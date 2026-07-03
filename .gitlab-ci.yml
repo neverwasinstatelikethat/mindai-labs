@@ -1,0 +1,33 @@
+stages:
+  - quality
+  - security
+
+default:
+  image: python:3.12-slim
+  cache:
+    key: pip
+    paths:
+      - .cache/pip
+
+quality:
+  stage: quality
+  before_script:
+    - python -m pip install --cache-dir .cache/pip -e ".[dev]"
+  script:
+    - python -m ruff check .
+    - python -m mypy src
+    - python -m pytest
+
+sast:
+  stage: security
+
+secret_detection:
+  stage: security
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+variables:
+  SECRET_DETECTION_ENABLED: "true"
+
