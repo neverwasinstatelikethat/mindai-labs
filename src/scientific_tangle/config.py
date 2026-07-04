@@ -17,12 +17,16 @@ class Settings(BaseSettings):
     yandex_model_version: str = "latest"
     yandex_model_uri: str | None = None
     yandex_timeout_seconds: float = 90
+    # Макс. одновременных запросов к Yandex (free-tier: 10 concurrent, запас = 8)
+    yandex_max_concurrent: int = 8
     yandex_embeddings_url: str = (
         "https://llm.api.cloud.yandex.net/foundationModels/v1/textEmbedding"
     )
     embedding_dimensions: int = 256
 
     # GigaChat fallback LLM
+    # Individual tier (GIGACHAT_API_PERS) — только 1 concurrent thread
+    gigachat_max_concurrent: int = 1
     gigachat_api_key: str | None = Field(default=None, repr=False)
     gigachat_base_url: str = "https://gigachat.devices.sberbank.ru/api/v1"
     gigachat_model: str = "GigaChat"

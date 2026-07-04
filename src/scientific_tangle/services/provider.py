@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import httpx
@@ -38,6 +39,19 @@ class YandexAuthError(ModelUnavailableError):
 
 class YandexUnavailableError(ModelUnavailableError):
     """Yandex 5xx или ошибка соединения — кандидат на fallback."""
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers — error-response detection
+# ---------------------------------------------------------------------------
+
+
+def _check_error_response(parsed: Any, content: str, provider: str) -> None:
+    """Проверяет, не вернул ли LLM JSON-объект с ошибкой вместо результата."""
+    if isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 2:
+        raise ModelUnavailableError(
+            f"{provider} вернул ошибку: {parsed.get('error', content[:200])}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +126,8 @@ class YandexAIStudioProvider:
             raise ValueError("YANDEX_API_KEY обязателен для live mode")
         self._model_uri = settings.resolved_yandex_model_uri
         self._settings = settings
+        # Семафор ограничивает количество одновременных запросов (free-tier: 10 concurrent)
+        self._semaphore = asyncio.Semaphore(settings.yandex_max_concurrent)
 
     async def complete_model(
         self,
@@ -133,42 +149,49 @@ class YandexAIStudioProvider:
             "Authorization": f"Api-Key {self._settings.yandex_api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(
-            base_url=self._settings.yandex_base_url,
-            timeout=self._settings.yandex_timeout_seconds,
-        ) as client:
-            for attempt in range(2):
-                try:
-                    response = await self._post_with_retry(client, payload, headers)
-                except httpx.TransportError as exc:
-                    raise YandexUnavailableError(
-                        f"Yandex соединение недоступно: {exc}"
-                    ) from exc
-                # Проверяем статус и выбрасываем типизированные ошибки для fallback
-                self._raise_for_status(response)
-                body = response.json()
-                content = body["choices"][0]["message"]["content"]
-                try:
-                    return schema.model_validate(json.loads(_clean_json(content)))
-                except (json.JSONDecodeError, ValidationError):
-                    if attempt == 1:
-                        raise
-                    payload["messages"] = [
-                        {"role": "system", "content": instance_instruction},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Исходная задача:\n{user}\n\n"
-                                "Предыдущий ответ не является экземпляром схемы. "
-                                "Исправь его и верни только data object:\n"
-                                f"{content[:4000]}"
-                            ),
-                        },
-                    ]
+        # Семафор ограничивает concurrent in-flight запросы (free-tier gauge ≤ 10)
+        logger.info("Yandex: отправка запроса к модели %s", self._model_uri)
+        _yandex_started = perf_counter()
+        async with self._semaphore:
+            async with httpx.AsyncClient(
+                base_url=self._settings.yandex_base_url,
+                timeout=self._settings.yandex_timeout_seconds,
+            ) as client:
+                for attempt in range(2):
+                    try:
+                        response = await self._post_with_retry(client, payload, headers)
+                    except httpx.TransportError as exc:
+                        raise YandexUnavailableError(
+                            f"Yandex соединение недоступно: {exc}"
+                        ) from exc
+                    # Проверяем статус и выбрасываем типизированные ошибки для fallback
+                    self._raise_for_status(response)
+                    body = response.json()
+                    content = body["choices"][0]["message"]["content"]
+                    try:
+                        parsed = json.loads(_clean_json(content))
+                        _check_error_response(parsed, content, "Yandex")
+                        elapsed = perf_counter() - _yandex_started
+                        logger.info("Yandex: ответ получен за %.1fs", elapsed)
+                        return schema.model_validate(parsed)
+                    except (json.JSONDecodeError, ValidationError):
+                        if attempt == 1:
+                            raise
+                        payload["messages"] = [
+                            {"role": "system", "content": instance_instruction},
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Исходная задача:\n{user}\n\n"
+                                    "Предыдущий ответ не является экземпляром схемы. "
+                                    "Исправь его и верни только data object:\n"
+                                    f"{content[:4000]}"
+                                ),
+                            },
+                        ]
         raise RuntimeError("Yandex structured output retry exhausted")
 
-    @staticmethod
-    def _raise_for_status(response: httpx.Response) -> None:
+    def _raise_for_status(self, response: httpx.Response) -> None:
         """Проверяет HTTP статус и выбрасывает типизированные ошибки для fallback."""
         status = response.status_code
         if status < 400:
@@ -223,6 +246,8 @@ class GigaChatProvider:
         if not settings.gigachat_api_key:
             raise ValueError("GIGACHAT_API_KEY обязателен для GigaChat mode")
         self._settings = settings
+        # GigaChat individual tier (GIGACHAT_API_PERS) — только 1 concurrent thread
+        self._semaphore = asyncio.Semaphore(settings.gigachat_max_concurrent)
 
     async def complete_model(
         self,
@@ -250,43 +275,51 @@ class GigaChatProvider:
             {"role": "user", "content": user},
         ]
 
-        async with GigaChat(
-            credentials=self._settings.gigachat_api_key,
-            base_url=self._settings.gigachat_base_url,
-            model=self._settings.gigachat_model,
-            verify_ssl_certs=self._settings.gigachat_verify_ssl_certs,
-            scope=self._settings.gigachat_scope,
-            timeout=self._settings.yandex_timeout_seconds,
-            max_retries=3,
-            retry_backoff_factor=0.5,
-        ) as client:
-            # Явная аутентификация — получаем токен доступа перед первым запросом
-            try:
-                client.get_token()
-            except Exception as exc:
-                logger.warning("GigaChat: не удалось получить токен доступа: %s", exc)
-                raise ModelUnavailableError(f"GigaChat auth error: {exc}") from exc
-
-            for attempt in range(2):
-                response = await self._call(client, build_request(messages))
-                content = self._extract_content(response)
+        # Семафор сериализует запросы (individual tier: 1 concurrent thread)
+        logger.info("GigaChat: отправка запроса к модели %s", self._settings.gigachat_model)
+        _gigachat_started = perf_counter()
+        async with self._semaphore:
+            async with GigaChat(
+                credentials=self._settings.gigachat_api_key,
+                base_url=self._settings.gigachat_base_url,
+                model=self._settings.gigachat_model,
+                verify_ssl_certs=self._settings.gigachat_verify_ssl_certs,
+                scope=self._settings.gigachat_scope,
+                timeout=self._settings.yandex_timeout_seconds,
+                max_retries=3,
+                retry_backoff_factor=0.5,
+            ) as client:
+                # Явная аутентификация — получаем токен доступа перед первым запросом
                 try:
-                    return schema.model_validate(json.loads(_clean_json(content)))
-                except (json.JSONDecodeError, ValidationError):
-                    if attempt == 1:
-                        raise
-                    messages = [
-                        {"role": "system", "content": instance_instruction},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Исходная задача:\n{user}\n\n"
-                                "Предыдущий ответ не является экземпляром схемы. "
-                                "Исправь его и верни только data object:\n"
-                                f"{content[:4000]}"
-                            ),
-                        },
-                    ]
+                    client.get_token()
+                except Exception as exc:
+                    logger.warning("GigaChat: не удалось получить токен доступа: %s", exc)
+                    raise ModelUnavailableError(f"GigaChat auth error: {exc}") from exc
+
+                for attempt in range(2):
+                    response = await self._call(client, build_request(messages))
+                    content = self._extract_content(response)
+                    try:
+                        parsed = json.loads(_clean_json(content))
+                        _check_error_response(parsed, content, "GigaChat")
+                        elapsed = perf_counter() - _gigachat_started
+                        logger.info("GigaChat: ответ получен за %.1fs", elapsed)
+                        return schema.model_validate(parsed)
+                    except (json.JSONDecodeError, ValidationError):
+                        if attempt == 1:
+                            raise
+                        messages = [
+                            {"role": "system", "content": instance_instruction},
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Исходная задача:\n{user}\n\n"
+                                    "Предыдущий ответ не является экземпляром схемы. "
+                                    "Исправь его и верни только data object:\n"
+                                    f"{content[:4000]}"
+                                ),
+                            },
+                        ]
         raise RuntimeError("GigaChat structured output retry exhausted")
 
     async def _call(self, client: GigaChat, request: Chat) -> ChatCompletion:
@@ -327,12 +360,12 @@ class GigaChatProvider:
 
 
 # ---------------------------------------------------------------------------
-# Fallback provider: Yandex → GigaChat
+# Fallback provider: GigaChat → Yandex
 # ---------------------------------------------------------------------------
 
 
 class FallbackProvider:
-    """Сначала Yandex, при сбое (429/401/403/5xx/соединение) — GigaChat."""
+    """Сначала GigaChat, при сбое — Yandex (с семафором для free-tier)."""
 
     mode = "fallback"
 
@@ -355,20 +388,19 @@ class FallbackProvider:
         user: str,
         schema: type[StructuredOutput],
     ) -> StructuredOutput:
-        # Сначала пробуем Yandex
-        if self._yandex:
-            try:
-                return await self._yandex.complete_model(system, user, schema)
-            except (YandexRateLimitError, YandexAuthError, YandexUnavailableError) as exc:
-                if self._gigachat:
-                    logger.warning("Yandex недоступен (%s), переключение на GigaChat", exc)
-                    return await self._gigachat.complete_model(system, user, schema)
-                raise ModelUnavailableError(
-                    f"Yandex недоступен, GigaChat не настроен: {exc}"
-                ) from exc
-        # Yandex нет — только GigaChat
+        # GigaChat — основной провайдер (нет жёсткого лимита запросов)
         if self._gigachat:
-            return await self._gigachat.complete_model(system, user, schema)
+            logger.info("Fallback: попытка GigaChat (основной)")
+            try:
+                return await self._gigachat.complete_model(system, user, schema)
+            except ModelUnavailableError as exc:
+                if self._yandex:
+                    logger.warning("Fallback: GigaChat недоступен (%s), переключение на Yandex", exc)
+                    return await self._yandex.complete_model(system, user, schema)
+                raise
+        # GigaChat нет — только Yandex (с семафором)
+        if self._yandex:
+            return await self._yandex.complete_model(system, user, schema)
         raise ModelUnavailableError("Нет доступных LLM провайдеров")
 
 
@@ -390,7 +422,7 @@ def build_provider(settings: Settings) -> ModelProvider:
             return GigaChatProvider(settings)
         return UnavailableProvider()
 
-    # "auto" или "fallback": если доступны оба — fallback, иначе единственный
+    # "auto" или "fallback": если доступны оба — fallback (GigaChat → Yandex), иначе единственный
     use_yandex = settings.use_yandex
     use_gigachat = settings.use_gigachat
 

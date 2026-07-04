@@ -30,6 +30,7 @@ from scientific_tangle.services.knowledge import InMemoryKnowledgeBase, Knowledg
 from scientific_tangle.services.provider import ModelProvider, build_provider
 
 INTENT_SYSTEM = """Ты Intent Router платформы MindAI.
+Система работает с горно-металлургической отраслью: добыча руд, обогащение, металлургия цветных металлов, геомеханика. Все вопросы относятся к этой предметной области.
 Разложи запрос на primary intent, secondary intents, entities и constraints.
 Требовать подтверждение можно только для необратимых изменений trusted graph, прав доступа,
 публикации или внешней передачи чувствительных данных. Исследовательские действия выполняются
@@ -37,6 +38,7 @@ INTENT_SYSTEM = """Ты Intent Router платформы MindAI.
 """
 
 PLANNER_SYSTEM = """Ты Planner Agent научной GraphRAG-системы MindAI.
+Система работает с горно-металлургической отраслью: добыча руд, обогащение, металлургия цветных металлов, геомеханика. Все вопросы относятся к этой предметной области.
 Преобразуй вопрос в строгий QueryPlan. Не отвечай на вопрос.
 Выдели сущности, числовые ограничения, географию и временной диапазон.
 Выбери local для точечного факта, global для обзора communities, hybrid для сложного сравнения.
@@ -44,6 +46,7 @@ max_hops не больше 4. Сохрани исходный вопрос бе�
 """
 
 ACTION_SYSTEM = """Ты Autonomous Action Planner платформы MindAI.
+Система работает с горно-металлургической отраслью: добыча руд, обогащение, металлургия цветных металлов, геомеханика. Все вопросы относятся к этой предметной области.
 Выбери и упорядочи tools, необходимые для полного выполнения пользовательского запроса.
 Не перекладывай исследовательскую работу на пользователя. Используй hybrid_search,
 graph_traverse, community_search, numeric_filter, conflict_scan, gap_scan и expert_lookup.
@@ -60,12 +63,14 @@ PLANNING_SYSTEM = f"""{INTENT_SYSTEM}\n{PLANNER_SYSTEM}\n{ACTION_SYSTEM}
 """
 
 CONTROL_SYSTEM = """Ты Autonomous Control Agent платформы MindAI.
+Система работает с горно-металлургической отраслью: добыча руд, обогащение, металлургия цветных металлов, геомеханика. Все вопросы относятся к этой предметной области.
 Сопоставь completion criteria с tool observations. Выбери continue_tools, если доступные tools могут
 закрыть конкретный пробел, иначе reason. Не проси пользователя выполнять исследовательские действия.
 После двух раундов tools выбирай reason и явно сохраняй оставшиеся пробелы в missing_evidence.
 """
 
 REASONER_SYSTEM = """Ты Reasoner Agent платформы MindAI.
+Система работает с горно-металлургической отраслью: добыча руд, обогащение, металлургия цветных металлов, геомеханика. Все вопросы относятся к этой предметной области.
 Синтезируй ответ только из переданных findings, evidence и community summaries.
 Укажи IDs использованных findings. Не добавляй числа, которых нет в evidence.
 Отдели conflicts, knowledge gaps и recommendations. Не давай пользователю поручений вида
@@ -74,12 +79,14 @@ Recommendations описывают следующие автономные де�
 """
 
 CRITIC_SYSTEM = """Ты Critic Agent научной GraphRAG-системы.
+Система работает с горно-металлургической отраслью: добыча руд, обогащение, металлургия цветных металлов, геомеханика. Все вопросы относятся к этой предметной области.
 Проверь соответствие вопросу, условия применимости, citations, числовую fidelity,
 неподдержанные выводы и корректность conflict/gap. Верни approved=false при любой
 содержательной проблеме и дай конкретные revision_instructions.
 """
 
 IMPROVER_SYSTEM = """Ты Improver Agent.
+Система работает с горно-металлургической отраслью: добыча руд, обогащение, металлургия цветных металлов, геомеханика. Все вопросы относятся к этой предметной области.
 Перепиши структурированный ответ строго по замечаниям Critic и тому же evidence context.
 Нельзя добавлять новые факты или источники. Сохрани IDs реально использованных findings.
 """
@@ -147,6 +154,19 @@ class ResearchWorkflow:
             duration_ms=duration_ms,
         )
 
+    @staticmethod
+    def _sanitize_action_plan(plan: AgentActionPlan, fallback_query: str) -> None:
+        """Переопределяет пустые query/purpose в action plan безопасными значениями.
+
+        GigaChat при fallback может возвращать пустые или whitespace-only строки
+        в structured output, что приводит к ошибкам выполнения tools.
+        """
+        for action in plan.actions:
+            if not action.query or not action.query.strip():
+                action.query = fallback_query
+            if not action.purpose or not action.purpose.strip():
+                action.purpose = fallback_query
+
     async def intent_router(self, state: ResearchState) -> dict[str, object]:
         intent = await self.provider.complete_model(
             INTENT_SYSTEM,
@@ -174,6 +194,12 @@ class ResearchWorkflow:
             ),
             PlanningBundle,
         )
+        # Принудительно сохраняем исходный вопрос пользователя — LLM может
+        # переформулировать вопрос и исказить смысл (особенно при fallback на GigaChat).
+        bundle.query_plan.question = state["question"]
+        # Гарантируем непустые query/purpose в action plan — GigaChat может
+        # возвращать пустые или whitespace-only строки в structured output.
+        self._sanitize_action_plan(bundle.action_plan, state["question"])
         return {
             "intent": bundle.intent,
             "query_plan": bundle.query_plan,
@@ -200,6 +226,8 @@ class ResearchWorkflow:
             ),
             QueryPlan,
         )
+        # Принудительно сохраняем исходный вопрос пользователя.
+        plan.question = state["question"]
         return {
             "query_plan": plan,
             "trace": [
@@ -225,6 +253,9 @@ class ResearchWorkflow:
             ),
             AgentActionPlan,
         )
+        # Гарантируем непустые query/purpose — GigaChat может возвращать
+        # пустые или whitespace-only строки в structured output.
+        self._sanitize_action_plan(action_plan, state["question"])
         return {
             "action_plan": action_plan,
             "trace": [
@@ -498,13 +529,16 @@ class ResearchWorkflow:
     ) -> Any:
         async def wrapped(state: ResearchState) -> dict[str, object]:
             started = perf_counter()
+            _logger.info("Агент '%s': начало выполнения", agent)
             try:
                 update = cast(dict[str, object], await node(state))
-            except Exception:
+            except Exception as exc:
                 duration_ms = (perf_counter() - started) * 1000
                 self.metrics.observe(agent, duration_ms, False)
+                _logger.error("Агент '%s': ошибка через %.0fms: %s", agent, duration_ms, exc)
                 raise
             duration_ms = (perf_counter() - started) * 1000
+            _logger.info("Агент '%s': завершён за %.0fms", agent, duration_ms)
             self.metrics.observe(agent, duration_ms, True)
             trace = update.get("trace")
             if isinstance(trace, list) and trace and isinstance(trace[-1], AgentEvent):

@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -62,6 +63,10 @@ from scientific_tangle.services.ingestion import IngestionService
 from scientific_tangle.services.provider import ModelUnavailableError, build_provider
 from scientific_tangle.services.research_intelligence import ResearchIntelligenceService
 from scientific_tangle.services.resolution import EntityResolutionWorkbench
+
+logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 knowledge = build_knowledge_base(settings)
@@ -364,6 +369,10 @@ async def stream_query(
             }
             config = {"configurable": {"thread_id": str(query.thread_id)}}
 
+            # Немедленное start-событие — пользователь видит, что запрос принят
+            yield f"data: {json.dumps({'type': 'start', 'question': query.question}, ensure_ascii=False)}\n\n"
+            logger.info("SSE stream started for question: %s", query.question[:100])
+
             final_answer = None
             # Стриминг обновлений состояния по мере выполнения узлов графа
             async for chunk in active_workflow.graph.astream(
@@ -380,18 +389,28 @@ async def stream_query(
                         last_event = trace[-1]
                         if hasattr(last_event, "model_dump"):
                             event_data = last_event.model_dump()
+                            # step отправляется как объект — фронтенд ожидает
+                            # { agent, status, message } для обновления шагов агента
                             data = {
                                 "type": "step",
-                                "step": node_name,
-                                **event_data,
+                                "step": {
+                                    "agent": event_data.get("agent", node_name),
+                                    "status": event_data.get("status", "completed"),
+                                    "message": event_data.get("message", ""),
+                                    "duration_ms": event_data.get("duration_ms"),
+                                },
                             }
                             yield f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                            logger.info("SSE: sent step event for node '%s'", node_name)
+                            # Processing-событие показывает прогресс между шагами
+                            yield f"data: {json.dumps({'type': 'processing', 'step': node_name}, ensure_ascii=False)}\n\n"
                     # Сохраняем финальный ответ из узла finalize
                     answer = update.get("answer")
                     if answer is not None:
                         final_answer = answer
 
             # Отправляем финальный ответ
+            logger.info("SSE: sending final answer")
             if final_answer is not None:
                 # Post-retrieval ACL: фильтруем findings по data_class
                 allowed_findings = [
