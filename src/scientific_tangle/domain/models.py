@@ -17,6 +17,7 @@ class KnowledgeStatus(StrEnum):
 
 class EvidenceLocator(BaseModel):
     document_id: UUID
+    source_title: str = "Источник"
     page: int | None = Field(default=None, ge=1)
     sheet: str | None = None
     cell_range: str | None = None
@@ -86,16 +87,29 @@ class Claim(BaseModel):
 
 class NumericFilter(BaseModel):
     property_name: str = Field(min_length=1)
-    operator: Literal["lt", "lte", "gt", "gte", "between"]
+    operator: Literal["eq", "lt", "lte", "gt", "gte", "between", "range"]
     value: float | None = None
     min_value: float | None = None
     max_value: float | None = None
     unit: str = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def validate_operator_fields(self) -> NumericFilter:
+        if self.operator in {"eq", "lt", "lte", "gt", "gte"} and self.value is None:
+            raise ValueError(f"Оператор {self.operator} требует значение value")
+        if self.operator in {"between", "range"} and (
+            self.min_value is None or self.max_value is None
+        ):
+            raise ValueError(
+                f"Оператор {self.operator} требует min_value и max_value"
+            )
+        return self
+
 
 class QueryPlan(BaseModel):
     question: str = Field(min_length=3)
     language: Literal["ru", "en"]
+    mode: Literal["local", "global", "hybrid"] = "hybrid"
     entity_ids: list[UUID] = Field(default_factory=list)
     entity_mentions: list[str] = Field(default_factory=list)
     numeric_filters: list[NumericFilter] = Field(default_factory=list)

@@ -1,24 +1,62 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Frontend
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+
+# Тестирование и линтеры
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.venv/
-dist/
-build/
-*.egg-info/
-.env
-.idea/
-.vscode/
-.agents/
-.claude/
-.codex/
-AGENTS.md
-CLAUDE.md
-docs/plans/
-data/raw/
-data/processed/
-artifacts/
 coverage.xml
 .coverage
 
+# IDE и редакторы
+.idea/
+.vscode/
+.qoder/
+.claude/
+.codex/
+.codex-*.png
+
+# Документация и инструкции агентов (не версионируются)
+.agents/
+AGENTS.md
+docs/*
+
+# Окружение
+.env
+.env.local
+
+# Docker (конфигурации версионируются, данные — нет)
+data/raw/
+data/processed/
+artifacts/
+
+# Корпус документов (большие файлы, не для репозитория)
+Источники информации/
+
+# Временные и вспомогательные файлы (префикс _)
+_*
+
+# Презентации и временные материалы
+*.pptx
+capture_screenshots.py
+
+# Результаты генерации
+graph_output*.json
+
+# LangGraph
+.langgraph_api/
+
+# Операционная система
+.DS_Store
+Thumbs.db
+*.log

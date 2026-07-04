@@ -1,47 +1,201 @@
-name: scientific-tangle
+name: mindai-scientific-tangle
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [mindai]
 
 services:
-  neo4j:
-    image: neo4j:5.26-community
+  backend:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    env_file:
+      - path: .env
+        required: false
     environment:
-      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-change-me}
-      NEO4J_PLUGINS: '["apoc"]'
-    ports:
-      - "7474:7474"
-      - "7687:7687"
+      KNOWLEDGE_BACKEND: neo4j
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_RUNTIME_PASSWORD:-mindai-neo4j-local}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://mindai:${POSTGRES_RUNTIME_PASSWORD:-mindai-postgres-local}@postgres:5432/mindai
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-mindai}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-mindai-local-secret}
+      SOURCE_ROOT: /data/sources
     volumes:
-      - neo4j_data:/data
+      - ./Источники информации:/data/sources:ro
+    ports: ["${BACKEND_PORT:-8000}:8000"]
+    depends_on:
+      neo4j: { condition: service_healthy }
+      elasticsearch: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  preload:
+    <<: *service-defaults
+    profiles: [tools]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      KNOWLEDGE_BACKEND: neo4j
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_RUNTIME_PASSWORD:-mindai-neo4j-local}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      SOURCE_ROOT: /data/sources
+    volumes:
+      - ./Источники информации:/data/sources:ro
+    command: ["python", "-m", "scientific_tangle.preload"]
+    restart: "no"
+    depends_on:
+      neo4j: { condition: service_healthy }
+      elasticsearch: { condition: service_healthy }
+
+  frontend:
+    <<: *service-defaults
+    build:
+      context: ./frontend
+    environment:
+      INTERNAL_API_URL: http://backend:8000
+    ports: ["${FRONTEND_PORT:-3000}:3000"]
+    depends_on:
+      backend: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  neo4j:
+    <<: *service-defaults
+    image: neo4j:5.26.8-community
+    stop_grace_period: 30s
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_RUNTIME_PASSWORD:-mindai-neo4j-local}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    ports: ["7474:7474", "7687:7687"]
+    volumes: ["neo4j_data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USERNAME:-neo4j} -p ${NEO4J_RUNTIME_PASSWORD:-mindai-neo4j-local} 'RETURN 1' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
 
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    <<: *service-defaults
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.6
+    stop_grace_period: 30s
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
-      ES_JAVA_OPTS: -Xms1g -Xmx1g
-    ports:
-      - "9200:9200"
-    volumes:
-      - elastic_data:/usr/share/elasticsearch/data
+      ES_JAVA_OPTS: -Xms768m -Xmx768m
+    ports: ["9200:9200"]
+    volumes: ["elastic_data:/usr/share/elasticsearch/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 1536M }
 
   redis:
-    image: redis:7.4-alpine
-    ports:
-      - "6379:6379"
+    <<: *service-defaults
+    image: redis:7.4.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   minio:
+    <<: *service-defaults
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-change-me}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-change-me}
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-mindai}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-mindai-local-secret}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio_data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mindai}
+      POSTGRES_USER: ${POSTGRES_USER:-mindai}
+      POSTGRES_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:-mindai-postgres-local}
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mindai} -d ${POSTGRES_DB:-mindai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  prometheus:
+    <<: *service-defaults
+    image: prom/prometheus:v3.4.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
     volumes:
-      - minio_data:/data
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      backend: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  grafana:
+    <<: *service-defaults
+    image: grafana/grafana:12.0.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-now}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports: ["${GRAFANA_PORT:-3001}:3000"]
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus: { condition: service_healthy }
+
+networks:
+  mindai:
 
 volumes:
   neo4j_data:
   elastic_data:
+  redis_data:
   minio_data:
-
+  postgres_data:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,22 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix mind: <https://mindai.local/ontology/> .
+
+mind:ClaimShape a sh:NodeShape ;
+    sh:targetClass mind:Claim ;
+    sh:property [
+        sh:path mind:predicate ;
+        sh:minCount 1 ;
+        sh:pattern "^[A-Z][A-Z0-9_]*$"
+    ] ;
+    sh:property [
+        sh:path mind:evidenceQuote ;
+        sh:minCount 1 ;
+        sh:minLength 1
+    ] ;
+    sh:property [
+        sh:path mind:confidence ;
+        sh:minCount 1 ;
+        sh:minInclusive 0 ;
+        sh:maxInclusive 1
+    ] .

@@ -19,3 +19,9 @@ def test_query_plan_rejects_unbounded_graph_depth() -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_live_query_requires_configured_model() -> None:
+    response = client.get("/api/v1/demo")
+
+    assert response.status_code == 503

@@ -138,7 +138,7 @@
 | P0 | Выбрать тему и три demo queries | утверждённый demo script |
 | P0 | Закрепить ontology v1 | schema + constraints + examples |
 | P0 | Реализовать document registry/parser | источник с page/sheet locators |
-| P0 | Реализовать extraction contract | claims/observations/evidence JSON |
+| P0 | Реализовать LLM-driven extraction contract | claims/observations/evidence JSON |
 | P0 | Записать seed graph | идемпотентный import |
 | P0 | Реализовать first hybrid query | evidence top-k |
 | P0 | Собрать grounded answer | zero unsupported claims на query #1 |
@@ -177,4 +177,3 @@
 | Agent latency | p95 превышает demo budget | parallel retrieval, cache, bounded critic loop |
 | UI опережает данные | статические dashboard/graph | contract fixtures из реального schema |
 | Много технологий без интеграции | ручные переходы в demo | единый correlation ID и end-to-end flow |
-

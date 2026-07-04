@@ -18,6 +18,28 @@ quality:
     - python -m mypy src
     - python -m pytest
 
+frontend:
+  stage: quality
+  image: node:22-alpine
+  cache:
+    key: npm
+    paths:
+      - frontend/.npm/
+  before_script:
+    - cd frontend
+    - npm ci --cache .npm --prefer-offline
+  script:
+    - npm run check
+    - npm run build
+
+compose:
+  stage: quality
+  image: docker:29-cli
+  services:
+    - docker:29-dind
+  script:
+    - docker compose config --quiet
+
 sast:
   stage: security
 
@@ -30,4 +52,3 @@ include:
 
 variables:
   SECRET_DETECTION_ENABLED: "true"
-
