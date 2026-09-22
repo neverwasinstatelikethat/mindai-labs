@@ -1,6 +1,20 @@
+# Сборка фронтенда обязана получать только исходники: локальные секреты,
+# окружение разработки и артефакты проверок не должны попадать в образ.
+.env
+.env.*
+*.local
+
+.git
+.gitignore
+.dockerignore
+.dev.log
+README.md
+
 node_modules
-.svelte-kit
-build
 .npm
 npm-debug.log
-
+.svelte-kit
+build
+coverage
+.test
+playwright-report

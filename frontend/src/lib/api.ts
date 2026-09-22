@@ -1,68 +1,93 @@
 import { env } from '$env/dynamic/public';
-import { getRoleHeaders } from './roleStore.svelte';
 import type {
-  AgentMetricsResponse,
-  AuditEvent,
+  AccountInfo,
   ClaimHistory,
   ComparisonTable,
   CorpusStats,
   DashboardData,
   DocumentReceipt,
-  EntityMergeProposal,
   EvaluationRun,
   EvolutionExperiment,
   EvolutionProposal,
+  ExportFormat,
+  FeedbackResult,
   FindingApiStatus,
   FindingListItem,
   GoldCase,
   GraphSnapshot,
-  Notification,
-  PipelineBenchmark,
-  PrincipalInfo,
   QueryResponse,
-  RetrievalBenchmark,
-  RoleInfo,
   SystemStatus,
 } from './types';
 
 const API_URL = env.PUBLIC_API_URL || '/backend';
 
-function buildHeaders(extra?: Record<string, string>): Record<string, string> {
-  return {
-    'Content-Type': 'application/json',
-    ...getRoleHeaders(),
-    ...extra,
-  };
+export class ApiError extends Error {
+  readonly status: number;
+  // Различаем 401 (сессии нет — редиректим на вход) и 403 (сессия есть,
+  // разрешения нет — объясняем на месте, не выбрасывая из рабочего экрана).
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: () => void): void {
+  onUnauthorized = handler;
+}
+
+function headersFor(extra?: Record<string, string>): Record<string, string> {
+  return { 'Content-Type': 'application/json', ...extra };
+}
+
+async function failure(response: Response): Promise<ApiError> {
+  const body = await response.json().catch(() => ({ detail: response.statusText }));
+  const message = typeof body.detail === 'string' ? body.detail : `HTTP ${response.status}`;
+  if (response.status === 401) onUnauthorized?.();
+  return new ApiError(message, response.status);
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
+    credentials: 'include',
     ...init,
-    headers: buildHeaders(init?.headers as Record<string, string> | undefined),
+    headers: headersFor(init?.headers as Record<string, string> | undefined),
   });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(body.detail || `HTTP ${response.status}`);
-  }
+  if (!response.ok) throw await failure(response);
   return response.json() as Promise<T>;
 }
 
 async function requestRaw(path: string, init?: RequestInit): Promise<Response> {
   const response = await fetch(`${API_URL}${path}`, {
+    credentials: 'include',
     ...init,
-    headers: buildHeaders(init?.headers as Record<string, string> | undefined),
+    headers: headersFor(init?.headers as Record<string, string> | undefined),
   });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(body.detail || `HTTP ${response.status}`);
-  }
+  if (!response.ok) throw await failure(response);
   return response;
 }
 
 export const api = {
   status: () => request<SystemStatus>('/health/ready'),
-  demo: () => request<QueryResponse>('/api/v1/demo'),
-  agentMetrics: () => request<AgentMetricsResponse>('/api/v1/agents/metrics'),
+
+  // ── Сессия ──────────────────────────────────────────────────────
+  me: () => request<AccountInfo>('/api/v1/auth/me'),
+  register: (input: { email: string; display_name: string; password: string }) =>
+    request<AccountInfo>('/api/v1/auth/register', { method: 'POST', body: JSON.stringify(input) }),
+  login: (input: { email: string; password: string }) =>
+    request<AccountInfo>('/api/v1/auth/login', { method: 'POST', body: JSON.stringify(input) }),
+  logout: () => request<{ status: 'logged_out' }>('/api/v1/auth/logout', { method: 'POST' }),
+  changePassword: (input: { current_password: string; new_password: string }) =>
+    request<AccountInfo>('/api/v1/auth/password', { method: 'POST', body: JSON.stringify(input) }),
+  updateProfile: (displayName: string) =>
+    request<AccountInfo>('/api/v1/auth/profile', {
+      method: 'PATCH',
+      body: JSON.stringify({ display_name: displayName }),
+    }),
+
+  // ── Знания и запросы ────────────────────────────────────────────
   graph: () => request<GraphSnapshot>('/api/v1/graph'),
   findings: (subject?: string, status?: FindingApiStatus) => {
     const params = new URLSearchParams();
@@ -80,12 +105,9 @@ export const api = {
     const response = await fetch(`${API_URL}/api/v1/documents/upload`, {
       method: 'POST',
       body: form,
-      headers: getRoleHeaders(),
+      credentials: 'include',
     });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({ detail: response.statusText }));
-      throw new Error(body.detail || `HTTP ${response.status}`);
-    }
+    if (!response.ok) throw await failure(response);
     return response.json() as Promise<DocumentReceipt>;
   },
   query: (question: string) =>
@@ -93,18 +115,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ question, language: 'ru', mode: 'hybrid' }),
     }),
-  validateQuery: (plan: unknown) =>
-    request<unknown>('/api/v1/queries/validate', {
-      method: 'POST',
-      body: JSON.stringify(plan),
-    }),
-  feedback: (queryId: string, findingId: string | null, verdict: string, comment: string) =>
-    request<EvolutionProposal>('/api/v1/feedback', {
-      method: 'POST',
-      body: JSON.stringify({ query_id: queryId, finding_id: findingId, verdict, comment }),
-    }),
+  // feedback возвращает FeedbackResult: решение эксперта сохраняется всегда, а
+  // proposal генерирует модель — без живого LLM его нет, и это не ошибка.
+  // supersede срабатывает только при verdict='correct' вместе с finding_id
+  // и correction, поэтому исправление обязано указывать на конкретное
+  // утверждение, а не на ответ целиком.
+  feedback: (input: {
+    query_id: string;
+    finding_id: string | null;
+    verdict: 'accept' | 'reject' | 'correct';
+    comment: string;
+    correction?: string;
+  }) => request<FeedbackResult>('/api/v1/feedback', { method: 'POST', body: JSON.stringify(input) }),
   proposals: () => request<EvolutionProposal[]>('/api/v1/proposals'),
-  experiments: () => request<EvolutionExperiment[]>('/api/v1/experiments'),
+  experiments: (limit = 50) =>
+    request<EvolutionExperiment[]>(`/api/v1/experiments?limit=${limit}`),
   runExperiment: (proposalId: string) =>
     request<EvolutionExperiment>(`/api/v1/proposals/${proposalId}/experiment?max_cases=1`, {
       method: 'POST',
@@ -114,44 +139,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ accepted }),
     }),
-  mergeProposals: () => request<EntityMergeProposal[]>('/api/v1/entity-resolution/proposals'),
-  reviewMerge: (proposalId: string, action: 'accept' | 'reject' | 'revert') =>
-    request<EntityMergeProposal>(`/api/v1/entity-resolution/proposals/${proposalId}/review`, {
-      method: 'POST',
-      body: JSON.stringify({ action }),
-    }),
-  evaluations: () => request<EvaluationRun[]>('/api/v1/evaluations'),
+  evaluations: (limit = 200) => request<EvaluationRun[]>(`/api/v1/evaluations?limit=${limit}`),
   goldCases: () => request<GoldCase[]>('/api/v1/evaluations/gold'),
-  retrievalBenchmark: () =>
-    request<RetrievalBenchmark>('/api/v1/evaluations/retrieval-benchmark', {
-      method: 'POST',
-    }),
-  pipelineBenchmark: () =>
-    request<PipelineBenchmark>('/api/v1/evaluations/pipeline-benchmark', {
-      method: 'POST',
-    }),
-  roles: () => request<RoleInfo[]>('/api/v1/roles'),
-  principal: () => request<PrincipalInfo>('/api/v1/principal'),
-  audit: () => request<AuditEvent[]>('/api/v1/audit'),
-  claimHistory: (claimId: string) =>
-    request<ClaimHistory>(`/api/v1/claims/${claimId}/history`),
+  claimHistory: (claimId: string) => request<ClaimHistory>(`/api/v1/claims/${claimId}/history`),
   compare: (question: string, entities: string[], dimensions: string[] = []) =>
     request<ComparisonTable>('/api/v1/compare', {
       method: 'POST',
       body: JSON.stringify({ question, entities, dimensions, language: 'ru' }),
     }),
-  export: async (answer: unknown, format: 'markdown' | 'json-ld') => {
-    const response = await requestRaw('/api/v1/export', {
-      method: 'POST',
-      body: JSON.stringify({ answer, format }),
-    });
-    return response;
-  },
+  // Экспортируется серверная копия ответа по query_id: присланный клиентом
+  // AnswerPayload из контракта убран (иначе ACL фильтровал бы клиентские данные).
+  export: (queryId: string, format: ExportFormat) =>
+    requestRaw('/api/v1/export', { method: 'POST', body: JSON.stringify({ query_id: queryId, format }) }),
   dashboard: () => request<DashboardData>('/api/v1/dashboard'),
-  notifications: () => request<Notification[]>('/api/v1/notifications'),
-  subscribe: (topic: string) =>
-    request<{ status: string; topic: string }>('/api/v1/subscriptions', {
-      method: 'POST',
-      body: JSON.stringify({ topic, subscriber_id: 'web' }),
-    }),
 };
+
+export function apiUrl(path: string): string {
+  return `${API_URL}${path}`;
+}

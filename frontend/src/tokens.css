@@ -1,0 +1,170 @@
+/* Softly — единый источник цвета, типографики, геометрии, ритма и движения.
+   Любые hex/rgba вне этого файла запрещены: компоненты и страницы берут значения
+   только токенами. */
+
+:root {
+  /* Поверхности: тёплая бумага как основа, пастель как сцена. */
+  --paper: #fdfcf8;
+  --paper-deep: #f7f4ec;
+  --surface: #ffffff;
+  --surface-sunk: #f6f3ec;
+  --surface-raised: #fffefb;
+
+  /* Пастельные поля сцены. */
+  --sage: #e8efe8;
+  --sage-deep: #d7e4d9;
+  --lavender: #efedf4;
+  --lavender-deep: #e0dcee;
+  --coral-mist: #ffe4e1;
+  --lav-mist: #e6e6fa;
+  --peach-wash: #fff1ec;
+
+  /* Чернила. */
+  --ink: #292524;
+  --ink-2: #4e4642;
+  --ink-3: #6b645c;
+  --ink-4: #8d857c;
+  --ink-inverse: #fdfcf8;
+  --ink-inverse-2: #d9d3cb;
+
+  /* Аура «Клубка» — живой свет агента. Единственный холодный спектр в системе:
+     маскот, кольцо композера и индикатор текущего раздела. */
+  --aura-cyan: #6fdcf2;
+  --aura-blue: #7aa8ff;
+  --aura-violet: #b9a4ff;
+  --aura-deep: #5462c8;
+  --aura-glow: rgba(122, 168, 255, 0.34);
+  --aura-ring: rgba(185, 164, 255, 0.5);
+  --aura-face: #ffffff;
+
+  /* Тёмная сцена (конверсия, статус сервиса, инверсные полосы). */
+  --stone-deep: #292524;
+  --stone-deeper: #1d1a19;
+
+  /* Линии и hairline. */
+  --line: #e7e2da;
+  --line-soft: #f0ece4;
+  --line-strong: #d5cec3;
+  --line-inverse: #46403c;
+
+  /* Действие: коралл — заполнение, никогда текст. */
+  --action: #ffb7b2;
+  --action-deep: #f79b93;
+  --action-ink: #b4564b;
+
+  /* Статусы данных остаются читаемыми на всех поверхностях. */
+  --consensus: #2f6b4f;
+  --consensus-wash: #e8efe8;
+  --hypothesis: #8a5a12;
+  --hypothesis-wash: #fbefdc;
+  --disputed: #a8382c;
+  --disputed-wash: #fde7e3;
+  --superseded: #6b645c;
+  --superseded-wash: #efebe6;
+
+  /* Прозрачность для скролла и теней. */
+  --veil: rgba(41, 37, 36, 0.42);
+  --sheen: rgba(255, 254, 251, 0.5);
+
+  /* Шрифты. Onest — рабочая и дисплейная пара с кириллицей, Caveat — рукописный
+     акцент, JetBrains Mono — числа, коды и локаторы. */
+  --font-ui: 'Onest', 'Segoe UI', sans-serif;
+  --font-hand: 'Caveat', 'Onest', cursive;
+  --font-data: 'JetBrains Mono', ui-monospace, monospace;
+
+  --t-display: clamp(42px, 8.4vw, 92px);
+  --t-h1: clamp(32px, 5vw, 56px);
+  --t-h2: clamp(25px, 3.3vw, 38px);
+  --t-h3: clamp(19px, 2.2vw, 26px);
+  --t-h4: 18px;
+  --t-lead: clamp(17px, 1.5vw, 21px);
+  --t-body: 16px;
+  --t-small: 14px;
+  --t-micro: 13px;
+  --t-hand: clamp(23px, 3vw, 34px);
+  --t-num: clamp(30px, 4vw, 46px);
+
+  --lh-tight: 1.04;
+  --lh-head: 1.16;
+  --lh-body: 1.62;
+  --lh-dense: 1.42;
+  --tr-display: -0.028em;
+  --tr-head: -0.02em;
+  --tr-body: -0.006em;
+
+  /* Геометрия Softly: крупные радиусы, control всегда pill. */
+  --r-xs: 12px;
+  --r-sm: 16px;
+  --r-md: 22px;
+  --r-lg: 30px;
+  --r-xl: 40px;
+  --r-pill: 999px;
+
+  /* Мягкие тени: почти невесомые на покое, заметные на подъёме. */
+  --shadow-soft: 0 4px 20px -2px rgba(41, 37, 36, 0.05), 0 1px 3px rgba(41, 37, 36, 0.04);
+  --shadow-lift: 0 18px 48px -18px rgba(41, 37, 36, 0.22), 0 4px 20px -2px rgba(41, 37, 36, 0.06);
+  --shadow-inset: inset 0 0 0 1px var(--line);
+  --shadow-focus: 0 0 0 3px rgba(180, 86, 75, 0.28);
+  --shadow-aura: 0 0 0 1px var(--aura-ring), 0 18px 48px -20px var(--aura-glow);
+  --shadow-blur: blur(72px);
+
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+  --s8: 64px;
+  --s9: 96px;
+  --s10: 128px;
+
+  --ease-soft: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-enter: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 160ms;
+  --dur: 280ms;
+  --dur-reveal: 800ms;
+  --dur-float: 6s;
+  --dur-aura: 14s;
+  --dur-blink: 6.5s;
+  --dur-marquee: 22s;
+  --dur-dock: 420ms;
+
+  --z-grain: 50;
+  --z-nav: 40;
+  --z-sheet: 60;
+  --z-veil: 55;
+  --z-dock: 36;
+
+  /* Полноэкранная сетка: рабочая поверхность занимает весь вьюпорт,
+     читаемая мера живёт внутри колонок, а не в полях страницы. */
+  --maxw-page: 1560px;
+  --maxw-narrow: 760px;
+  --maxw-measure: 62ch;
+  --pad-page: clamp(20px, 3.2vw, 56px);
+  --rail-w: 272px;
+
+  /* Высота шапки: стартовое значение до измерения. NavBar публикует сюда
+     измеренную высоту — полоса переносится в две строки на узких ширинах,
+     и константа прячет якоря под шапку. */
+  --topbar-h: 72px;
+  --grain-op: 0.35;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 1ms;
+    --dur: 1ms;
+    --dur-reveal: 1ms;
+    --dur-dock: 1ms;
+  }
+}
+
+/* Угол аура-кольца: зарегистрированное свойство можно анимировать как число,
+   поэтому конический градиент композера вращается покадроми, а не пересобирается.
+   inherits: true — значение нужно псевдоэлементу ::before, а не только самому полю. */
+@property --aura-angle {
+  syntax: '<angle>';
+  inherits: true;
+  initial-value: 0deg;
+}

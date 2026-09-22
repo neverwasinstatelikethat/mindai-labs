@@ -1,126 +1,172 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
-  import { env } from '$env/dynamic/public';
-  import { api } from '$lib/api';
-  import GraphCanvas from '$lib/GraphCanvas.svelte';
-  import { getRoleHeaders } from '$lib/roleStore.svelte';
+  /**
+   * Рабочая поверхность запроса: вопрос › след прохода › ответ-бумага.
+   * Компонент ничего не запрашивает сам: все вызовы живут в маршруте
+   * `(app)/research` и приходят колбэками, а право на действие читается из
+   * подтверждённой сессии (`session.can`), а не из выбора на клиенте.
+   */
+  import { tick } from 'svelte';
+  import { countOf, num, plural } from '$lib/format';
+  import { bandOf, groupIntervals } from '$lib/rail';
+  import { session } from '$lib/sessionStore.svelte';
+  import {
+    AGENT_LABELS,
+    INTENT_LABELS,
+    MODEL_MODE_LABELS,
+    OPERATOR_SYMBOL,
+    OPERATOR_WORD,
+    PREDICATE_LABELS,
+    PROPERTY_LABELS,
+    STEP_STATE_LABELS,
+    STATUS_PHRASE,
+    STATUS_SUPERSEDED,
+    SUBJECT_LABELS,
+    describeScope,
+    describeValue,
+    knownTerm,
+    termOf,
+  } from '$lib/terms';
+  import { DATA_CLASS_LABELS } from '$lib/types';
+  import Button from '$lib/ui/Button.svelte';
+  import Chip from '$lib/ui/Chip.svelte';
+  import Empty from '$lib/ui/Empty.svelte';
+  import Field from '$lib/ui/Field.svelte';
+  import Icon from '$lib/ui/Icon.svelte';
+  import Mascot from '$lib/ui/Mascot.svelte';
+  import Notice from '$lib/ui/Notice.svelte';
+  import Panel from '$lib/ui/Panel.svelte';
+  import PromptInput from '$lib/ui/PromptInput.svelte';
+  import StatusPill from '$lib/ui/StatusPill.svelte';
   import type {
+    AgentEvent,
     AnswerPayload,
-    EvaluationRun,
-    GraphSnapshot,
-    GraphNode,
+    ClaimHistory,
+    CorpusStats,
     Evidence,
     Finding,
-    SystemStatus,
-    QueryResponse,
+    NumericObservation,
   } from '$lib/types';
-  import {
-    Loader2, Check, Search, FileText, BarChart3, Pencil, Wrench, MessageSquare,
-    X, ChevronDown, Network, AlertTriangle, ThumbsUp, ThumbsDown, Send,
-    Sparkles, Activity,
-  } from '@lucide/svelte';
 
-  // ── Types ──────────────────────────────────────────────────────
-  interface AgentStep {
-    id: string;
+  export interface RunFailure {
     label: string;
-    description: string;
-    status: 'running' | 'completed';
-    result?: string;
-    toolDetails?: string[];
+    detail: string;
+    recovery: string;
+    question: string;
+    // Ссылка на вход нужна только когда доступ истёк: в остальных отказах
+    // перелогин ничего не меняет, и предлагать его — значит уводить человека
+    // от причины.
+    login?: boolean;
   }
 
-  interface ChatMessage {
-    id: string;
-    role: 'user' | 'assistant';
-    content: string;
-    timestamp: number;
-    agentSteps?: AgentStep[];
-    answer?: AnswerPayload;
-    evaluation?: EvaluationRun;
-    isRefinement?: boolean;
-    error?: string;
-    retryQuery?: string;
+  // Поля шага приходят из потока и могут отсутствовать: клиент не додумывает
+  // за сервер ни узла, ни состояния, ни длительности — null рисуется как
+  // «нет данных».
+  export interface TrailStep {
+    agent: string | null;
+    status: AgentEvent['status'] | null;
+    message: string | null;
+    duration_ms: number | null;
   }
 
-  // ── State ──────────────────────────────────────────────────────
-  let messages = $state<ChatMessage[]>([]);
-  let input = $state('');
-  let loading = $state(false);
-  let messagesContainer: HTMLDivElement | null = $state(null);
-  let status: SystemStatus | null = $state(null);
-
-  // Graph panel state
-  let graphPanelOpen = $state(false);
-  let graphPanelData = $state<GraphSnapshot>({ nodes: [], edges: [], communities: [] });
-  let graphSelectedId = $state<string | undefined>(undefined);
-
-  // Refinement state
-  let refiningMessageId = $state<string | null>(null);
-  let refinementInput = $state('');
-
-  // Correction state
-  let correctingMessageId = $state<string | null>(null);
-  let correctionText = $state('');
-  let correctionSubmitted = $state(false);
-
-  // Feedback state
-  let feedbackMessageId = $state<string | null>(null);
-  let feedbackHelpful = $state<boolean | null>(null);
-  let feedbackText = $state('');
-  let feedbackSubmitted = $state(false);
-
-  // Expandable sections
-  let expandedSources = $state<Set<string>>(new Set());
-  let expandedFindings = $state<Set<string>>(new Set());
-
-  // Expanded source items (full quote)
-  let expandedSourceItems = $state<Set<string>>(new Set());
-
-  // Expanded trace (agent timeline)
-  let expandedTrace = $state<Set<string>>(new Set());
-
-  const API_URL = env.PUBLIC_API_URL || '/backend';
-
-  // ── Helpers ────────────────────────────────────────────────────
-  function uid(): string {
-    return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  export interface SheetNotice {
+    kind: 'ok' | 'error';
+    title: string;
+    detail: string;
   }
 
-  function pct(v: number): string {
-    return `${Math.round(v * 100)}%`;
+  export type HistoryResult =
+    | { history: ClaimHistory; error?: undefined }
+    | { history: null; error: string };
+
+  interface Measure {
+    key: string;
+    property: string;
+    propertyCode: string | null;
+    operatorLabel: string;
+    valueText: string;
+    unit: string;
+    normalizedText: string;
+    normalizedUnit: string;
+    raw: string;
+    left: number;
+    width: number;
+    limits: { at: number; label: string }[];
+    scaleFrom: string;
+    scaleTo: string;
+    filterNote: string;
+    outsideFilter: boolean;
   }
 
-  function confColor(v: number): string {
-    if (v >= 0.7) return '#1f7650';
-    if (v >= 0.4) return '#a66513';
-    return '#ad3434';
+  interface Props {
+    question: string;
+    answer: AnswerPayload | null;
+    running: boolean;
+    steps: TrailStep[];
+    elapsedMs: number;
+    error: RunFailure | null;
+    corpus: CorpusStats | null;
+    corpusState: 'loading' | 'ready' | 'error';
+    examples: string[];
+    examplesState: 'loading' | 'ready' | 'error';
+    openClaimId: string | null;
+    focusKey: string | null;
+    busy: 'correction' | 'feedback' | 'export' | 'import' | null;
+    notice: SheetNotice | null;
+    // Вопрос, пришедший со входа в раздел: им лишь заполняется поле,
+    // сам проход по нему не запускается.
+    seed: string;
+    onask: (question: string) => void;
+    onstop: () => void;
+    onselect: (id: string | null) => void;
+    onfocus: (key: string | null) => void;
+    oncorrection: (input: {
+      finding: Finding;
+      comment: string;
+      correction: string;
+    }) => Promise<boolean>;
+    onfeedback: (input: { verdict: 'accept' | 'reject'; comment: string }) => Promise<boolean>;
+    onexport: (format: 'markdown' | 'json-ld') => Promise<boolean>;
+    onimport: (file: File) => Promise<boolean>;
+    onnotice: (notice: SheetNotice | null) => void;
+    onhistory: (claimId: string) => Promise<HistoryResult>;
+    onexamples: () => void;
   }
 
-  function statusLabel(mode: string): string {
-    const map: Record<string, string> = {
-      yandex: 'YandexGPT', gigachat: 'GigaChat', fallback: 'Резервный режим', scripted: 'Демо-режим',
-    };
-    return map[mode] ?? mode;
-  }
+  const {
+    question,
+    answer,
+    running,
+    steps,
+    elapsedMs,
+    error,
+    corpus,
+    corpusState,
+    examples,
+    examplesState,
+    openClaimId,
+    focusKey,
+    busy,
+    notice,
+    seed = '',
+    onask,
+    onstop,
+    onselect,
+    onfocus,
+    oncorrection,
+    onfeedback,
+    onexport,
+    onimport,
+    onnotice,
+    onhistory,
+    onexamples,
+  }: Props = $props();
 
-  function formatTime(ts: number): string {
-    return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-  }
+  // ── Имена реальных значений контракта ─────────────────────────────────────
+  // Статусы, намерения, узлы, операторы и свойства берутся из `terms.ts`:
+  // здесь остаются только те словари, которых в нём нет (инструменты обхода,
+  // исход шага, стадии прохода).
 
-  // ── Agent Steps Builder ────────────────────────────────────────
-  function buildAgentSteps(): AgentStep[] {
-    return [
-      { id: 'plan', label: 'Планировщик', description: 'Анализ запроса и планирование инструментов', status: 'running' },
-      { id: 'search', label: 'Поиск', description: 'Гибридный поиск по корпусу и графу', status: 'running' },
-      { id: 'analyze', label: 'Анализ', description: 'Извлечение фактов и числовых данных', status: 'running' },
-      { id: 'synth', label: 'Синтез', description: 'Формирование ответа с доказательствами', status: 'running' },
-      { id: 'critic', label: 'Критика', description: 'Проверка конфликтов и пробелов', status: 'running' },
-      { id: 'improve', label: 'Улучшение', description: 'Оценка качества и доработка', status: 'running' },
-    ];
-  }
-
-  const toolLabels: Record<string, string> = {
+  const TOOL_LABELS: Record<string, string> = {
     hybrid_search: 'Гибридный поиск',
     graph_traverse: 'Обход графа',
     community_search: 'Поиск по сообществам',
@@ -130,1715 +176,2800 @@
     expert_lookup: 'Поиск экспертов',
   };
 
-  function updateStepsWithResult(steps: AgentStep[], answer: AnswerPayload): AgentStep[] {
-    const evidenceCount = answer.findings.reduce((sum, f) => sum + f.evidence.length, 0);
-    const conflictCount = answer.conflicts.length;
-    const gapCount = answer.knowledge_gaps.length;
-    const toolCount = answer.tool_observations.length;
-    const toolSummaries = answer.tool_observations.map((t) =>
-      `${toolLabels[t.tool] ?? t.tool}: ${t.summary}`
-    );
-    return steps.map((s) => {
-      const updated = { ...s, status: 'completed' as const };
-      if (s.id === 'plan') updated.result = `${answer.tool_observations.length} инструментов запланировано`;
-      if (s.id === 'search') {
-        updated.result = `${evidenceCount} источников · ${toolCount} инструментов`;
-        updated.toolDetails = toolSummaries;
-      }
-      if (s.id === 'analyze') updated.result = `${answer.findings.length} утверждений извлечено`;
-      if (s.id === 'synth') updated.result = 'Ответ сформирован';
-      if (s.id === 'critic') updated.result = `${conflictCount} конфликтов, ${gapCount} пробелов`;
-      if (s.id === 'improve') updated.result = `Уверенность: ${pct(answer.confidence)}`;
-      return updated;
-    });
-  }
-
-  function toggleTrace(msgId: string): void {
-    const next = new Set(expandedTrace);
-    if (next.has(msgId)) next.delete(msgId);
-    else next.add(msgId);
-    expandedTrace = next;
-  }
-
-  function agentLabel(agent: string): string {
-    const map: Record<string, string> = {
-      intent_router: 'Маршрутизатор намерений',
-      planner: 'Планировщик',
-      action_planner: 'Планировщик действий',
-      tool_executor: 'Исполнитель инструментов',
-      controller: 'Контроллер',
-      reasoner: 'Анализ',
-      critic: 'Критика',
-      improver: 'Улучшение',
-      synthesizer: 'Синтез',
-    };
-    return map[agent] ?? agent;
-  }
-
-  async function animateSteps(messageId: string, steps: AgentStep[]): Promise<void> {
-    for (let i = 0; i < steps.length; i++) {
-      await new Promise((r) => setTimeout(r, 200));
-      const msg = messages.find((m) => m.id === messageId);
-      if (!msg || !msg.agentSteps) return;
-      msg.agentSteps = msg.agentSteps.map((s, idx) =>
-        idx <= i ? { ...s, status: 'completed' as const } : s
-      );
-      messages = [...messages];
-    }
-  }
-
-  // ── SSE Streaming ─────────────────────────────────────────────
-  const sseAgentToStepId: Record<string, string> = {
-    intent_router: 'plan',
-    planner: 'plan',
-    action_planner: 'plan',
-    tool_executor: 'search',
-    controller: 'search',
-    reasoner: 'analyze',
-    synthesizer: 'synth',
-    critic: 'critic',
-    improver: 'improve',
+  const OBS_LABELS: Record<string, string> = {
+    success: 'выполнено',
+    warning: 'с предупреждением',
+    error: 'с ошибкой',
   };
 
-  function updateStepFromSSE(
-    messageId: string,
-    step: { agent: string; status: string; message?: string },
-  ): void {
-    const msg = messages.find((m) => m.id === messageId);
-    if (!msg || !msg.agentSteps) return;
-    const stepId = sseAgentToStepId[step.agent];
-    if (!stepId) return;
-    msg.agentSteps = msg.agentSteps.map((s) => {
-      if (s.id !== stepId) return s;
-      return {
-        ...s,
-        status: step.status === 'completed' ? 'completed' as const : 'running' as const,
-        result: step.message ?? s.result,
-      };
-    });
-    messages = [...messages];
+  type StageKey = 'setup' | 'traverse' | 'answer' | 'other';
+
+  const STAGES: { key: StageKey; label: string; hint: string }[] = [
+    {
+      key: 'setup',
+      label: 'Постановка задачи',
+      hint: 'как прочитан вопрос: сущности, фильтры, география, период, глубина',
+    },
+    { key: 'traverse', label: 'Обход графа', hint: 'что вернул обход и чего не хватает' },
+    { key: 'answer', label: 'Сборка ответа', hint: 'тезисы, проверка и ревизии' },
+    { key: 'other', label: 'Иные шаги', hint: 'события вне трёх стадий' },
+  ];
+
+  // Стадии соответствуют узлам ResearchWorkflow.stream: узел, которого в таблице
+  // нет, честно попадает в «иные шаги», а не теряется.
+  const AGENT_STAGE: Record<string, StageKey> = {
+    planning_agent: 'setup',
+    action_planner: 'traverse',
+    tool_executor: 'traverse',
+    controller: 'traverse',
+    reasoner: 'answer',
+    critic: 'answer',
+    improver: 'answer',
+    synthesizer: 'answer',
+    finalize: 'answer',
+  };
+
+  // Цвет плашки шага: «готово» — состояние по умолчанию, а не успех, поэтому
+  // оно нейтральное; заметно только отклонение.
+  function stepPill(status: AgentEvent['status']): 'off' | 'hypothesis' | 'disputed' {
+    if (status === 'failed') return 'disputed';
+    if (status === 'revised') return 'hypothesis';
+    return 'off';
   }
 
-  async function streamQuery(query: string, assistantId: string): Promise<void> {
-    const response = await fetch(`${API_URL}/api/v1/query/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...getRoleHeaders() },
-      body: JSON.stringify({ question: query, language: 'ru', mode: 'hybrid' }),
-    });
+  // ── Локальное состояние листа ────────────────────────────────────────────
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    if (!response.body) {
-      throw new Error('No response body for streaming');
-    }
+  let flow = $state<HTMLDivElement | null>(null);
+  let rail = $state<HTMLElement | null>(null);
+  let narrow = $state(false);
+  let draft = $state('');
+  let seeded = false;
+  let guideOpen = $state(false);
+  let correctionFor = $state<string | null>(null);
+  let correctionComment = $state('');
+  let correctionText = $state('');
+  let feedbackVerdict = $state<'accept' | 'reject' | null>(null);
+  let feedbackComment = $state('');
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        let data: { type: string; step?: { agent: string; status: string; message?: string }; answer?: AnswerPayload | QueryResponse; message?: string; error?: string };
-        try {
-          data = JSON.parse(line.slice(6));
-        } catch {
-          continue;
-        }
-        if (data.type === 'step' && data.step) {
-          updateStepFromSSE(assistantId, data.step);
-        } else if (data.type === 'answer' && data.answer) {
-          // Handle both QueryResponse and bare AnswerPayload formats
-          let answer: AnswerPayload;
-          let evaluation: EvaluationRun | undefined;
-          if ('answer' in data.answer && data.answer.answer) {
-            const qr = data.answer as QueryResponse;
-            answer = qr.answer;
-            evaluation = qr.evaluation;
-          } else {
-            answer = data.answer as AnswerPayload;
-          }
-          const msg = messages.find((m) => m.id === assistantId);
-          if (!msg) return;
-          msg.agentSteps = updateStepsWithResult(msg.agentSteps!, answer);
-          msg.answer = answer;
-          msg.evaluation = evaluation;
-          msg.content = answer.summary;
-          messages = [...messages];
-          await scrollToBottom();
-        } else if (data.type === 'done') {
-          const msg = messages.find((m) => m.id === assistantId);
-          if (msg && msg.agentSteps) {
-            msg.agentSteps = msg.agentSteps.map((s) => ({ ...s, status: 'completed' as const }));
-            messages = [...messages];
-          }
-        } else if (data.type === 'error') {
-          throw new Error(data.message || data.error || 'Ошибка потоковой передачи');
-        }
-      }
-    }
+  // История версий — по каждому утверждению отдельно: загрузка одного тезиса не
+  // перекрашивает остальные, и отказ относится к одному месту, а не ко всем.
+  interface HistoryState {
+    busy: boolean;
+    error: string;
+    data: ClaimHistory | null;
   }
+  const EMPTY_HISTORY: HistoryState = { busy: false, error: '', data: null };
+  let histories = $state<Record<string, HistoryState>>({});
 
-  // ── API Calls ─────────────────────────────────────────────────
-  async function sendMessage(query: string, isRefinement = false): Promise<void> {
-    if (!query.trim() || loading) return;
+  let trailUser = $state<boolean | null>(null);
+  let scaleUser = $state<boolean | null>(null);
 
-    const userMsg: ChatMessage = {
-      id: uid(), role: 'user', content: query, timestamp: Date.now(),
-    };
-    const assistantId = uid();
-    const assistantMsg: ChatMessage = {
-      id: assistantId, role: 'assistant', content: '', timestamp: Date.now(),
-      agentSteps: buildAgentSteps(), isRefinement,
-    };
-    messages = [...messages, userMsg, assistantMsg];
-    input = '';
-    loading = true;
-    await scrollToBottom();
+  const canAsk = $derived(session.can('query:ask'));
+  const canExport = $derived(session.can('export:run'));
+  const canFeedback = $derived(session.can('feedback:give'));
+  const canSupersede = $derived(session.can('restricted:read'));
 
-    try {
-      // Try SSE streaming first
-      await streamQuery(query, assistantId);
-    } catch (streamErr) {
-      // If we already received the answer via streaming, just finalize
-      const existingMsg = messages.find((m) => m.id === assistantId);
-      if (existingMsg && existingMsg.answer) {
-        if (existingMsg.agentSteps) {
-          existingMsg.agentSteps = existingMsg.agentSteps.map((s) => ({ ...s, status: 'completed' as const }));
-          messages = [...messages];
-        }
-        return;
-      }
+  const draftValid = $derived(draft.trim().length >= 3);
+  const corpusEmpty = $derived(corpus ? corpus.documents === 0 : null);
+  // Ответ уже лёг в лист, а проход ещё открыт: это реальный момент, когда
+  // маскот «говорит», а не выдуманное состояние.
+  const answerArriving = $derived(running && answer !== null);
 
-      // Fall back to non-streaming endpoint
-      try {
-        const result: QueryResponse = await api.query(query);
-        const answer = result.answer;
-
-        const msg = messages.find((m) => m.id === assistantId);
-        if (!msg) return;
-        msg.agentSteps = updateStepsWithResult(msg.agentSteps!, answer);
-        msg.answer = answer;
-        msg.evaluation = result.evaluation;
-        msg.content = answer.summary;
-        messages = [...messages];
-
-        await animateSteps(assistantId, msg.agentSteps!);
-
-        const finalMsg = messages.find((m) => m.id === assistantId);
-        if (finalMsg && finalMsg.agentSteps) {
-          finalMsg.agentSteps = finalMsg.agentSteps.map((s) => ({ ...s, status: 'completed' as const }));
-          messages = [...messages];
-        }
-      } catch (err) {
-        const msg = messages.find((m) => m.id === assistantId);
-        if (!msg) return;
-        const errMsg = err instanceof Error ? err.message : 'Неизвестная ошибка';
-        if (errMsg.includes('403') || errMsg.includes('Forbidden')) {
-          msg.error = 'Нет доступа. Проверьте роль пользователя.';
-        } else if (errMsg.includes('500') || errMsg.includes('Internal')) {
-          msg.error = 'Произошла ошибка. Попробуйте переформулировать вопрос.';
-        } else if (errMsg.includes('fetch') || errMsg.includes('Network')) {
-          msg.error = 'Не удалось подключиться к серверу. Проверьте, что бэкенд запущен.';
-        } else {
-          msg.error = errMsg;
-        }
-        msg.retryQuery = query;
-        msg.agentSteps = [];
-        messages = [...messages];
-      }
-    } finally {
-      loading = false;
-    }
-  }
-
-  async function retry(msg: ChatMessage): Promise<void> {
-    if (!msg.retryQuery) return;
-    // Remove the error message
-    messages = messages.filter((m) => m.id !== msg.id);
-    await sendMessage(msg.retryQuery, msg.isRefinement);
-  }
-
-  // ── Graph Panel ────────────────────────────────────────────────
-  function openGraph(msg: ChatMessage): void {
-    if (!msg.answer) return;
-    graphPanelData = msg.answer.graph;
-    graphSelectedId = undefined;
-    graphPanelOpen = true;
-  }
-
-  function closeGraph(): void {
-    graphPanelOpen = false;
-  }
-
-  function showFindingInGraph(msg: ChatMessage, finding: Finding): void {
-    if (!msg.answer) return;
-    graphPanelData = msg.answer.graph;
-    // Try to match finding.id to a graph node
-    const matchId = msg.answer.graph.nodes.find(
-      (n) => n.id === finding.id || n.id === finding.id.replace('finding-', '')
-    )?.id;
-    graphSelectedId = matchId;
-    graphPanelOpen = true;
-  }
-
-  // ── Expandable Sections ────────────────────────────────────────
-  function toggleSources(msgId: string): void {
-    const next = new Set(expandedSources);
-    if (next.has(msgId)) next.delete(msgId);
-    else next.add(msgId);
-    expandedSources = next;
-  }
-
-  function toggleFindings(msgId: string): void {
-    const next = new Set(expandedFindings);
-    if (next.has(msgId)) next.delete(msgId);
-    else next.add(msgId);
-    expandedFindings = next;
-  }
-
-  function toggleSourceItem(itemId: string): void {
-    const next = new Set(expandedSourceItems);
-    if (next.has(itemId)) next.delete(itemId);
-    else next.add(itemId);
-    expandedSourceItems = next;
-  }
-
-  // ── Refinement Flow ────────────────────────────────────────────
-  function startRefinement(msg: ChatMessage): void {
-    refiningMessageId = msg.id;
-    refinementInput = '';
-    correctingMessageId = null;
-    feedbackMessageId = null;
-  }
-
-  function cancelRefinement(): void {
-    refiningMessageId = null;
-    refinementInput = '';
-  }
-
-  async function submitRefinement(msg: ChatMessage): Promise<void> {
-    if (!refinementInput.trim() || !msg.answer) return;
-    const originalQuery = msg.answer.question;
-    const newQuery = `${originalQuery} Уточнение: ${refinementInput}`;
-    refiningMessageId = null;
-    refinementInput = '';
-    await sendMessage(newQuery, true);
-  }
-
-  // ── Correction Flow (Self-Evolving) ────────────────────────────
-  function startCorrection(msg: ChatMessage): void {
-    correctingMessageId = msg.id;
-    correctionText = msg.content || msg.answer?.summary || '';
-    correctionSubmitted = false;
-    refiningMessageId = null;
-    feedbackMessageId = null;
-  }
-
-  function cancelCorrection(): void {
-    correctingMessageId = null;
-    correctionText = '';
-    correctionSubmitted = false;
-  }
-
-  async function submitCorrection(msg: ChatMessage): Promise<void> {
-    if (!msg.answer || !correctionText.trim()) return;
-    try {
-      await fetch(`${API_URL}/api/v1/feedback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getRoleHeaders() },
-        body: JSON.stringify({
-          query_id: msg.answer.query_id,
-          finding_id: null,
-          verdict: 'correct',
-          comment: 'Исправление ответа от пользователя',
-          correction: correctionText,
-        }),
-      });
-      correctionSubmitted = true;
-    } catch {
-      correctionSubmitted = true;
-    }
-    setTimeout(() => {
-      correctingMessageId = null;
-      correctionText = '';
-      correctionSubmitted = false;
-    }, 3000);
-  }
-
-  // ── Feedback Flow ──────────────────────────────────────────────
-  function startFeedback(msg: ChatMessage): void {
-    feedbackMessageId = msg.id;
-    feedbackHelpful = null;
-    feedbackText = '';
-    feedbackSubmitted = false;
-    refiningMessageId = null;
-    correctingMessageId = null;
-  }
-
-  function cancelFeedback(): void {
-    feedbackMessageId = null;
-    feedbackHelpful = null;
-    feedbackText = '';
-    feedbackSubmitted = false;
-  }
-
-  async function submitFeedback(msg: ChatMessage): Promise<void> {
-    if (!msg.answer) return;
-    const helpful = feedbackHelpful ?? true;
-    const comment = feedbackText.trim().length >= 3
-      ? feedbackText.trim()
-      : (helpful ? 'Ответ был полезен' : 'Ответ не был полезен');
-    try {
-      await fetch(`${API_URL}/api/v1/feedback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getRoleHeaders() },
-        body: JSON.stringify({
-          query_id: msg.answer.query_id,
-          finding_id: null,
-          verdict: helpful ? 'accept' : 'reject',
-          comment,
-        }),
-      });
-    } catch { /* ignore */ }
-    feedbackSubmitted = true;
-    setTimeout(() => {
-      feedbackMessageId = null;
-      feedbackHelpful = null;
-      feedbackText = '';
-      feedbackSubmitted = false;
-    }, 3000);
-  }
-
-  // ── Input Handling ─────────────────────────────────────────────
-  function handleKeyDown(e: KeyboardEvent): void {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage(input);
-    }
-  }
-
-  function handleInput(): void {
-    // Auto-resize handled by CSS
-  }
-
-  // ── Derived Data ───────────────────────────────────────────────
-  function getAllEvidence(answer: AnswerPayload): { evidence: Evidence; finding: Finding }[] {
-    return answer.findings.flatMap((f) => f.evidence.map((e) => ({ evidence: e, finding: f })));
-  }
-
-  function evidenceCount(answer: AnswerPayload): number {
-    return answer.findings.reduce((sum, f) => sum + f.evidence.length, 0);
-  }
-
-  // ── Scroll ─────────────────────────────────────────────────────
-  async function scrollToBottom(): Promise<void> {
-    await tick();
-    if (messagesContainer) {
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
-    }
-  }
-
-  // ── Lifecycle ──────────────────────────────────────────────────
-  onMount(async () => {
-    try {
-      status = await api.status();
-    } catch {
-      status = null;
-    }
+  // Вопрос со входа в раздел подставляется в поле один раз и сразу запускается:
+  // человек уже отправил его с входной страницы, повторять нажатие не нужно.
+  // Пока сессия не подтверждена, ждём — права на проход приходят с сервера.
+  $effect.pre(() => {
+    const value = seed;
+    if (seeded || !value) return;
+    draft = value;
+    if (!canAsk) return;
+    seeded = true;
+    queueMicrotask(() => onask(value.trim()));
   });
+
+  // След сворачивается сам, когда проход закончился, но решение человека
+  // всегда перекрывает авто-состояние.
+  const trailOpen = $derived(trailUser ?? running);
+  const scaleOpen = $derived(scaleUser ?? !narrow);
+
+  // Узкий экран — одна вертикальная композиция: шкала и след убираются в
+  // раскрытия. $effect.pre, чтобы не мелькать развёрнутым списком на мобильном.
+  $effect.pre(() => {
+    const query = window.matchMedia('(max-width: 1119px)');
+    const sync = () => {
+      narrow = query.matches;
+    };
+    sync();
+    query.addEventListener('change', sync);
+    return () => query.removeEventListener('change', sync);
+  });
+
+  // Новый прогон не наследует правки, вердикты и истории прошлого листа.
+  const runKey = $derived(`${answer?.query_id ?? 'нет'}|${running ? 'идёт' : 'стоп'}`);
+  $effect(() => {
+    void runKey;
+    correctionFor = null;
+    correctionComment = '';
+    correctionText = '';
+    feedbackVerdict = null;
+    feedbackComment = '';
+    histories = {};
+  });
+
+  const railGroups = $derived(groupIntervals(answer?.findings ?? []));
+  const trailSteps = $derived<TrailStep[]>(
+    steps.length ? steps : (answer?.trace ?? []).map((step) => ({ ...step })),
+  );
+
+  function stageOf(agent: string): StageKey {
+    return AGENT_STAGE[agent] ?? 'other';
+  }
+
+  function stepsFor(key: StageKey): TrailStep[] {
+    return trailSteps.filter((step) => (step.agent ? stageOf(step.agent) : 'other') === key);
+  }
+
+  const stageStrip = $derived(
+    STAGES.filter((stage) => stage.key !== 'other' && stepsFor(stage.key).length > 0).map((stage) => ({
+      label: stage.label,
+      count: stepsFor(stage.key).length,
+    })),
+  );
+
+  const evidenceTotal = $derived(
+    answer ? answer.findings.reduce((sum, finding) => sum + finding.evidence.length, 0) : 0,
+  );
+
+  // ── Форматирование ──────────────────────────────────────────────────────
+
+  function seconds(ms: number): string {
+    return `${(ms / 1000).toFixed(1)} с`;
+  }
+
+  function shortCode(value: string | null | undefined, size = 8): string {
+    if (!value) return '—';
+    return value.slice(0, size);
+  }
+
+  function keyOf(finding: Finding, index: number): string {
+    return `${finding.id}#${index}`;
+  }
+
+  function prefersReduced(): boolean {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+
+  // ── Служебные строки прохода ──────────────────────────────────────────────
+  // Рабочий процесс пишет часть строк ключами онтологии и по-английски
+  // (workflow.py). Правим только эти, проверенные шаблоны; незнакомый текст
+  // остаётся как есть — переводить данные, которые нельзя назвать, интерфейс не
+  // вправе.
+  const DECISION_WORDS: Record<string, string> = {
+    continue_tools: 'ищем недостающие доказательства',
+    reason: 'переходим к ответу',
+  };
+
+  const SERVER_PHRASES: { pattern: RegExp; say: (parts: string[]) => string }[] = [
+    {
+      pattern: /^Intent=([a-z_]+), план из (\d+) действий$/i,
+      say: ([intent, count]) =>
+        `вопрос прочитан как «${termOf(INTENT_LABELS, intent)}» · план: ${countOf(
+          Number(count),
+          'действие',
+          'действия',
+          'действий',
+        )}`,
+    },
+    {
+      pattern: /^(\d+) actions → (\d+) findings, (\d+) конфликтов, (\d+) пробелов$/i,
+      say: ([actions, findings, conflicts, gaps]) =>
+        [
+          countOf(Number(actions), 'действие', 'действия', 'действий'),
+          countOf(Number(findings), 'утверждение', 'утверждения', 'утверждений'),
+          countOf(Number(conflicts), 'расхождение', 'расхождения', 'расхождений'),
+          countOf(Number(gaps), 'пробел', 'пробела', 'пробелов'),
+        ].join(' · '),
+    },
+    {
+      pattern: /^Перепланировано: (\d+) actions$/i,
+      say: ([count]) =>
+        `план обновлён: ${countOf(Number(count), 'действие', 'действия', 'действий')}`,
+    },
+    {
+      pattern: /^Решение: (continue_tools|reason)(?:; пробелы: (\d+))?$/i,
+      say: ([decision, missing]) =>
+        DECISION_WORDS[decision.toLowerCase()] +
+        (missing ? ` · не хватает подтверждений: ${missing}` : ''),
+    },
+    { pattern: /^Собран answer на подтверждённых findings$/i, say: () => 'ответ собран по подтверждённым утверждениям' },
+    { pattern: /^Critic одобрил ответ$/i, say: () => 'проверка ответа пройдена' },
+    {
+      pattern: /^Ревизия ответа по замечаниям Critic$/i,
+      say: () => 'ответ пересобран по замечаниям проверки',
+    },
+    { pattern: /^Деградированный ответ: (.+)$/i, say: ([reason]) => `ответ неполный: ${reason}` },
+    { pattern: /^Ответ собран$/i, say: () => 'ответ собран' },
+  ];
+
+  function agentName(key: string | null | undefined): string | null {
+    if (!key) return null;
+    return AGENT_LABELS[key] ?? AGENT_LABELS[key.toLowerCase()] ?? null;
+  }
+
+  // Замечания проверки и причины деградации приходят свободным текстом и
+  // склеиваются в одну строку: служебные имена, перечни идентификаторов и классы
+  // python-ошибок вычищаются по частям.
+  // Все замены — функциями: `String.replace` не принимает смешанный набор
+  // «строка или функция», а возвращаемая строка нужна одна и та же.
+  const PROSE_FIXES: [RegExp, (...parts: string[]) => string][] = [
+    [/неизвестные finding ids:\s*\[[^\]]*\]/gi, () => 'утверждения вне собранного доказательства'],
+    [/числовая fidelity не выдержана/gi, () => 'числа не подтверждены цитатами'],
+    [/\bfinding ids?\b/gi, () => 'идентификаторы утверждений'],
+    // Идентификатор записи в середине предложения аналитику не о чём говорит.
+    [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, () => 'утверждение'],
+    [
+      /узел ([a-z_]+) завершился ошибкой(?:\s*\([^)]*\))?/gi,
+      (_all: string, node: string) => `${agentName(node) ?? 'шаг прохода'}: сбой`,
+    ],
+    [
+      /^Узел ([a-z_]+):/i,
+      (_all: string, node: string) => `${agentName(node) ?? 'Проход'}:`,
+    ],
+  ];
+
+  function phraseOf(text: string): string {
+    let phrase = text;
+    for (const { pattern, say } of SERVER_PHRASES) {
+      const match = pattern.exec(text);
+      if (match) {
+        phrase = say(match.slice(1).map((part) => part ?? ''));
+        break;
+      }
+    }
+    return PROSE_FIXES.reduce(
+      (value, [pattern, replacement]) => value.replace(pattern, replacement),
+      phrase,
+    );
+  }
+
+  // Полоса интервала: цвет несёт статус, поэтому варианты consensus/disputed
+  // берут классы из `app.css`; «гипотеза» доопределена ниже единственной строкой.
+  function bandClass(status: Finding['status']): string {
+    if (status === 'disputed') return 'bar__fill--disputed';
+    if (status === 'consensus') return 'bar__fill--consensus';
+    return '';
+  }
+
+  function stepName(step: TrailStep): { label: string; code: string | null } {
+    const known = agentName(step.agent);
+    if (known) return { label: known, code: null };
+    return { label: 'шаг прохода', code: step.agent ?? null };
+  }
+
+  function stepNote(step: TrailStep): string {
+    if (step.duration_ms == null) return 'нет данных';
+    return step.duration_ms > 0 ? seconds(step.duration_ms) : '—';
+  }
+
+  function signOf(operator: string): string {
+    if (operator === 'range') return OPERATOR_SYMBOL.between;
+    return OPERATOR_SYMBOL[operator as NumericObservation['operator']] ?? operator;
+  }
+
+  function labelOf(operator: string): string {
+    return OPERATOR_WORD[operator as NumericObservation['operator']] ?? operator;
+  }
+
+  // Ключ онтологии в русском имени или техническая подпись, когда имени нет:
+  // сырой ключ в позицию заголовка или текста не попадает.
+  function termPair(
+    map: Record<string, string>,
+    key: string | null | undefined,
+    whenMissing: string,
+  ): { label: string; code: string | null } {
+    if (!key) return { label: whenMissing, code: null };
+    const known = knownTerm(map, key);
+    return known ? { label: known, code: null } : { label: whenMissing, code: key };
+  }
+
+  function propertyTerm(name: string): { label: string; code: string | null } {
+    return termPair(PROPERTY_LABELS, name, 'свойство вне словаря');
+  }
+
+  function subjectTerm(finding: Finding): { label: string; code: string | null } {
+    return termPair(SUBJECT_LABELS, finding.subject, 'субъект не указан');
+  }
+
+  function predicateTerm(finding: Finding): { label: string; code: string | null } {
+    return termPair(PREDICATE_LABELS, finding.predicate, 'предикат не указан');
+  }
+
+  function filterText(filter: {
+    operator: string;
+    value?: number;
+    min_value?: number;
+    max_value?: number;
+    unit: string;
+  }): string {
+    if (filter.operator === 'between' || filter.operator === 'range') {
+      return `${num(filter.min_value ?? 0)}–${num(filter.max_value ?? 0)} ${filter.unit}`;
+    }
+    return `${signOf(filter.operator)} ${num(filter.value ?? 0)} ${filter.unit}`;
+  }
+
+  // Источник тезиса: название документа, а не идентификатор записи — UUID сам
+  // по себе аналитику не о чём говорит.
+  function sourceOf(finding: Finding): string {
+    return finding.evidence[0]?.source_title || 'запись корпуса';
+  }
+
+  function railCode(finding: Finding): string {
+    const evidence = finding.evidence[0];
+    if (!evidence) return 'без ссылки на источник';
+    const place =
+      evidence.page != null
+        ? `с. ${evidence.page}`
+        : evidence.sheet
+          ? `лист ${evidence.sheet}`
+          : (evidence.cell_range ?? '');
+    return `${evidence.source_title || 'запись корпуса'}${place ? ` · ${place}` : ''}`;
+  }
+
+  function locParts(evidence: Evidence): string[] {
+    const parts: string[] = [];
+    if (evidence.page != null) parts.push(`стр. ${evidence.page}`);
+    if (evidence.sheet) parts.push(`лист ${evidence.sheet}`);
+    if (evidence.cell_range) parts.push(`ячейки ${evidence.cell_range}`);
+    if (evidence.char_start != null) {
+      parts.push(`сим. ${evidence.char_start}–${evidence.char_end ?? evidence.char_start}`);
+    }
+    return parts.length ? parts : ['без локатора'];
+  }
+
+  function scopeText(scope: Record<string, string> | undefined): string {
+    const conditions = describeScope(scope);
+    return conditions.length ? conditions.join(' · ') : 'условия не заданы';
+  }
+
+  function reviewDate(value: string | null): string {
+    if (!value) return '—';
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('ru-RU');
+  }
+
+  // ── Число: значение, нормализация и относительно фильтра запроса ─────────
+
+  function envelope(observation: NumericObservation): [number, number] | null {
+    const lo = observation.normalized_min ?? observation.min_value;
+    const hi = observation.normalized_max ?? observation.max_value;
+    if (lo != null && hi != null) return [lo, hi];
+    const point = observation.normalized_value ?? observation.value;
+    return point == null ? null : [point, point];
+  }
+
+  function rawText(observation: NumericObservation): string {
+    const lo = observation.min_value;
+    const hi = observation.max_value;
+    if (observation.operator === 'between' && lo != null && hi != null) return `${num(lo)}–${num(hi)}`;
+    return observation.value == null ? observation.raw_text : num(observation.value);
+  }
+
+  function normalizedText(observation: NumericObservation): string {
+    const range = envelope(observation);
+    if (observation.operator === 'between' && range) return `${num(range[0])}–${num(range[1])}`;
+    const point = observation.normalized_value ?? observation.value;
+    return point == null ? '—' : num(point);
+  }
+
+  function niceCeil(value: number): number {
+    if (!Number.isFinite(value) || value === 0) return 1;
+    const magnitude = 10 ** Math.floor(Math.log10(Math.abs(value)));
+    return (Math.ceil((value / magnitude) * 4) / 4) * magnitude;
+  }
+
+  type Filter = AnswerPayload['query_plan']['numeric_filters'][number];
+
+  function filterRange(filter: Filter): [number, number] {
+    if (filter.operator === 'between' || filter.operator === 'range') {
+      return [filter.min_value ?? 0, filter.max_value ?? 0];
+    }
+    if (filter.operator === 'lte' || filter.operator === 'lt') return [-Infinity, filter.value ?? 0];
+    if (filter.operator === 'gte' || filter.operator === 'gt') return [filter.value ?? 0, Infinity];
+    const point = filter.value ?? 0;
+    return [point, point];
+  }
+
+  function measureOf(finding: Finding, observation: NumericObservation, index: number): Measure {
+    const range = envelope(observation);
+    const unit = observation.unit || observation.normalized_unit;
+    const axisUnit = observation.normalized_unit || observation.unit;
+    const filters = (answer?.query_plan.numeric_filters ?? []).filter(
+      (filter) => filter.property_name.toLowerCase() === observation.property_name.toLowerCase(),
+    );
+    const comparable = filters.find((filter) => filter.unit === observation.normalized_unit) ?? null;
+    const comparableRange = comparable ? filterRange(comparable) : null;
+
+    const numbers = [
+      range?.[0],
+      range?.[1],
+      comparableRange?.[0],
+      comparableRange?.[1],
+    ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+
+    let from = 0;
+    let to = 1;
+    if (numbers.length) {
+      const peak = Math.max(...numbers);
+      const floor = Math.min(...numbers, 0);
+      const isPercent = axisUnit.trim() === '%' || axisUnit.trim() === 'проц';
+      to = isPercent ? Math.max(100, peak) : Math.max(niceCeil(peak * 1.25), niceCeil(peak));
+      from = floor < 0 ? -niceCeil(Math.abs(floor) * 1.25) : 0;
+      if (to <= from) to = from + 1;
+    }
+    const span = to - from;
+    const pos = (value: number) => Math.max(0, Math.min(100, ((value - from) / span) * 100));
+
+    let left = 0;
+    let width = 1.5;
+    if (range) {
+      left = pos(range[0]);
+      width = Math.max(pos(range[1]) - left, 1.5);
+    }
+    if (observation.operator === 'lt' || observation.operator === 'lte') {
+      left = 0;
+      width = Math.max(pos(range?.[1] ?? 0), 1.5);
+    }
+    if (observation.operator === 'gt' || observation.operator === 'gte') {
+      left = pos(range?.[0] ?? 0);
+      width = Math.max(100 - left, 1.5);
+    }
+
+    const limits: { at: number; label: string }[] = [];
+    if (range) {
+      if (observation.operator === 'between') {
+        limits.push({ at: pos(range[0]), label: `низ ${num(range[0])}` });
+        limits.push({ at: pos(range[1]), label: `верх ${num(range[1])}` });
+      } else {
+        limits.push({
+          at: pos(range[0]),
+          label: `${signOf(observation.operator)} ${num(range[0])}`,
+        });
+      }
+    }
+    if (comparable && comparableRange) {
+      const [filterLo, filterHi] = comparableRange;
+      if (Number.isFinite(filterLo)) limits.push({ at: pos(filterLo), label: `фильтр ${num(filterLo)}` });
+      if (Number.isFinite(filterHi) && filterHi !== filterLo) {
+        limits.push({ at: pos(filterHi), label: `фильтр ${num(filterHi)}` });
+      }
+    }
+
+    let outside = false;
+    if (comparableRange && range) {
+      outside = range[1] < comparableRange[0] || range[0] > comparableRange[1];
+    }
+
+    const property = propertyTerm(observation.property_name);
+
+    return {
+      key: `${finding.id}#${observation.property_name}#${index}`,
+      property: property.label,
+      propertyCode: property.code,
+      operatorLabel: labelOf(observation.operator),
+      valueText: rawText(observation),
+      unit,
+      normalizedText: normalizedText(observation),
+      normalizedUnit: axisUnit,
+      raw: observation.raw_text,
+      left,
+      width,
+      limits,
+      scaleFrom: num(from),
+      scaleTo: num(to),
+      filterNote: comparable
+        ? `условие плана: ${labelOf(comparable.operator)} ${filterText(comparable)}`
+        : '',
+      outsideFilter: outside,
+    };
+  }
+
+  function measuresOf(finding: Finding): Measure[] {
+    return finding.observations.map((observation, index) => measureOf(finding, observation, index));
+  }
+
+  function findingRange(finding: Finding): [number, number] | null {
+    const ranges = finding.observations
+      .map(envelope)
+      .filter((item): item is [number, number] => item !== null);
+    if (!ranges.length) return null;
+    return [Math.min(...ranges.map((item) => item[0])), Math.max(...ranges.map((item) => item[1]))];
+  }
+
+  function rivalsOf(finding: Finding): { finding: Finding; delta: number }[] {
+    if (!finding.subject || !finding.predicate || !answer) return [];
+    const own = findingRange(finding);
+    if (!own) return [];
+    const out: { finding: Finding; delta: number }[] = [];
+    for (const other of answer.findings) {
+      if (other.id === finding.id) continue;
+      if (other.subject !== finding.subject || other.predicate !== finding.predicate) continue;
+      const range = findingRange(other);
+      if (!range) continue;
+      if (range[1] >= own[0] && range[0] <= own[1]) continue;
+      out.push({
+        finding: other,
+        delta: range[0] > own[1] ? range[0] - own[1] : own[0] - range[1],
+      });
+    }
+    return out;
+  }
+
+  function valueSummary(finding: Finding): string {
+    if (!finding.observations.length) return 'числовых наблюдений нет';
+    return finding.observations.map(describeValue).join(' · ');
+  }
+
+  const filterRows = $derived(
+    (answer?.query_plan.numeric_filters ?? []).map((filter) => {
+      const [lo, hi] = filterRange(filter);
+      const covered = (answer?.findings ?? [])
+        .flatMap((finding) => finding.observations)
+        .filter((observation) => {
+          const range = envelope(observation);
+          if (!range || observation.property_name.toLowerCase() !== filter.property_name.toLowerCase()) {
+            return false;
+          }
+          return range[1] >= lo && range[0] <= hi;
+        }).length;
+      return { filter, covered };
+    }),
+  );
+
+  // ── Что показывать внутри стадии: только реальные поля ответа прогона ─────
+  // Виды собираются в скрипте, чтобы разметка не сужала типы на глаз.
+
+  const intentView = $derived.by(() => {
+    const intent = answer?.intent;
+    if (!intent) return null;
+    return {
+      label: termOf(INTENT_LABELS, intent.primary),
+      secondary: intent.secondary.length
+        ? intent.secondary.map((code) => termOf(INTENT_LABELS, code)).join(' · ')
+        : 'не заявлено',
+      entities: intent.entities,
+      constraints: intent.constraints,
+    };
+  });
+
+  const planView = $derived.by(() => {
+    const plan = answer?.query_plan;
+    if (!plan) return null;
+    return {
+      mentions: plan.entity_mentions,
+      countries: plan.countries,
+      period: `${plan.year_from ?? '—'}–${plan.year_to ?? '—'}`,
+      hops: plan.max_hops ?? null,
+      filters: plan.numeric_filters.length,
+    };
+  });
+
+  // Итог одного обхода: что вернулось по числам и чем это кончилось. Служебная
+  // бухгалтерия цикла (причина, повтор, условие остановки, id following-действий
+  // и артефактов) аналитику не нужна — на неполный ответ указывает причина
+  // деградации в шапке листа.
+  const obsView = $derived(
+    (answer?.tool_observations ?? []).map((observation, index) => {
+      const tool = knownTerm(TOOL_LABELS, observation.tool);
+      return {
+        key: `${observation.action_id}#${index}`,
+        name: tool ?? 'чтение корпуса',
+        toolCode: tool ? null : observation.tool,
+        status: observation.status,
+        statusLabel: knownTerm(OBS_LABELS, observation.status) ?? 'исход не описан',
+        summary: observation.summary,
+        findings: observation.finding_ids?.length ?? 0,
+        nodes: observation.graph_node_ids?.length ?? 0,
+      };
+    }),
+  );
+
+  // Стадия видна, когда на неё пришли события или когда у неё есть данные.
+  // До ответа стадии остаются в каркасе с честной подписью «придёт с ответом»:
+  // по ним аналитик читает проход.
+  const stageBlocks = $derived.by(() => {
+    const waiting = !answer;
+    return STAGES.map((stage) => {
+      const items = stepsFor(stage.key);
+      const data =
+        stage.key === 'setup'
+          ? intentView !== null || planView !== null
+          : stage.key === 'traverse'
+            ? obsView.length > 0
+            : false;
+      const show = items.length > 0 || data || (waiting && stage.key !== 'other');
+      return { key: stage.key, label: stage.label, hint: stage.hint, items, data, show };
+    }).filter((block) => block.show);
+  });
+
+  // ── Фокус и прокрутка ───────────────────────────────────────────────────
+
+  function scrollTo(attribute: string, value: string): void {
+    const nodes = Array.from(flow?.querySelectorAll<HTMLElement>(`[data-${attribute}]`) ?? []);
+    const target = nodes.find((node) => node.dataset[attribute] === value);
+    target?.scrollIntoView({ block: 'nearest', behavior: prefersReduced() ? 'auto' : 'smooth' });
+  }
+
+  $effect(() => {
+    const id = openClaimId;
+    if (!id) return;
+    void tick().then(() => scrollTo('claim', id));
+  });
+
+  $effect(() => {
+    const key = focusKey;
+    if (!key) return;
+    void tick().then(() => scrollTo('evidence', key));
+  });
+
+  function onRowKeys(event: KeyboardEvent): void {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    const rows = Array.from(rail?.querySelectorAll<HTMLButtonElement>('[data-tick]') ?? []);
+    if (!rows.length) return;
+    const current = rows.indexOf(event.currentTarget as HTMLButtonElement);
+    const next =
+      event.key === 'ArrowDown'
+        ? (current + 1) % rows.length
+        : (current - 1 + rows.length) % rows.length;
+    event.preventDefault();
+    rows[next]?.focus();
+  }
+
+  // ── Действия ────────────────────────────────────────────────────────────
+
+  function ask(value: string): void {
+    const trimmed = value.trim();
+    if (trimmed.length < 3 || running || !canAsk) return;
+    draft = '';
+    correctionFor = null;
+    feedbackVerdict = null;
+    onnotice(null);
+    onask(trimmed);
+  }
+
+  function toggleClaim(id: string): void {
+    onfocus(null);
+    onselect(openClaimId === id ? null : id);
+  }
+
+  function toggleEvidence(key: string): void {
+    onfocus(focusKey === key ? null : key);
+  }
+
+  function startCorrection(finding: Finding): void {
+    correctionFor = finding.id;
+    correctionComment = '';
+    correctionText = finding.statement;
+    onnotice(null);
+  }
+
+  async function sendCorrection(finding: Finding): Promise<void> {
+    const comment = correctionComment.trim();
+    const correction = correctionText.trim();
+    if (comment.length < 3 || correction.length < 3) return;
+    let accepted = false;
+    try {
+      accepted = await oncorrection({ finding, comment, correction });
+    } catch (reason) {
+      // Отказ и сетевой сбой не притворяются успехом: причину показываем
+      // сообщением, введённый текст сохраняем.
+      accepted = false;
+      onnotice({
+        kind: 'error',
+        title: 'Исправление не отправлено',
+        detail:
+          reason instanceof Error && reason.message
+            ? reason.message
+            : 'Проверьте соединение и отправьте правку снова — текст сохранён.',
+      });
+    }
+    if (accepted) {
+      correctionFor = null;
+      correctionComment = '';
+      correctionText = '';
+    }
+  }
+
+  async function sendFeedback(): Promise<void> {
+    const comment = feedbackComment.trim();
+    if (!feedbackVerdict || comment.length < 3) return;
+    let accepted = false;
+    try {
+      accepted = await onfeedback({ verdict: feedbackVerdict, comment });
+    } catch (reason) {
+      accepted = false;
+      onnotice({
+        kind: 'error',
+        title: 'Отзыв не отправлен',
+        detail:
+          reason instanceof Error && reason.message
+            ? reason.message
+            : 'Проверьте соединение и отправьте отзыв снова — текст сохранён.',
+      });
+    }
+    if (accepted) {
+      feedbackVerdict = null;
+      feedbackComment = '';
+    }
+  }
+
+  async function pickFile(event: Event): Promise<void> {
+    const field = event.currentTarget as HTMLInputElement;
+    const file = field.files?.[0];
+    if (!file) return;
+    await onimport(file);
+    field.value = '';
+  }
+
+  function historyState(claimId: string): HistoryState {
+    return histories[claimId] ?? EMPTY_HISTORY;
+  }
+
+  async function loadHistory(claimId: string): Promise<void> {
+    histories = { ...histories, [claimId]: { busy: true, error: '', data: null } };
+    try {
+      const result = await onhistory(claimId);
+      histories = {
+        ...histories,
+        [claimId]: { busy: false, error: result.error ?? '', data: result.history },
+      };
+    } catch (reason) {
+      // Сбой канала не должен оставаться «вечной загрузкой»: состояние
+      // разворачивается в отказ с повтором.
+      histories = {
+        ...histories,
+        [claimId]: {
+          busy: false,
+          error: reason instanceof Error && reason.message ? reason.message : 'Соединение не ответило',
+          data: null,
+        },
+      };
+    }
+  }
 </script>
 
-<div class="chat-panel">
-  <!-- Header -->
-  <div class="chat-header">
-    <div class="chat-header__title">
-      <Sparkles size={22} />
-      <div>
-        <h1>Научный Клубок — Запросы</h1>
-        <p>Задайте вопрос — агенты найдут ответ в графе знаний</p>
-      </div>
-    </div>
-    {#if status}
-      <div class="chat-status" class:ready={status.status === 'ready'}>
-        <span></span>
-        {status.status === 'ready' ? 'Все сервисы готовы' : statusLabel(status.model_mode)}
-      </div>
-    {/if}
-  </div>
+<svelte:window
+  onkeydown={(event) => {
+    // Escape закрывает раскрытое доказательство, но не мешает модальному окну:
+    // пока открыт диалог, клавишу забирает он.
+    if (event.key !== 'Escape' || !focusKey) return;
+    if (document.querySelector('[role="dialog"]')) return;
+    onfocus(null);
+  }}
+/>
 
-  <!-- Messages Area -->
-  <div class="chat-messages" bind:this={messagesContainer}>
-    {#if messages.length === 0}
-      <div class="chat-welcome">
-        <div class="chat-welcome__icon"><Sparkles size={36} /></div>
-        <h2>Задайте вопрос по графику знаний</h2>
-        <p>Агенты проанализируют запрос, найдут источники, выявят противоречия и сформируют ответ с оценкой качества.</p>
-        <div class="chat-suggestions">
-          <button onclick={() => sendMessage('Обзор способов удаления SO2 из отходящих газов металлургических предприятий')}>
-            Обзор способов удаления SO₂ из отходящих газов
-          </button>
-          <button onclick={() => sendMessage('Обзор современных способов переработки свинцово-цинкового сырья')}>
-            Переработка свинцово-цинкового сырья
-          </button>
-          <button onclick={() => sendMessage('Анализ технологий и примеров закачки шахтных вод в глубокие горизонты')}>
-            Закачка шахтных вод в глубокие горизонты
-          </button>
-        </div>
-      </div>
-    {/if}
-
-    {#each messages as msg (msg.id)}
-      {#if msg.role === 'user'}
-        <div class="msg msg--user">
-          <div class="msg__bubble msg__bubble--user">
-            {#if msg.isRefinement}
-              <span class="msg__badge">Уточнение</span>
-            {/if}
-            {msg.content}
+<div class="ask">
+  <div class="ask__flow" bind:this={flow}>
+    <!-- ── 1. СОСТОЯНИЯ ДО ОТВЕТА ────────────────────────────────────────── -->
+    {#if !answer && !running && !error}
+      {#if corpusEmpty === true}
+        <Panel tone="sunk">
+          <div class="case">
+            <Notice tone="warn" title="Корпус пуст: спрашивать не о чем">
+              <p>
+                В корпусе пока ни одного документа — сравнивать и трассировать нечего.
+              </p>
+              <p class="micro">
+                Загрузите PDF, DOCX, XLSX, JSON или TXT: как только разбор закончится, вопрос по
+                новому материалу можно задать прямо здесь.
+              </p>
+            </Notice>
+            <div class="row">
+              <label class="btn btn--action btn--sm upload">
+                <Icon name="upload" size={16} />
+                {busy === 'import' ? 'Обрабатываем…' : 'Импортировать документ'}
+                <input
+                  type="file"
+                  accept=".pdf,.docx,.xlsx,.json,.txt"
+                  disabled={busy === 'import'}
+                  onchange={pickFile}
+                />
+              </label>
+              <Button href="/dashboard" variant="quiet" size="sm" icon="gauge">
+                Панель состояния корпуса
+              </Button>
+            </div>
           </div>
-          <span class="msg__time">{formatTime(msg.timestamp)}</span>
-        </div>
+        </Panel>
       {:else}
-        <div class="msg msg--assistant">
-          <div class="msg__avatar"><Sparkles size={16} /></div>
-          <div class="msg__content">
-            {#if msg.isRefinement}
-              <span class="msg__badge msg__badge--refined">Уточнённый ответ</span>
-            {/if}
-
-            <!-- Agent Steps -->
-            {#if msg.agentSteps && msg.agentSteps.length > 0}
-              <div class="agent-steps">
-                {#each msg.agentSteps as step (step.id)}
-                  <div class="agent-step" class:completed={step.status === 'completed'}>
-                    <span class="agent-step__icon">
-                      {#if step.status === 'running'}
-                        <Loader2 size={15} class="spin" />
-                      {:else}
-                        <Check size={15} />
-                      {/if}
-                    </span>
-                    <span class="agent-step__label">{step.label}</span>
-                    {#if step.result}
-                      <span class="agent-step__result">{step.result}</span>
-                    {/if}
+        <Empty icon="compass" title="Ни одного прогона на этом листе" body="
+          Впишите вопрос с числом и условием применения: проход вернёт утверждения, и каждое — с
+          цитатой и локатором до страницы, листа или диапазона ячеек.">
+          {#snippet action()}
+            <div class="case__actions">
+              {#if corpusEmpty === false}
+                <p class="micro">
+                  корпус читается: каждый новый вопрос собирает отдельный проход и отдельный лист
+                </p>
+              {:else if corpusState === 'loading'}
+                <p class="micro">показания корпуса ещё не пришли — вопрос можно задать и без них</p>
+              {:else if corpusState === 'error'}
+                <p class="micro">
+                  показания корпуса не получены — вопрос можно задать и без них, на ход это не влияет
+                </p>
+              {/if}
+              {#if examplesState === 'loading'}
+                <p class="micro">читаем эталонные вопросы корпуса…</p>
+              {:else if examplesState === 'error'}
+                <Notice tone="error" title="Эталонные вопросы не получены">
+                  <p>Список не загрузился — свои вопросы можно задавать как обычно.</p>
+                  <div class="row">
+                    <Button variant="quiet" size="sm" icon="refresh" onclick={onexamples}>
+                      Загрузить снова
+                    </Button>
                   </div>
+                </Notice>
+              {:else if examples.length}
+                <p class="micro case__label">эталонные вопросы корпуса</p>
+                {#each examples as example (example)}
+                  <Button variant="quiet" size="sm" icon="quote" class="example" onclick={() => ask(example)}>
+                    {example}
+                  </Button>
                 {/each}
-              </div>
+              {:else}
+                <p class="micro">
+                  эталонных вопросов в этом наборе нет — сформулируйте свой, поле ниже
+                </p>
+              {/if}
+            </div>
+          {/snippet}
+        </Empty>
+      {/if}
+    {/if}
+
+    {#if error}
+      <Panel tone="lav">
+        <div class="case">
+          <Notice tone="error" title={error.label}>
+            <p>{error.detail}</p>
+          </Notice>
+          <p class="micro"><b>Что дальше.</b> {error.recovery}</p>
+          {#if error.question}
+            <div class="row">
+              <Button variant="ink" size="sm" icon="refresh" onclick={() => ask(error.question)}>
+                Повторить проход
+              </Button>
+              {#if error.login}
+                <a class="small" href="/login">Войти заново</a>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      </Panel>
+    {/if}
+
+    {#if notice}
+      <div class="notice-row">
+        <Notice tone={notice.kind === 'error' ? 'error' : 'ok'} title={notice.title}>
+          <p>{notice.detail}</p>
+        </Notice>
+        <Button variant="ghost" size="sm" onclick={() => onnotice(null)}>Скрыть</Button>
+      </div>
+    {/if}
+
+    <!-- ── 2. СЛЕД ПРОХОДА: стадии обхода на утопленном листе ───────────── -->
+    {#if running || trailSteps.length}
+      <Panel tone="sunk">
+        <section class="trail" aria-labelledby="trail-title">
+          <div class="trail__head">
+            <div class="trail__title">
+              <h2 class="h4" id="trail-title">
+                {#if running}
+                  <Mascot mood={answerArriving ? 'say' : 'think'} size={32} label="Агент собирает ответ" />
+                  {answerArriving ? 'Ответ приходит' : 'Собираем ответ'}
+                {:else}
+                  След прохода
+                {/if}
+              </h2>
+              <p class="micro">
+                {#if stageStrip.length}
+                  {#each stageStrip as stage (stage.label)}
+                    <span class="tag">{stage.label} · <b class="num">{stage.count}</b></span>
+                  {/each}
+                {:else}
+                  <span class="tag">шагов ещё не было</span>
+                {/if}
+              </p>
+            </div>
+            <div class="trail__meter">
+              <span class="trail__elapsed">{seconds(elapsedMs)}</span>
+              <!-- Живая область вне сворачиваемого тела: объявление доходит и
+                   тогда, когда след закрыт (так он закрыт по умолчанию). -->
+              <p class="micro trail__count" role="status" aria-live="polite" aria-atomic="true">
+                {#if running}
+                  получено {countOf(trailSteps.length, 'шаг', 'шага', 'шагов')} · идёт {seconds(elapsedMs)}
+                {:else}
+                  получено {countOf(trailSteps.length, 'шаг', 'шага', 'шагов')} · проход занял
+                  {seconds(elapsedMs)}
+                {/if}
+              </p>
+              <Button
+                variant="quiet"
+                size="sm"
+                class="trail__toggle"
+                expanded={trailOpen}
+                controls="trail-body"
+                onclick={() => (trailUser = !trailOpen)}
+              >
+                {trailOpen ? 'Свернуть след' : 'Развернуть след'}
+              </Button>
+            </div>
+          </div>
+
+          <div id="trail-body" class="trail__body" hidden={!trailOpen}>
+            <p class="micro trail__honest">
+              <Icon name="info" size={14} />
+              Общего числа шагов у прохода нет: ниже состоявшиеся шаги и время.
+            </p>
+
+            {#if running && !trailSteps.length}
+              <p class="trail__waiting">
+                Читаем корпус — шаги появятся по мере прохода.
+              </p>
             {/if}
 
-            <!-- Error -->
-            {#if msg.error}
-              <div class="msg__error">
-                <AlertTriangle size={18} />
-                <div>
-                  <strong>{msg.error}</strong>
-                  <button class="msg__retry" onclick={() => retry(msg)}>
-                    <Loader2 size={14} /> Повторить
-                  </button>
+            {#each stageBlocks as block (block.key)}
+              <div class="stage" data-stage={block.key}>
+                <div class="stage__head">
+                  <h3 class="small">{block.label}</h3>
+                  <span class="micro">{block.hint}</span>
+                  {#if block.items.length}
+                    <span class="tag num">{block.items.length}</span>
+                  {/if}
                 </div>
-              </div>
-            {/if}
 
-            <!-- Answer -->
-            {#if msg.answer}
-              <!-- Answer text -->
-              <div class="answer-text">
-                <p>{msg.content}</p>
-                {#if msg.answer.findings.length > 0}
-                  <ul class="answer-findings-list">
-                    {#each msg.answer.findings.slice(0, 5) as finding}
-                      <li>{finding.statement}</li>
+                {#if block.items.length}
+                  <ol class="stage__steps">
+                    {#each block.items as step, index (index)}
+                      {@const name = stepName(step)}
+                      {@const phrase = step.message ? phraseOf(step.message) : ''}
+                      <li class="step" data-state={step.status ?? 'unknown'}>
+                        <span class="step__idx num">{String(index + 1).padStart(2, '0')}</span>
+                        <span class="step__body">
+                          <span class="step__agent">{name.label}</span>
+                          {#if name.code}<code class="code tech">{name.code}</code>{/if}
+                          {#if phrase}<span class="step__msg">{phrase}</span>{/if}
+                        </span>
+                        {#if step.status}
+                          <StatusPill
+                            status={stepPill(step.status)}
+                            label={STEP_STATE_LABELS[step.status]}
+                          />
+                        {:else}
+                          <span class="tag">нет данных</span>
+                        {/if}
+                        <span class="step__note num">{stepNote(step)}</span>
+                      </li>
                     {/each}
-                  </ul>
-                  {#if msg.answer.findings.length > 5}
-                    <p class="answer-more">и ещё {msg.answer.findings.length - 5} утверждений…</p>
+                  </ol>
+                {:else}
+                  <p class="micro">шагов этой стадии ещё не было</p>
+                {/if}
+
+                {#if block.key === 'setup'}
+                  {#if intentView || planView}
+                    {#if intentView}
+                      <dl class="kv stage__kv">
+                        <dt>основное намерение</dt>
+                        <dd>{intentView.label}</dd>
+                        <dt>вторичные</dt>
+                        <dd>{intentView.secondary}</dd>
+                      </dl>
+                      {#if intentView.entities.length || intentView.constraints.length}
+                        <div class="chips">
+                          {#each intentView.entities as entity (entity)}
+                            <span class="chip chip--static"><Icon name="target" size={13} />{entity}</span>
+                          {/each}
+                          {#each intentView.constraints as constraint (constraint)}
+                            <span class="chip chip--static"><Icon name="filter" size={13} />{constraint}</span>
+                          {/each}
+                        </div>
+                      {/if}
+                    {/if}
+
+                    {#if planView}
+                      <div class="chips">
+                        {#if planView.mentions.length}
+                          {#each planView.mentions as mention (mention)}
+                            <span class="chip chip--static"><Icon name="target" size={13} />{mention}</span>
+                          {/each}
+                        {:else}
+                          <span class="chip chip--static">сущности в вопросе не распознаны</span>
+                        {/if}
+                        {#each planView.countries as country (country)}
+                          <span class="chip chip--static"><Icon name="pin" size={13} />{country}</span>
+                        {/each}
+                      </div>
+                      <dl class="kv stage__kv">
+                        <dt>период</dt>
+                        <dd class="num">{planView.period}</dd>
+                        <dt>глубина обхода</dt>
+                        <dd class="num">
+                          {planView.hops ?? '—'}
+                          {planView.hops ? plural(planView.hops, 'скачок', 'скачка', 'скачков') : ''}
+                        </dd>
+                        <dt>числовых фильтров</dt>
+                        <dd class="num">{planView.filters}</dd>
+                      </dl>
+                      {#if filterRows.length}
+                        <div class="table-wrap">
+                          <table class="table">
+                            <caption class="micro">
+                              условия вопроса по числам
+                            </caption>
+                            <thead>
+                              <tr>
+                                <th>свойство</th><th>условие</th><th>значение</th><th>покрытие</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {#each filterRows as row (row.filter.property_name + row.filter.operator)}
+                                {@const property = propertyTerm(row.filter.property_name)}
+                                <tr class:no-coverage={row.covered === 0}>
+                                  <td>
+                                    {property.label}
+                                    {#if property.code}<code class="code tech">{property.code}</code>{/if}
+                                  </td>
+                                  <td>
+                                    {labelOf(row.filter.operator)}
+                                    <span class="num">{signOf(row.filter.operator)}</span>
+                                  </td>
+                                  <td class="num">{filterText(row.filter)}</td>
+                                  <td class="num">
+                                    {row.covered}
+                                    {plural(row.covered, 'наблюдение', 'наблюдения', 'наблюдений')}
+                                  </td>
+                                </tr>
+                              {/each}
+                            </tbody>
+                          </table>
+                        </div>
+                        <p class="micro">
+                          «покрытие» — сколько числовых наблюдений ответа попало под условие вопроса.
+                        </p>
+                      {/if}
+                    {/if}
+                  {:else}
+                    <p class="micro">
+                      намерение и параметры вопроса (сущности, фильтры, география, период, глубина)
+                      приходят одним блоком с ответом
+                    </p>
                   {/if}
                 {/if}
-              </div>
 
-              <!-- Conflicts -->
-              {#if msg.answer.conflicts.length > 0}
-                <div class="conflict-cards">
-                  {#each msg.answer.conflicts as conflict}
-                    <div class="card card--conflict">
-                      <AlertTriangle size={15} />
-                      <span>{conflict}</span>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-
-              <!-- Gaps -->
-              {#if msg.answer.knowledge_gaps.length > 0}
-                <div class="gap-cards">
-                  {#each msg.answer.knowledge_gaps as gap}
-                    <div class="card card--gap">
-                      <Search size={15} />
-                      <span>{gap}</span>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-
-              <!-- Metrics -->
-              <div class="metrics-row">
-                <span class="metric" style={`color:${confColor(msg.answer.confidence)}`}>
-                  Уверенность: {pct(msg.answer.confidence)}
-                </span>
-                {#if msg.evaluation}
-                  <span class="metric">Покрытие: {pct(msg.evaluation.metrics.citation_coverage)}</span>
-                {/if}
-                <span class="metric metric--model">{statusLabel(msg.answer.model_mode)}</span>
-              </div>
-
-              <!-- Action buttons -->
-              <div class="action-buttons">
-                <button class="action-btn" onclick={() => openGraph(msg)}>
-                  <Search size={15} /> Открыть граф
-                </button>
-                <button class="action-btn" onclick={() => toggleSources(msg.id)}>
-                  <FileText size={15} /> Источники ({evidenceCount(msg.answer)})
-                  <span class={expandedSources.has(msg.id) ? 'rotated' : ''}><ChevronDown size={13} /></span>
-                </button>
-                <button class="action-btn" onclick={() => toggleFindings(msg.id)}>
-                  <BarChart3 size={15} /> Находки ({msg.answer.findings.length})
-                  <span class={expandedFindings.has(msg.id) ? 'rotated' : ''}><ChevronDown size={13} /></span>
-                </button>
-                <button class="action-btn" onclick={() => toggleTrace(msg.id)}>
-                  <Activity size={15} /> Трассировка ({msg.answer.tool_observations.length + msg.answer.trace.length})
-                  <span class={expandedTrace.has(msg.id) ? 'rotated' : ''}><ChevronDown size={13} /></span>
-                </button>
-              </div>
-
-              <!-- Self-evolving controls -->
-              <div class="evolving-controls">
-                <button class="action-btn action-btn--ghost" onclick={() => startRefinement(msg)}>
-                  <Pencil size={14} /> Уточнить
-                </button>
-                <button class="action-btn action-btn--ghost" onclick={() => startCorrection(msg)}>
-                  <Wrench size={14} /> Исправить
-                </button>
-                <button class="action-btn action-btn--ghost" onclick={() => startFeedback(msg)}>
-                  <MessageSquare size={14} /> Отзыв
-                </button>
-              </div>
-
-              <!-- Expandable: Sources -->
-              {#if expandedSources.has(msg.id)}
-                <div class="expandable-section">
-                  <h4><FileText size={15} /> Источники</h4>
-                  {#each getAllEvidence(msg.answer) as { evidence: ev, finding }, i}
-                    {@const itemId = `${msg.id}-src-${i}`}
-                    <div class="source-item">
-                      <div class="source-item__header">
-                        <strong>{ev.source_title || 'Источник'}</strong>
-                        {#if ev.score != null}
-                          <span class="source-item__score">Релевантность: {pct(ev.score)}</span>
-                        {/if}
-                      </div>
-                      <p class="source-item__quote">
-                        {expandedSourceItems.has(itemId) ? ev.quote : ev.quote.slice(0, 100) + (ev.quote.length > 100 ? '…' : '')}
-                      </p>
-                      {#if ev.page || ev.sheet || ev.cell_range}
-                        <div class="source-item__meta">
-                          {#if ev.page}<span>Стр. {ev.page}</span>{/if}
-                          {#if ev.sheet}<span>Лист «{ev.sheet}»</span>{/if}
-                          {#if ev.cell_range}<span>Ячейки {ev.cell_range}</span>{/if}
-                        </div>
-                      {/if}
-                      {#if ev.quote.length > 100}
-                        <button class="source-item__toggle" onclick={() => toggleSourceItem(itemId)}>
-                          {expandedSourceItems.has(itemId) ? 'Свернуть' : 'Показать полностью'}
-                        </button>
-                      {/if}
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-
-              <!-- Expandable: Findings -->
-              {#if expandedFindings.has(msg.id)}
-                <div class="expandable-section">
-                  <h4><BarChart3 size={15} /> Находки</h4>
-                  {#each msg.answer.findings as finding}
-                    <div class="finding-card">
-                      <div class="finding-card__spo">
-                        {#if finding.subject && finding.predicate}
-                          <span class="finding-card__subject">{finding.subject}</span>
-                          <span class="finding-card__arrow">→</span>
-                          <span class="finding-card__predicate">{finding.predicate}</span>
-                          <span class="finding-card__arrow">→</span>
-                        {/if}
-                        <span class="finding-card__statement">{finding.statement}</span>
-                      </div>
-                      <div class="finding-card__conf">
-                        <div class="finding-card__bar">
-                          <div style={`width:${pct(finding.confidence)};background:${confColor(finding.confidence)}`}></div>
-                        </div>
-                        <span style={`color:${confColor(finding.confidence)}`}>{pct(finding.confidence)}</span>
-                      </div>
-                      <div class="finding-card__actions">
-                        <button onclick={() => showFindingInGraph(msg, finding)}>
-                          <Network size={13} /> Показать в графе
-                        </button>
-                        <span class="finding-card__evidence-count">
-                          {finding.evidence.length} источн.
-                        </span>
-                        {#if finding.status === 'disputed'}
-                          <span class="finding-card__status finding-card__status--disputed">расхождения</span>
-                        {:else if finding.status === 'hypothesis'}
-                          <span class="finding-card__status finding-card__status--hypothesis">гипотеза</span>
-                        {:else}
-                          <span class="finding-card__status finding-card__status--consensus">согласуется</span>
-                        {/if}
-                      </div>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-
-              <!-- Expandable: Trace -->
-              {#if expandedTrace.has(msg.id)}
-                <div class="expandable-section">
-                  <h4><Activity size={15} /> Трассировка агентов</h4>
-                  {#if msg.answer.tool_observations.length > 0}
-                    <div class="trace-section">
-                      <small>Инструменты ({msg.answer.tool_observations.length})</small>
-                      {#each msg.answer.tool_observations as obs}
-                        <div class="trace-item">
-                          <span class="trace-item__status trace-item__status--{obs.status}"></span>
-                          <span class="trace-item__tool">{toolLabels[obs.tool] ?? obs.tool}</span>
-                          <span class="trace-item__summary">{obs.summary}</span>
+                {#if block.key === 'traverse'}
+                  {#if obsView.length}
+                    <div class="stage__obs">
+                      {#each obsView as observation (observation.key)}
+                        <div class="obs">
+                          <div class="obs__head">
+                            <span class="small">{observation.name}</span>
+                            {#if observation.toolCode}<code class="code tech">{observation.toolCode}</code>{/if}
+                            <StatusPill
+                              status={observation.status === 'error'
+                                ? 'disputed'
+                                : observation.status === 'warning'
+                                  ? 'hypothesis'
+                                  : 'consensus'}
+                              label={observation.statusLabel}
+                            />
+                          </div>
+                          <p class="small">{observation.summary}</p>
+                          <p class="micro">
+                            утверждений <b class="num">{observation.findings}</b> · узлов
+                            <b class="num">{observation.nodes}</b>
+                          </p>
                         </div>
                       {/each}
                     </div>
+                  {:else if !answer}
+                    <p class="micro">
+                      итоги обхода приходят вместе с ответом — пока видно только завершение шагов
+                    </p>
                   {/if}
-                  {#if msg.answer.trace.length > 0}
-                    <div class="trace-section">
-                      <small>Агенты ({msg.answer.trace.length})</small>
-                      {#each msg.answer.trace as event}
-                        <div class="trace-item">
-                          <span class="trace-item__status trace-item__status--{event.status}"></span>
-                          <span class="trace-item__tool">{agentLabel(event.agent)}</span>
-                          <span class="trace-item__summary">{event.message}</span>
-                          {#if event.duration_ms > 0}
-                            <span class="trace-item__duration">{(event.duration_ms / 1000).toFixed(1)}с</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </section>
+      </Panel>
+    {/if}
+
+    <!-- ── 3. ОТВЕТ = БУМАГА ─────────────────────────────────────────────── -->
+    {#if answer}
+      {@const payload = answer}
+      <article class="paper">
+        <header class="paper__head">
+          <p class="eyebrow">
+            <Icon name="doc" size={16} />
+            Ответ прогона
+            <code class="code paper__id">{shortCode(payload.query_id)}</code>
+          </p>
+          <h2 class="h3">{payload.question || question}</h2>
+          <!-- Режим сборки меняет доверие к ответу: «scripted» и «unavailable»
+               выглядят на листе иначе, чем ответ модели. -->
+          {#if payload.model_mode !== 'gigachat'}
+            <p class="micro paper__mode">
+              <Icon name="alert" size={14} />
+              {MODEL_MODE_LABELS[payload.model_mode]}
+            </p>
+          {/if}
+          <div class="prose">
+            <p class="summary">
+              {payload.summary || 'Проход не вернул текстового резюме — ниже только утверждения.'}
+            </p>
+          </div>
+          <div class="paper__bar">
+            <dl class="kv paper__kv">
+              <dt>затрачено</dt>
+              <dd class="num">{seconds(elapsedMs)}</dd>
+              <dt>утверждений · ссылок</dt>
+              <dd class="num">{payload.findings.length} · {evidenceTotal}</dd>
+              <dt>расхождений · пробелов</dt>
+              <dd class="num">{payload.conflicts.length} · {payload.knowledge_gaps.length}</dd>
+            </dl>
+            {#if canExport}
+              <div class="paper__export">
+                <span class="micro">выгрузка этого ответа</span>
+                <Button
+                  variant="quiet"
+                  size="sm"
+                  icon="download"
+                  busy={busy === 'export'}
+                  disabled={busy === 'export'}
+                  onclick={() => void onexport('markdown')}
+                >
+                  Markdown
+                </Button>
+                <Button
+                  variant="quiet"
+                  size="sm"
+                  disabled={busy === 'export'}
+                  onclick={() => void onexport('json-ld')}
+                >
+                  JSON-LD
+                </Button>
+              </div>
+            {/if}
+            <p class="micro paper__confidence">
+              уверенность сборки {num(Math.round(payload.confidence * 100))} % — оценка полноты
+              подбора, не проверка числа
+            </p>
+          </div>
+          <!-- Легенда листа свёрнута: порядок чтения важнее пояснений, а правила
+               нужны ровно один раз. -->
+          <div class="acc paper__guide">
+            <button
+              class="acc__head"
+              type="button"
+              aria-expanded={guideOpen}
+              aria-controls="paper-guide"
+              onclick={() => (guideOpen = !guideOpen)}
+            >
+              <span>Как читать этот лист</span>
+              <Icon name="plus" size={16} class="acc__icon" />
+            </button>
+            <div id="paper-guide" class="acc__body" hidden={!guideOpen}>
+              <ul class="paper__guide-list">
+                <li>
+                  Число без условия применения и локатора результатом не считается: раскройте тезис и
+                  прочитайте фрагмент первоисточника.
+                </li>
+                <li>
+                  Шкала интервалов повторяет список тезисов: ↑ ↓ — переход по шкале, Enter — открыть
+                  тезис; полосы сравнимы только внутри одной единицы измерения.
+                </li>
+                <li>
+                  Неполный ответ помечен причинами над списком тезисов; там же видно, что снять из
+                  условий, чтобы проход собрался целиком.
+                </li>
+              </ul>
+            </div>
+          </div>
+        </header>
+
+        {#if payload.degradation_reasons.length}
+          <div class="paper__degraded">
+            <Notice tone="warn" title="Ответ собран не полностью">
+              {#each payload.degradation_reasons as reason (reason)}
+                <p>{phraseOf(reason)}</p>
+              {/each}
+            </Notice>
+            <p class="micro">
+              Снимите часть условий — числовой фильтр, период или глубину обхода — и спросите заново.
+            </p>
+          </div>
+        {/if}
+
+        {#if !payload.findings.length}
+          <div class="paper__empty">
+            <Empty icon="search" title="Совпадений нет" body="
+              Обход корпуса прошёл до конца и не нашёл ни одного утверждения под этот вопрос. Это
+              результат, а не сбой.">
+              {#snippet action()}
+                <div class="case__actions">
+                  {#if payload.knowledge_gaps.length}
+                    <p class="micro case__label">пробелы, отмеченные прогоном</p>
+                    {#each payload.knowledge_gaps.slice(0, 3) as gap, position (position)}
+                      <p class="small gap">{gap}</p>
+                    {/each}
+                  {/if}
+                  <p class="micro">
+                    Снимите числовой фильтр, расширьте период или переформулируйте вопрос ближе к
+                    формулировкам источников — параметры плана видны в следу прохода выше.
+                  </p>
+                  {#if payload.conflicts.length || payload.recommendations.length}
+                    <p class="micro">
+                      При этом прогон всё равно вернул расхождения и рекомендации — они под этим
+                      блоком.
+                    </p>
+                  {/if}
+                </div>
+              {/snippet}
+            </Empty>
+          </div>
+        {:else}
+          <div class="paper__body">
+            <!-- Шкала интервалов: клавиатурный путь к тому же содержимому,
+                 что и список тезисов, и общий масштаб по единице. -->
+            <nav class="scale" bind:this={rail} aria-label="Шкала интервалов ответа">
+              <div class="scale__head">
+                <h3 class="small">Шкала интервалов</h3>
+                <span class="micro">
+                  {countOf(payload.findings.length, 'утверждение', 'утверждения', 'утверждений')}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="scale__toggle"
+                  expanded={scaleOpen}
+                  controls="scale-body"
+                  onclick={() => (scaleUser = !scaleOpen)}
+                >
+                  {scaleOpen ? 'Свернуть' : 'Показать'}
+                </Button>
+              </div>
+              <div id="scale-body" hidden={!scaleOpen}>
+                {#if railGroups.length}
+                  {#each railGroups as group (group.unit)}
+                    <div class="scale__group">
+                      <p class="micro scale__unit">
+                        <b>{group.unit}</b>
+                        {#if Number.isFinite(group.lo)}
+                          <span class="num">{num(group.lo)}–{num(group.hi)}</span>
+                        {:else}
+                          <span>числовых наблюдений нет</span>
+                        {/if}
+                      </p>
+                      {#each group.rows as row (row.item.id)}
+                        {@const band = bandOf(row, group)}
+                        <button
+                          class="tick"
+                          type="button"
+                          data-tick={row.item.id}
+                          aria-current={row.item.id === openClaimId ? 'true' : undefined}
+                          onkeydown={onRowKeys}
+                          onclick={() => {
+                            onselect(row.item.id);
+                            onfocus(null);
+                          }}
+                        >
+                          <span class="tick__idx num">{String(row.index + 1).padStart(2, '0')}</span>
+                          <span class="tick__body">
+                            <span class="tick__code">{railCode(row.item)}</span>
+                            <span class="tick__label">{row.item.statement}</span>
+                            <span class="bar">
+                              {#if band}
+                                <span
+                                  class="bar__fill {bandClass(row.item.status)}"
+                                  data-status={row.item.status}
+                                  style="left: {band.left}%; width: {band.width}%;"
+                                ></span>
+                              {/if}
+                            </span>
+                            <span class="micro">
+                              {#if row.bounds}
+                                <b class="num">{num(row.bounds[0])}–{num(row.bounds[1])} {group.unit}</b>
+                              {:else}
+                                <b>без числа</b>
+                              {/if}
+                              · ссылок <b class="num">{row.item.evidence.length}</b>
+                            </span>
+                          </span>
+                        </button>
+                      {/each}
+                    </div>
+                  {/each}
+                  <p class="micro">
+                    полосы сравнимы только внутри одной единицы: шкала группирует наблюдения по ней.
+                  </p>
+                {:else}
+                  <p class="micro">проход не оставил интервалов — утверждения без числовых наблюдений</p>
+                {/if}
+              </div>
+            </nav>
+
+            <div class="theses">
+              {#each payload.findings as finding (finding.id)}
+                {@const open = finding.id === openClaimId}
+                {@const rivals = rivalsOf(finding)}
+                <!-- subject/predicate объявляются на уровне перебора: {@const}
+                     внутри <div> компилятор Svelte не принимает. -->
+                {@const subject = subjectTerm(finding)}
+                {@const predicate = predicateTerm(finding)}
+                <article class="thesis" class:thesis--open={open} data-claim={finding.id}>
+                  <div class="thesis__head">
+                    <div class="thesis__marks">
+                      <StatusPill status={finding.status} label={STATUS_PHRASE[finding.status]} />
+                      <span class="tag">
+                        <Icon
+                          name={finding.data_class === 'restricted'
+                            ? 'lock'
+                            : finding.data_class === 'internal'
+                              ? 'shield'
+                              : 'eye'}
+                          size={13}
+                        />
+                        {DATA_CLASS_LABELS[finding.data_class]}
+                      </span>
+                      <span class="tag">версия <b class="num">{finding.version}</b></span>
+                      {#if finding.superseded_by}
+                        <span class="tag">
+                          {STATUS_SUPERSEDED} <code class="code tech">{shortCode(finding.superseded_by)}</code>
+                        </span>
+                      {/if}
+                    </div>
+                    <h3 class="thesis__statement">{finding.statement}</h3>
+                    <p class="micro thesis__spo">
+                      <b>{subject.label}</b> · {predicate.label} · {scopeText(finding.scope)}
+                      {#if subject.code || predicate.code}
+                        <code class="code tech"
+                          >{subject.code ?? ''}{#if subject.code && predicate.code} · {/if}{predicate.code ?? ''}</code
+                        >
+                      {/if}
+                    </p>
+                    <Button
+                      variant="quiet"
+                      size="sm"
+                      class="thesis__toggle"
+                      expanded={open}
+                      controls={`trace-${finding.id}`}
+                      onclick={() => toggleClaim(finding.id)}
+                    >
+                      {open ? 'Свернуть разбор' : 'Открыть разбор'}
+                    </Button>
+                  </div>
+
+                  <div id={`trace-${finding.id}`}>
+                    {#if !open}
+                      <p class="micro thesis__closed">
+                        {valueSummary(finding)} ·
+                        {countOf(finding.evidence.length, 'доказательство', 'доказательства', 'доказательств')} —
+                        откройте тезис, чтобы прочитать цитаты и локаторы
+                      </p>
+                    {:else}
+                      {#if finding.observations.length}
+                        <div class="measures">
+                          <p class="micro measures__label">
+                            числовые наблюдения · нормализация и положение относительно условия вопроса
+                          </p>
+                          {#each measuresOf(finding) as measure (measure.key)}
+                            <div class="measure">
+                              <div class="measure__top">
+                                <span class="micro">
+                                  {measure.property}
+                                  {#if measure.propertyCode}<code class="code tech">{measure.propertyCode}</code>{/if}
+                                  · {measure.operatorLabel}
+                                </span>
+                                <span class="measure__value num">{measure.valueText} {measure.unit}</span>
+                              </div>
+                              <div class="bar measure__track">
+                                <span
+                                  class="bar__fill {bandClass(finding.status)}"
+                                  data-status={finding.status}
+                                  style="left: {measure.left}%; width: {measure.width}%;"
+                                ></span>
+                                {#each measure.limits as limit, position (position)}
+                                  <span class="measure__limit" style="left: {limit.at}%"></span>
+                                {/each}
+                              </div>
+                              <p class="micro measure__scale">
+                                шкала <span class="num">{measure.scaleFrom}–{measure.scaleTo} {measure.normalizedUnit}</span>
+                                · норм. <span class="num">{measure.normalizedText} {measure.normalizedUnit}</span>
+                              </p>
+                              {#if measure.limits.length}
+                                <p class="micro measure__limits">
+                                  {#each measure.limits as limit, position (position)}
+                                    <span class="tag num">{limit.label}</span>
+                                  {/each}
+                                </p>
+                              {/if}
+                              <p class="micro">в источнике: «{measure.raw}»</p>
+                              {#if measure.filterNote}
+                                <p class="micro measure__filter" class:outside={measure.outsideFilter}>
+                                  {measure.filterNote}{#if measure.outsideFilter} · наблюдение вне фильтра{/if}
+                                </p>
+                              {/if}
+                            </div>
+                          {/each}
+                        </div>
+                      {:else}
+                        <p class="thesis__bare">
+                          числовых наблюдений нет — тезис держится только на цитате
+                        </p>
+                      {/if}
+
+                      {#if rivals.length}
+                        <div class="rivals">
+                          <p class="micro rivals__label">
+                            расхождение на одном интервале · {subjectTerm(finding).label} ›
+                            {predicateTerm(finding).label}
+                          </p>
+                          <div class="rivals__row" data-self>
+                            <span class="small">{sourceOf(finding)} · этот тезис</span>
+                            <span class="num">{valueSummary(finding)}</span>
+                          </div>
+                          {#each rivals as rival (rival.finding.id)}
+                            <div class="rivals__row">
+                              <span class="small">{sourceOf(rival.finding)}</span>
+                              <span class="num">{valueSummary(rival.finding)}</span>
+                            </div>
+                            <p class="micro">
+                              нормализованные границы не пересекаются на
+                              <b class="num">{num(rival.delta)}</b>
+                              {finding.observations[0]?.normalized_unit ?? ''}
+                            </p>
+                          {/each}
+                          <p class="micro">
+                            Полный разбор — в разделе «Расхождения»; там видно, какая пара попала в
+                            противоречие по всем условиям.
+                          </p>
+                        </div>
+                      {/if}
+
+                      <!-- Каждое доказательство раскрывается с клавиатуры -->
+                      <div class="trace">
+                        <p class="micro trace__label">
+                          доказательство ·
+                          {countOf(finding.evidence.length, 'ссылка', 'ссылки', 'ссылок')} на фрагменты
+                        </p>
+                        {#if !finding.evidence.length}
+                          <Notice tone="error" title="Тезис не трассируется">
+                            <p>
+                              Утверждение пришло без единого локатора: проверить его по
+                              первоисточнику нельзя, пока разбор не добавит доказательство.
+                            </p>
+                          </Notice>
+                        {:else}
+                          {#each finding.evidence as evidence, index (index)}
+                            {@const itemKey = keyOf(finding, index)}
+                            {@const expanded = itemKey === focusKey}
+                            <div
+                              class="evidence"
+                              class:evidence--open={expanded}
+                              data-evidence={itemKey}
+                            >
+                              <button
+                                class="evidence__head"
+                                type="button"
+                                aria-expanded={expanded}
+                                aria-controls={`body-${itemKey.replace('#', '-')}`}
+                                onclick={() => toggleEvidence(itemKey)}
+                              >
+                                <span class="evidence__src">
+                                  <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={16} />
+                                  <b>{evidence.source_title}</b>
+                                </span>
+                                <span class="locator">
+                                  {#each locParts(evidence) as part, position (part)}
+                                    {#if position > 0}<span class="locator__sep" aria-hidden="true">·</span>{/if}
+                                    <span>{part}</span>
+                                  {/each}
+                                </span>
+                                <span class="micro">{expanded ? 'скрыть цитату' : 'прочитать цитату'}</span>
+                              </button>
+                              <div
+                                class="evidence__body"
+                                id={`body-${itemKey.replace('#', '-')}`}
+                                hidden={!expanded}
+                              >
+                                <p class="quote">«{evidence.quote}»</p>
+                                <dl class="kv evidence__kv">
+                                  <dt>источник</dt>
+                                  <dd>{evidence.source_title || 'запись корпуса'}</dd>
+                                  {#if evidence.page != null}
+                                    <dt>страница</dt><dd class="num">{evidence.page}</dd>
+                                  {/if}
+                                  {#if evidence.sheet}
+                                    <dt>лист</dt><dd>{evidence.sheet}</dd>
+                                  {/if}
+                                  {#if evidence.cell_range}
+                                    <dt>ячейки</dt><dd class="num">{evidence.cell_range}</dd>
+                                  {/if}
+                                  {#if evidence.char_start != null}
+                                    <dt>смещение символов</dt>
+                                    <dd class="num">{evidence.char_start}–{evidence.char_end ?? evidence.char_start}</dd>
+                                  {/if}
+                                </dl>
+                                <p class="micro">
+                                  Esc — закрыть раскрытие; тот же фрагмент доступен в «Находках» и на
+                                  карте связей.
+                                </p>
+                              </div>
+                            </div>
+                          {/each}
+                        {/if}
+                      </div>
+
+                      {#if canSupersede}
+                        <div class="thesis__actions">
+                          {#if correctionFor === finding.id}
+                            <div class="correction">
+                              <Field
+                                label="Причина правки"
+                                name={`correction-comment-${finding.id}`}
+                                type="textarea"
+                                rows={2}
+                                placeholder="Что не так с формулировкой или числом"
+                                hint="Минимум три символа — иначе правку не принять."
+                                bind:value={correctionComment}
+                              />
+                              <Field
+                                label="Исправленное утверждение"
+                                name={`correction-text-${finding.id}`}
+                                type="textarea"
+                                rows={2}
+                                hint="Минимум три символа — текст станет новой версией утверждения."
+                                bind:value={correctionText}
+                              />
+                              <Notice tone="info" title="Правка относится к этому тезису">
+                                <p>
+                                  Она создаёт новую версию утверждения и оставляет прежнюю в истории
+                                  связей — ответ целиком не меняется.
+                                </p>
+                              </Notice>
+                              <div class="row">
+                                <Button
+                                  variant="action"
+                                  size="sm"
+                                  busy={busy === 'correction'}
+                                  disabled={busy === 'correction'
+                                    || correctionComment.trim().length < 3
+                                    || correctionText.trim().length < 3}
+                                  onclick={() => void sendCorrection(finding)}
+                                >
+                                  Заменить версию
+                                </Button>
+                                <Button variant="quiet" size="sm" onclick={() => (correctionFor = null)}>
+                                  Отмена
+                                </Button>
+                              </div>
+                            </div>
+                          {:else}
+                            <Button
+                              variant="quiet"
+                              size="sm"
+                              icon="plus"
+                              disabled={running}
+                              onclick={() => startCorrection(finding)}
+                            >
+                              Исправить это утверждение
+                            </Button>
                           {/if}
                         </div>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {/if}
+                      {:else if canFeedback}
+                        <p class="micro thesis__note">
+                          Замена утверждения доступна при расширенном доступе. Отзыв по ответу
+                          целиком — ниже.
+                        </p>
+                      {/if}
 
-              <!-- Refinement input -->
-              {#if refiningMessageId === msg.id}
-                <div class="inline-input">
-                  <textarea
-                    bind:value={refinementInput}
-                    placeholder="Уточните запрос (например: только для медной металлургии)…"
-                    rows="2"
-                  ></textarea>
-                  <div class="inline-input__actions">
-                    <button class="action-btn" onclick={() => submitRefinement(msg)} disabled={!refinementInput.trim()}>
-                      <Send size={14} /> Отправить
-                    </button>
-                    <button class="action-btn action-btn--ghost" onclick={cancelRefinement}>Отмена</button>
+                      <!-- История версий открытого утверждения: состояние своё у
+                           каждого тезиса, отказ — тоже свой. -->
+                      {@const hist = historyState(finding.id)}
+                      <div class="history">
+                        <p class="micro history__label">история версий утверждения</p>
+                        <div class="row">
+                          <Button
+                            variant="quiet"
+                            size="sm"
+                            icon="clock"
+                            busy={hist.busy}
+                            disabled={hist.busy}
+                            onclick={() => void loadHistory(finding.id)}
+                          >
+                            {hist.busy ? 'Читаем…' : hist.data ? 'Обновить версии' : 'Запросить версии'}
+                          </Button>
+                        </div>
+                        {#if hist.error}
+                          <Notice tone="error" title="История версий не получена">
+                            <p>{hist.error}</p>
+                            <div class="row">
+                              <Button
+                                variant="quiet"
+                                size="sm"
+                                icon="refresh"
+                                onclick={() => void loadHistory(finding.id)}
+                              >
+                                Повторить запрос
+                              </Button>
+                            </div>
+                          </Notice>
+                        {:else if hist.data}
+                          {#if !hist.data.versions.length}
+                            <p class="micro">других версий у этого тезиса нет.</p>
+                          {:else}
+                            {#each hist.data.versions as version (version.finding_id + version.version)}
+                              <div class="version">
+                                <p class="small">{version.statement}</p>
+                                <p class="micro">
+                                  версия <b class="num">{version.version}</b> ·
+                                  <StatusPill
+                                    status={version.status}
+                                    label={STATUS_PHRASE[version.status]}
+                                  />
+                                  {#if version.review_date}
+                                    <time datetime={version.review_date}>{reviewDate(version.review_date)}</time>
+                                  {:else}
+                                    разбор не проводился
+                                  {/if}
+                                  {#if version.reviewer_id}
+                                    · правил <code class="code tech">{shortCode(version.reviewer_id)}</code>
+                                  {/if}
+                                </p>
+                                {#if version.review_reason}<p class="micro">{version.review_reason}</p>{/if}
+                              </div>
+                            {/each}
+                          {/if}
+                        {/if}
+                      </div>
+                    {/if}
                   </div>
-                </div>
-              {/if}
-
-              <!-- Correction input -->
-              {#if correctingMessageId === msg.id}
-                {#if correctionSubmitted}
-                  <div class="inline-success">
-                    <Check size={16} /> Спасибо! Ваше исправление отправлено для улучшения системы.
-                  </div>
-                {:else}
-                  <div class="inline-input">
-                    <textarea
-                      bind:value={correctionText}
-                      rows="4"
-                      placeholder="Отредактируйте ответ…"
-                    ></textarea>
-                    <div class="inline-input__actions">
-                      <button class="action-btn" onclick={() => submitCorrection(msg)} disabled={!correctionText.trim()}>
-                        <Send size={14} /> Отправить исправление
-                      </button>
-                      <button class="action-btn action-btn--ghost" onclick={cancelCorrection}>Отмена</button>
-                    </div>
-                  </div>
-                {/if}
-              {/if}
-
-              <!-- Feedback form -->
-              {#if feedbackMessageId === msg.id}
-                {#if feedbackSubmitted}
-                  <div class="inline-success">
-                    <Check size={16} /> Спасибо за отзыв!
-                  </div>
-                {:else}
-                  <div class="feedback-form">
-                    <p class="feedback-form__question">Был ли ответ полезен?</p>
-                    <div class="feedback-form__buttons">
-                      <button
-                        class:feedback-btn--active={feedbackHelpful === true}
-                        onclick={() => feedbackHelpful = true}
-                      >
-                        <ThumbsUp size={15} /> Да
-                      </button>
-                      <button
-                        class:feedback-btn--active={feedbackHelpful === false}
-                        onclick={() => feedbackHelpful = false}
-                      >
-                        <ThumbsDown size={15} /> Нет
-                      </button>
-                    </div>
-                    <textarea
-                      bind:value={feedbackText}
-                      placeholder="Что можно улучшить?"
-                      rows="2"
-                    ></textarea>
-                    <div class="inline-input__actions">
-                      <button
-                        class="action-btn"
-                        onclick={() => submitFeedback(msg)}
-                        disabled={feedbackHelpful === null}
-                      >
-                        <Send size={14} /> Отправить
-                      </button>
-                      <button class="action-btn action-btn--ghost" onclick={cancelFeedback}>Отмена</button>
-                    </div>
-                  </div>
-                {/if}
-              {/if}
-            {/if}
+                </article>
+              {/each}
+            </div>
           </div>
-        </div>
-      {/if}
-    {/each}
+        {/if}
+
+        {#if payload.conflicts.length || payload.knowledge_gaps.length || payload.recommendations.length}
+          <section class="block">
+            <div class="block__head">
+              <h3 class="h4">Где источники расходятся и где молчат</h3>
+              <p class="micro">
+                Конфликт — пара утверждений об одном субъекте и предикате при непересекающихся
+                нормализованных диапазонах; пробел — непокрытая комбинация измерений.
+              </p>
+            </div>
+            {#each payload.conflicts as item, index (index)}
+              <div class="line">
+                <span class="tag">расхождение {String(index + 1).padStart(2, '0')}</span>
+                <p class="small">{item}</p>
+              </div>
+            {/each}
+            {#each payload.knowledge_gaps as item, index (index)}
+              <div class="line">
+                <span class="tag">пробел {String(index + 1).padStart(2, '0')}</span>
+                <p class="small">{item}</p>
+              </div>
+            {/each}
+            {#each payload.recommendations as item, index (index)}
+              <div class="line">
+                <span class="tag">шаг проверки {String(index + 1).padStart(2, '0')}</span>
+                <p class="small">{item}</p>
+              </div>
+            {/each}
+            <div class="row">
+              <Button href="/conflicts" variant="quiet" size="sm" icon="conflict">
+                Все расхождения корпуса
+              </Button>
+            </div>
+          </section>
+        {/if}
+
+        {#if canFeedback}
+          <section class="block">
+            <div class="block__head">
+              <h3 class="h4">Отзыв по ответу</h3>
+              <p class="micro">
+                Отзыв ложится на ответ этого прогона и создаёт предложение на проверку. Замена
+                конкретного утверждения — в разборе тезиса выше.
+              </p>
+            </div>
+            <div class="verdicts">
+              <span class="micro">вердикт</span>
+              <Chip pressed={feedbackVerdict === 'accept'} onclick={() => (feedbackVerdict = 'accept')}>
+                Ответ полезен
+              </Chip>
+              <Chip pressed={feedbackVerdict === 'reject'} onclick={() => (feedbackVerdict = 'reject')}>
+                Ответу не верю
+              </Chip>
+            </div>
+            <Field
+              label="Комментарий"
+              name="answer-feedback"
+              type="textarea"
+              rows={2}
+              placeholder="Что проверить в первую очередь"
+              hint="Минимум три символа — пустой комментарий не принять."
+              bind:value={feedbackComment}
+            />
+            <Button
+              variant="action"
+              size="sm"
+              busy={busy === 'feedback'}
+              disabled={busy === 'feedback' || !feedbackVerdict || feedbackComment.trim().length < 3}
+              onclick={() => void sendFeedback()}
+            >
+              Отправить отзыв
+            </Button>
+          </section>
+        {:else}
+          <p class="micro">
+            Отзыв по ответу доступен при расширенном доступе: без него ответ остаётся на листе, но
+            предложение эволюции из него не создаётся.
+          </p>
+        {/if}
+      </article>
+    {/if}
   </div>
 
-  <!-- Input Area -->
-  <div class="chat-input-area">
-    <div class="chat-input-wrapper">
-      <textarea
-        bind:value={input}
-        onkeydown={handleKeyDown}
-        oninput={handleInput}
-        placeholder="Задайте вопрос по графику знаний…"
-        rows="1"
-        disabled={loading}
-      ></textarea>
-      <button
-        class="chat-send-btn"
-        onclick={() => sendMessage(input)}
-        disabled={loading || input.trim().length < 3}
-        aria-label="Отправить"
-      >
-        {#if loading}
-          <Loader2 size={18} class="spin" />
+  <!-- ── 4. КОМПОЗЕР: прилип ко дну рабочего листа, маскот = состояние прогона -->
+  <div class="ask__composer">
+    <!-- Показания корпуса, остановка прохода и «Приложить документ» живут своей
+         строкой над полем: ряд инструментов композера на узком экране уходит в
+         скрытый горизонтальный скролл, а эти действия обязательные. -->
+    <div class="ask__meta">
+      <span class="tag ask__corpus">
+        {#if corpusState === 'loading'}
+          читаем показания корпуса…
+        {:else if corpusState === 'error'}
+          показания корпуса не получены
+        {:else if corpus}
+          корпус: документов <b class="num">{corpus.documents}</b> · утверждений
+          <b class="num">{corpus.claims}</b> · фрагментов <b class="num">{corpus.chunks}</b> ·
+          сущностей <b class="num">{corpus.entities}</b>
         {:else}
-          <Send size={18} />
+          показания корпуса не получены
         {/if}
-      </button>
+      </span>
+      {#if running}
+        <Button variant="quiet" size="sm" icon="close" onclick={onstop}>Остановить проход</Button>
+      {/if}
+      <label class="btn btn--sm btn--quiet upload ask__attach">
+        <Icon name="upload" size={16} />
+        {busy === 'import' ? 'Обрабатываем…' : 'Приложить документ'}
+        <input
+          type="file"
+          accept=".pdf,.docx,.xlsx,.json,.txt"
+          disabled={busy === 'import'}
+          onchange={pickFile}
+        />
+      </label>
     </div>
-    <p class="chat-input-hint">Enter — отправить · Shift+Enter — новая строка</p>
+
+    <PromptInput
+      bind:value={draft}
+      variant="docked"
+      name="ask"
+      label="Вопрос к графу доказательств"
+      placeholder="Какие методы обессоливания подходят при сульфатах и хлоридах 200–300 мг/л?"
+      busy={running}
+      disabled={!canAsk}
+      hint={draft && !draftValid ? 'минимум три символа' : 'Enter — спросить · Shift + Enter — строка'}
+      onsubmit={ask}
+    />
+
+    {#if draft && !draftValid}
+      <p class="field__error ask__note">
+        Вопрос короче трёх символов — добавьте формулировку, иначе ответа не будет.
+      </p>
+    {/if}
+    {#if !canAsk}
+      <p class="field__error ask__note">
+        Спрашивать корпус может подтверждённый аккаунт с доступом к запросам: сейчас его нет.
+        Находки и карта связей работают.
+      </p>
+    {/if}
   </div>
 </div>
 
-<!-- Graph Panel Overlay -->
-{#if graphPanelOpen}
-  <div class="graph-overlay" onclick={closeGraph} role="presentation">
-    <div class="graph-panel" onclick={(e) => e.stopPropagation()} role="dialog" aria-label="Граф связей">
-      <div class="graph-panel__header">
-        <h3><Network size={18} /> Граф связей запроса</h3>
-        <button class="graph-panel__close" onclick={closeGraph} aria-label="Закрыть">
-          <X size={20} />
-        </button>
-      </div>
-      <div class="graph-panel__body">
-        {#if graphPanelData.nodes.length > 0}
-          <GraphCanvas
-            graph={graphPanelData}
-            selectedId={graphSelectedId}
-          />
-        {:else}
-          <div class="graph-panel__empty">
-            <Network size={40} />
-            <p>Граф не содержит данных для этого запроса</p>
-          </div>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
-
 <style>
-  .chat-panel {
+  .ask {
     display: flex;
     flex-direction: column;
-    height: calc(100vh - 220px);
-    min-height: 500px;
-    max-width: 100%;
+    gap: var(--s5);
   }
 
-  /* Header */
-  .chat-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 16px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid var(--line);
-    margin-bottom: 0;
-    flex-shrink: 0;
-  }
-  .chat-header__title {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-  .chat-header__title :global(svg) { color: var(--accent); flex: none; }
-  .chat-header h1 {
-    margin: 0;
-    font-family: Georgia, serif;
-    font-size: 24px;
-    letter-spacing: -0.02em;
-    line-height: 1.2;
-  }
-  .chat-header p {
-    margin: 4px 0 0;
-    font-size: 13px;
-    color: var(--muted);
-  }
-  .chat-status {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--muted);
-    flex-shrink: 0;
-  }
-  .chat-status span {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--amber);
-  }
-  .chat-status.ready span { background: var(--green); }
-
-  /* Messages Area */
-  .chat-messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 20px 0;
-    scroll-behavior: smooth;
-  }
-
-  /* Welcome state */
-  .chat-welcome {
+  .ask__flow {
     display: flex;
     flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-    padding: 60px 20px;
-    gap: 8px;
-  }
-  .chat-welcome__icon {
-    display: grid;
-    place-items: center;
-    width: 64px;
-    height: 64px;
-    border-radius: 16px;
-    background: var(--surface);
-    color: var(--accent);
-    margin-bottom: 8px;
-  }
-  .chat-welcome h2 {
-    font-family: Georgia, serif;
-    font-size: 26px;
-    margin: 0;
-  }
-  .chat-welcome p {
-    color: var(--muted);
-    font-size: 15px;
-    line-height: 1.5;
-    max-width: 460px;
-  }
-  .chat-suggestions {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-top: 20px;
-    max-width: 520px;
-    width: 100%;
-  }
-  .chat-suggestions button {
-    text-align: left;
-    padding: 12px 16px;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: white;
-    cursor: pointer;
-    font-size: 13px;
-    color: var(--ink);
-    transition: all 0.15s;
-  }
-  .chat-suggestions button:hover {
-    border-color: var(--accent);
-    background: #fdf9f7;
-  }
-
-  /* Messages */
-  .msg {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 20px;
-    animation: msg-fade-in 0.2s ease;
-  }
-  @keyframes msg-fade-in {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .msg--user {
-    flex-direction: row-reverse;
-    align-items: flex-start;
-  }
-  .msg__avatar {
-    display: grid;
-    place-items: center;
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    background: var(--ink);
-    color: white;
-    flex-shrink: 0;
-  }
-  .msg__bubble {
-    max-width: 75%;
-    padding: 12px 16px;
-    border-radius: 14px;
-    font-size: 14px;
-    line-height: 1.55;
-  }
-  .msg__bubble--user {
-    background: var(--cobalt);
-    color: white;
-    border-bottom-right-radius: 4px;
-  }
-  .msg--user .msg__time {
-    font-size: 11px;
-    color: var(--muted);
-    flex-shrink: 0;
-    margin-top: 4px;
-  }
-  .msg--assistant .msg__content {
-    max-width: 82%;
-    flex: 1;
+    gap: var(--s5);
     min-width: 0;
   }
-  .msg__badge {
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 5px;
-    background: #e8f0ff;
-    color: #1e40af;
-    margin-bottom: 8px;
-  }
-  .msg__badge--refined {
-    background: #fef3e2;
-    color: #92400e;
-  }
-  .msg__time {
-    font-size: 11px;
-    color: var(--muted);
-    margin-top: 4px;
-  }
 
-  /* Agent Steps */
-  .agent-steps {
+  /* ── Композер: прилип ко дну листа вместе со своими подсказками ──────── */
+
+  .ask__composer {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 12px 14px;
-    background: var(--surface);
-    border-radius: 10px;
-    margin-bottom: 12px;
-  }
-  .agent-step {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    color: var(--muted);
-    transition: color 0.2s;
-  }
-  .agent-step.completed {
-    color: var(--ink);
-  }
-  .agent-step__icon {
-    display: grid;
-    place-items: center;
-    width: 20px;
-    height: 20px;
-    flex-shrink: 0;
-  }
-  .agent-step:not(.completed) .agent-step__icon {
-    color: var(--cobalt);
-  }
-  .agent-step.completed .agent-step__icon {
-    color: var(--green);
-  }
-  .agent-step__label {
-    font-weight: 600;
-  }
-  .agent-step__result {
-    font-size: 12px;
-    color: var(--muted);
-    margin-left: auto;
-    white-space: nowrap;
-  }
-  .agent-step.completed .agent-step__result {
-    color: var(--green);
-    font-weight: 600;
+    gap: var(--s2);
+    /* Единица прилипания — весь композер: поле PromptInput растёт само по
+       содержимому, а строка подсказки не отрывается от поля при прокрутке.
+       Лоток непрозрачен: без подложки строка показаний лежит поверх прокрутки
+       и список эталонных вопросов читается сквозь неё. */
+    position: sticky;
+    bottom: var(--s4);
+    z-index: var(--z-dock);
+    padding: var(--s2) var(--s3) var(--s3);
+    border-radius: var(--r-lg);
+    background: var(--surface-sunk);
   }
 
-  /* Error */
-  .msg__error {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 14px;
-    background: #fde8e6;
-    border: 1px solid #f0b5ad;
-    border-radius: 10px;
-    color: #852d2d;
+  .ask__note {
+    margin: 0;
+    padding-inline: var(--s4);
+    font-size: var(--t-micro);
   }
-  .msg__error :global(svg) { color: #ad3434; flex-shrink: 0; margin-top: 1px; }
-  .msg__error strong { display: block; font-size: 13px; margin-bottom: 6px; }
-  .msg__retry {
+
+  /* Ряд над полем: показания корпуса, остановка прохода и приложение
+     документа. Переносится, а не уходит в скрытый скролл. */
+  .ask__meta {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    flex-wrap: wrap;
+    padding-inline: var(--s4);
+  }
+
+  .ask__corpus {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    border: 1px solid #f0b5ad;
-    background: white;
-    color: #852d2d;
-    padding: 5px 12px;
-    border-radius: 7px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
+    gap: var(--s1);
+    flex-wrap: wrap;
+    min-width: 0;
+    font-variant-numeric: tabular-nums;
   }
 
-  /* Answer Text */
-  .answer-text {
-    font-size: 14px;
-    line-height: 1.6;
+  .ask__attach {
+    flex: none;
+  }
+
+  @media (max-width: 640px) {
+    .ask__composer {
+      bottom: calc(var(--s3) + env(safe-area-inset-bottom, 0px));
+    }
+
+    .ask__note,
+    .ask__meta {
+      padding-inline: var(--s3);
+    }
+  }
+
+  /* Файловый инпут живёт в label: сам инпут невидим, но остаётся в
+     клавиатурном пути, поэтому focus показываем на всей подписи. */
+  .upload {
+    position: relative;
+  }
+
+  .upload input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .btn.upload:focus-within {
+    outline: 2px solid var(--action-ink);
+    outline-offset: 3px;
+  }
+
+  .btn.upload:hover {
+    background: var(--surface-raised);
+  }
+
+  .trail__body[hidden],
+  .evidence__body[hidden] {
+    display: none;
+  }
+
+  /* ── Состояния ───────────────────────────────────────────────────────────── */
+
+  .case {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+  }
+
+  .case__actions {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--s2);
+    width: 100%;
+    max-width: var(--maxw-measure);
+  }
+
+  .case__label {
+    margin-top: var(--s2);
+    font-weight: 500;
+    color: var(--ink-2);
+  }
+
+  .btn.example {
+    justify-content: flex-start;
+    text-align: left;
+    white-space: normal;
+    line-height: var(--lh-dense);
+    min-height: 44px;
+    height: auto;
+    padding-block: var(--s2);
+  }
+
+  .notice-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s2);
+  }
+
+  .notice-row :global(.notice) {
+    flex: 1 1 auto;
+  }
+
+  /* ── След прохода ────────────────────────────────────────────────────── */
+
+  .trail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+  }
+
+  .trail__head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+  }
+
+  .trail__title {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    min-width: 0;
+  }
+
+  .trail__title .h4 {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+  }
+
+  .trail__title .micro {
+    display: flex;
+    gap: var(--s2);
+    flex-wrap: wrap;
+  }
+
+  .trail__meter {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--s1);
+    flex: none;
+  }
+
+  .trail__elapsed {
+    font-family: var(--font-data);
+    font-size: var(--t-h3);
+    font-weight: 600;
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: var(--tr-head);
+  }
+
+  .trail__body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    padding-top: var(--s3);
+    border-top: 1px solid var(--line);
+  }
+
+  .trail__honest {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s2);
+    color: var(--ink-2);
+    max-width: var(--maxw-measure);
+  }
+
+  .trail__waiting {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    font-size: var(--t-small);
+    color: var(--ink-3);
+  }
+
+  .stage {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    padding: var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    background: var(--surface);
+    box-shadow: var(--shadow-soft);
+  }
+
+  .stage__head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+
+  .stage__head .small {
+    font-weight: 600;
     color: var(--ink);
-    margin-bottom: 12px;
+    font-size: var(--t-body);
   }
-  .answer-text p {
-    margin: 0 0 10px;
+
+  .stage__head .micro {
+    flex: 1 1 200px;
   }
-  .answer-findings-list {
-    margin: 8px 0 0;
-    padding-left: 18px;
+
+  .stage__steps {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    margin: 0;
+    padding: 0;
     list-style: none;
   }
-  .answer-findings-list li {
-    position: relative;
-    padding: 4px 0;
-    font-size: 13px;
-    color: #555f59;
-  }
-  .answer-findings-list li::before {
-    content: "▸";
-    position: absolute;
-    left: -14px;
-    color: var(--accent);
-  }
-  .answer-more {
-    font-size: 12px;
-    color: var(--muted);
-    margin-top: 6px;
+
+  .step {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    padding: var(--s2) var(--s3);
+    border-radius: var(--r-sm);
+    background: var(--surface-sunk);
+    flex-wrap: wrap;
   }
 
-  /* Conflict & Gap Cards */
-  .conflict-cards, .gap-cards {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 10px;
+  .step[data-state='failed'] {
+    background: var(--disputed-wash);
   }
-  .card {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 12px;
-    line-height: 1.45;
-  }
-  .card :global(svg) { flex-shrink: 0; margin-top: 1px; }
-  .card--conflict {
-    background: #fde8e6;
-    border: 1px solid #f0b5ad;
-    color: #852d2d;
-  }
-  .card--conflict :global(svg) { color: #ad3434; }
-  .card--gap {
-    background: #fef3e2;
-    border: 1px solid #f0d4a0;
-    color: #84500f;
-  }
-  .card--gap :global(svg) { color: #a66513; }
 
-  /* Metrics */
-  .metrics-row {
+  .step[data-state='revised'] {
+    background: var(--hypothesis-wash);
+  }
+
+  .step__idx {
+    color: var(--ink-4);
+    flex: none;
+  }
+
+  .step__body {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    flex-wrap: wrap;
+    min-width: 0;
+    flex: 1 1 260px;
+  }
+
+  .step__agent {
+    font-weight: 600;
+    font-size: var(--t-small);
+  }
+
+  .step__msg {
+    font-size: var(--t-micro);
+    color: var(--ink-3);
+    line-height: var(--lh-dense);
+    overflow-wrap: anywhere;
+  }
+
+  .step__note {
+    flex: none;
+    font-size: var(--t-micro);
+    color: var(--ink-3);
+  }
+
+  .stage__kv {
+    max-width: var(--maxw-measure);
+  }
+
+  /* Фильтр плана без единого покрытия — факт, а не оформление. */
+  .no-coverage {
+    background: var(--disputed-wash);
+  }
+
+  .stage__kv dd {
+    font-family: var(--font-data);
+  }
+
+  .chips {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
-    margin-bottom: 12px;
+    gap: var(--s2);
   }
-  .metric {
-    display: inline-flex;
+
+  /* Статические чипы плана: длинная сущность не должна расшивать экран
+     по горизонтали, поэтому переносим текст внутри чипа. */
+  .chips .chip--static {
+    white-space: normal;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .evidence__kv dd,
+  .stage__kv dd,
+  .paper__kv dd {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .stage__obs {
+    display: grid;
+    gap: var(--s3);
+    grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  }
+
+  .obs {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+    padding: var(--s3) var(--s4);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-md);
+    background: var(--surface-sunk);
+  }
+
+  .obs__head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    flex-wrap: wrap;
+  }
+
+  .obs p {
+    overflow-wrap: anywhere;
+  }
+
+  /* ── Бумага ответа ───────────────────────────────────────────────────── */
+
+  /* Лист лежит на всю ширину (wrap--bleed): плотность даёт таблица и шкала,
+     а читается текст в своей мере, поэтому она ограничена внутри колонок. */
+  .paper {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s5);
+    padding: clamp(var(--s4), 2.4vw, var(--s7));
+    border: 1px solid var(--line);
+    border-radius: var(--r-xl);
+    background: var(--paper);
+    box-shadow: var(--shadow-lift);
+  }
+
+  .paper__head {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+  }
+
+  .summary {
+    margin-top: var(--s2);
+    max-width: var(--maxw-measure);
+    font-size: var(--t-lead);
+    line-height: 1.5;
+    color: var(--ink-2);
+    white-space: pre-line;
+    text-wrap: pretty;
+  }
+
+  .paper__guide {
+    align-self: flex-start;
+    width: 100%;
+    max-width: var(--maxw-measure);
+  }
+
+  .paper__guide-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    margin: 0;
+    padding-inline-start: var(--s4);
+  }
+
+  .paper__guide-list li {
+    text-wrap: pretty;
+  }
+
+  .paper__bar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+    padding: var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface-raised);
+  }
+
+  .paper__kv {
+    flex: 1 1 320px;
+    min-width: 0;
+  }
+
+  .paper__export {
+    display: flex;
     align-items: center;
-    padding: 3px 10px;
-    border-radius: 6px;
-    background: var(--surface);
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--ink);
+    gap: var(--s2);
+    flex-wrap: wrap;
+    flex: none;
   }
-  .metric--model {
-    color: var(--muted);
+
+  .paper__degraded {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+  }
+
+  /* Служебное имя или идентификатор — только подписью при человекочитаемом
+     названии: шрифт данных, размер и цвет младше основного текста. */
+  .tech {
+    font-size: var(--t-micro);
+    font-weight: 400;
+    color: var(--ink-4);
+    overflow-wrap: anywhere;
+  }
+
+  .paper__id {
+    color: var(--ink-3);
+  }
+
+  /* Режим сборки и само-оценка — сведения, а не измеренные данные: им не место
+     в моно-шкале метрик. */
+  .paper__mode {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    max-width: var(--maxw-measure);
+    color: var(--hypothesis);
+  }
+
+  .paper__confidence {
+    flex: 1 1 100%;
+    margin: 0;
+    color: var(--ink-3);
+  }
+
+  .paper__body {
+    display: grid;
+    gap: var(--s5);
+    grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+    align-items: start;
+  }
+
+  @media (max-width: 1119px) {
+    .paper__body {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  /* ── Шкала интервалов ────────────────────────────────────────────────── */
+
+  .scale {
+    position: sticky;
+    top: calc(var(--topbar-h) + var(--s4));
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    max-height: calc(100vh - var(--topbar-h) - var(--s7));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    padding: var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    background: var(--surface-sunk);
+  }
+
+  @media (max-width: 1119px) {
+    .scale {
+      position: static;
+      max-height: none;
+      overflow: visible;
+    }
+  }
+
+  .scale__head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    flex-wrap: wrap;
+  }
+
+  .scale__head .small {
+    font-weight: 600;
+    font-size: var(--t-body);
+  }
+
+  .scale__head .micro {
+    flex: 1 1 100px;
+  }
+
+  .btn.scale__toggle,
+  .btn.trail__toggle {
+    flex: none;
+    min-height: 44px;
+  }
+
+  .scale__group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    margin-top: var(--s3);
+  }
+
+  .scale__unit {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--s2);
+    font-weight: 500;
+    color: var(--ink-2);
+  }
+
+  .tick {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s3);
+    width: 100%;
+    padding: var(--s3);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface);
+    color: var(--ink-2);
+    text-align: left;
+    cursor: pointer;
+    transition: border-color var(--dur-fast) var(--ease-soft),
+      background var(--dur-fast) var(--ease-soft);
+  }
+
+  .tick:hover {
+    border-color: var(--line-strong);
+    background: var(--surface-raised);
+  }
+
+  .tick[aria-current='true'] {
+    border-color: var(--action-deep);
+    background: var(--peach-wash);
+    box-shadow: var(--shadow-soft);
+  }
+
+  .tick__idx {
+    font-size: var(--t-micro);
+    color: var(--ink-4);
+    flex: none;
+  }
+
+  .tick__body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .tick__code {
+    font-size: var(--t-micro);
+    color: var(--ink-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tick__label {
+    font-size: var(--t-small);
+    line-height: var(--lh-dense);
+    color: var(--ink);
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+  }
+
+  /* app.css не знает полосы «гипотезы»: доопределяем единственный недостающий
+     вариант тем же токеном статуса. */
+  .bar__fill[data-status='hypothesis'] {
+    background: var(--hypothesis);
+  }
+
+  /* ── Тезисы ──────────────────────────────────────────────────────────── */
+
+  .theses {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    min-width: 0;
+  }
+
+  .thesis {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    padding: var(--s4) var(--s5);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-lg);
+    background: var(--surface);
+  }
+
+  .thesis--open {
+    border-color: var(--line-strong);
+    box-shadow: var(--shadow-soft);
+  }
+
+  .thesis__head {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+  }
+
+  .thesis__marks {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    flex-wrap: wrap;
+  }
+
+  .thesis__statement {
+    max-width: var(--maxw-measure);
+    font-size: var(--t-h4);
+    font-weight: 600;
+    line-height: var(--lh-head);
+    letter-spacing: var(--tr-body);
+    text-wrap: pretty;
+    overflow-wrap: anywhere;
+  }
+
+  .thesis__spo {
+    display: flex;
+    gap: var(--s2);
+    flex-wrap: wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .thesis__toggle {
+    align-self: flex-start;
+  }
+
+  .thesis__closed,
+  .thesis__bare,
+  .thesis__note {
+    margin-top: var(--s2);
+    max-width: var(--maxw-measure);
+    overflow-wrap: anywhere;
+  }
+
+  .thesis__bare {
+    font-family: var(--font-data);
+    font-size: var(--t-micro);
+    color: var(--hypothesis);
+  }
+
+  /* ── Числовые наблюдения ─────────────────────────────────────────────── */
+
+  .measures {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    margin-top: var(--s4);
+  }
+
+  .measures__label {
+    font-weight: 500;
+    color: var(--ink-2);
+  }
+
+  .measure {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    padding: var(--s3) var(--s4);
+    border-radius: var(--r-md);
+    background: var(--surface-sunk);
+  }
+
+  .measure__top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+
+  .measure__top code {
+    font-family: var(--font-data);
+    color: var(--ink-2);
+  }
+
+  .measure__value {
+    font-size: var(--t-h4);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Мерка лежит на утопленном поле: трек светлее фона и не сливается с ним,
+     метки условий выходят за полосу. */
+  .measure__track {
+    overflow: visible;
+    background: var(--surface-raised);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+
+  .measure__limit {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 2px;
+    border-radius: var(--r-pill);
+    background: var(--ink-3);
+    transform: translateX(-1px);
+  }
+
+  .measure__scale,
+  .measure__limits,
+  .measure__filter {
+    display: flex;
+    gap: var(--s2);
+    flex-wrap: wrap;
+  }
+
+  .measure__filter {
+    color: var(--ink-3);
+  }
+
+  .measure__filter.outside {
+    color: var(--disputed);
     font-weight: 500;
   }
 
-  /* Action Buttons */
-  .action-buttons, .evolving-controls {
+  /* ── Расхождение ─────────────────────────────────────────────────────── */
+
+  .rivals {
     display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-bottom: 8px;
+    flex-direction: column;
+    gap: var(--s2);
+    margin-top: var(--s4);
+    padding: var(--s4);
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--r-md);
+    background: var(--disputed-wash);
   }
-  .action-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 7px 12px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    background: white;
-    cursor: pointer;
-    font-size: 12px;
+
+  .rivals__label {
     font-weight: 600;
-    color: var(--ink);
-    transition: all 0.12s;
-  }
-  .action-btn:hover {
-    border-color: var(--cobalt);
-    color: var(--cobalt);
-  }
-  .action-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-  .action-btn--ghost {
-    background: transparent;
-    border-color: transparent;
-    color: var(--muted);
-  }
-  .action-btn--ghost:hover {
-    background: var(--surface);
-    color: var(--ink);
-  }
-  :global(.rotated) {
-    transform: rotate(180deg);
-    transition: transform 0.15s;
+    color: var(--disputed);
   }
 
-  /* Expandable Sections */
-  .expandable-section {
-    margin-top: 8px;
-    padding: 12px;
-    background: var(--surface);
-    border-radius: 10px;
-  }
-  .expandable-section h4 {
+  .rivals__row {
     display: flex;
-    align-items: center;
-    gap: 6px;
-    margin: 0 0 10px;
-    font-size: 13px;
-  }
-
-  /* Source Items */
-  .source-item {
-    padding: 10px 0;
-    border-bottom: 1px solid var(--line);
-  }
-  .source-item:last-child { border: 0; }
-  .source-item__header {
-    display: flex;
+    align-items: baseline;
     justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 4px;
-  }
-  .source-item__header strong {
-    font-size: 13px;
-  }
-  .source-item__score {
-    font-size: 11px;
-    color: var(--muted);
-    white-space: nowrap;
-  }
-  .source-item__quote {
-    margin: 0;
-    font-size: 12px;
-    line-height: 1.5;
-    color: #555f59;
-  }
-  .source-item__meta {
-    display: flex;
-    gap: 10px;
-    margin-top: 4px;
-    font-size: 10px;
-    color: var(--muted);
-  }
-  .source-item__toggle {
-    border: 0;
-    background: transparent;
-    color: var(--accent);
-    font-size: 11px;
-    font-weight: 600;
-    cursor: pointer;
-    padding: 4px 0 0;
+    gap: var(--s3);
+    flex-wrap: wrap;
   }
 
-  /* Finding Cards */
-  .finding-card {
-    padding: 10px;
-    background: white;
-    border: 1px solid var(--line);
-    border-radius: 9px;
-    margin-bottom: 8px;
-  }
-  .finding-card:last-child { margin: 0; }
-  .finding-card__spo {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-wrap: wrap;
-    font-size: 12px;
-    line-height: 1.4;
-    margin-bottom: 8px;
-  }
-  .finding-card__subject {
-    font-weight: 700;
-    color: var(--cobalt);
-  }
-  .finding-card__predicate {
+  .rivals__row[data-self] {
     font-weight: 600;
-    color: var(--accent);
-    text-transform: uppercase;
-    font-size: 10px;
-    letter-spacing: 0.04em;
   }
-  .finding-card__arrow {
-    color: var(--muted);
-    font-size: 11px;
-  }
-  .finding-card__statement {
-    color: var(--ink);
-    flex: 1;
-    min-width: 120px;
-  }
-  .finding-card__conf {
+
+  /* ── Доказательства ──────────────────────────────────────────────────── */
+
+  .trace {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 8px;
+    flex-direction: column;
+    gap: var(--s2);
+    margin-top: var(--s4);
+    padding-left: var(--s4);
+    border-left: 1px solid var(--coral-mist);
   }
-  .finding-card__bar {
-    flex: 1;
-    height: 5px;
-    background: var(--surface);
-    border-radius: 3px;
+
+  .trace__label {
+    font-weight: 500;
+    color: var(--ink-2);
+  }
+
+  .evidence {
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-md);
+    background: var(--surface-raised);
     overflow: hidden;
   }
-  .finding-card__bar > div {
-    height: 100%;
-    border-radius: 3px;
-    transition: width 0.3s;
-  }
-  .finding-card__conf > span {
-    font-size: 12px;
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-  }
-  .finding-card__actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .finding-card__actions button {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    border: 1px solid var(--line);
-    background: white;
-    border-radius: 6px;
-    padding: 4px 10px;
-    font-size: 11px;
-    font-weight: 600;
-    cursor: pointer;
-    color: var(--ink);
-    transition: all 0.12s;
-  }
-  .finding-card__actions button:hover {
-    border-color: var(--cobalt);
-    color: var(--cobalt);
-  }
-  .finding-card__evidence-count {
-    font-size: 11px;
-    color: var(--muted);
-  }
-  .finding-card__status {
-    font-size: 10px;
-    font-weight: 700;
-    padding: 2px 7px;
-    border-radius: 4px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .finding-card__status--consensus { background: #e1efe7; color: var(--green); }
-  .finding-card__status--disputed { background: #fef3e2; color: var(--amber); }
-  .finding-card__status--hypothesis { background: #fde8e6; color: var(--red); }
 
-  /* Trace Section */
-  .trace-section {
-    margin-bottom: 10px;
+  .evidence--open {
+    border-color: var(--action);
+    box-shadow: var(--shadow-soft);
   }
-  .trace-section:last-child { margin: 0; }
-  .trace-section small {
-    display: block;
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    margin-bottom: 6px;
-  }
-  .trace-item {
+
+  .evidence__head {
     display: flex;
-    align-items: flex-start;
-    gap: 6px;
-    padding: 5px 0;
-    border-bottom: 1px solid var(--line);
-    font-size: 12px;
-    line-height: 1.4;
+    align-items: center;
+    gap: var(--s3);
+    width: 100%;
+    padding: var(--s3) var(--s4);
+    min-height: 44px;
+    border: 0;
+    background: none;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    flex-wrap: wrap;
+    transition: background var(--dur-fast) var(--ease-soft);
   }
-  .trace-item:last-child { border: 0; }
-  .trace-item__status {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--muted);
-    flex-shrink: 0;
-    margin-top: 5px;
+
+  .evidence__head:hover {
+    background: var(--peach-wash);
   }
-  .trace-item__status--success, .trace-item__status--completed { background: var(--green); }
-  .trace-item__status--warning, .trace-item__status--revised { background: var(--amber); }
-  .trace-item__status--error, .trace-item__status--failed { background: var(--red); }
-  .trace-item__status--started { background: var(--cobalt); }
-  .trace-item__tool {
+
+  .evidence__head:focus-visible {
+    outline: 2px solid var(--action-ink);
+    outline-offset: -3px;
+  }
+
+  .evidence__src {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    min-width: 0;
+    flex: 1 1 200px;
+    font-size: var(--t-small);
+  }
+
+  .evidence__src b {
     font-weight: 600;
-    color: var(--ink);
-    white-space: nowrap;
-    flex-shrink: 0;
+    overflow-wrap: anywhere;
   }
-  .trace-item__summary {
-    color: #555f59;
-    flex: 1;
+
+  .evidence__head .locator {
+    flex-wrap: wrap;
+    font-family: var(--font-data);
+    flex: 1 1 220px;
     min-width: 0;
   }
-  .trace-item__duration {
-    font-size: 10px;
-    color: var(--muted);
-    white-space: nowrap;
-    flex-shrink: 0;
-    font-variant-numeric: tabular-nums;
+
+  .locator__sep {
+    color: var(--line-strong);
   }
 
-  /* Inline Inputs (Refinement, Correction) */
-  .inline-input {
-    margin-top: 10px;
-    padding: 12px;
-    background: var(--surface);
-    border-radius: 10px;
-  }
-  .inline-input textarea {
-    display: block;
-    width: 100%;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-size: 13px;
-    line-height: 1.5;
-    resize: vertical;
-    min-height: 40px;
-    background: white;
-    color: var(--ink);
-    outline: 0;
-  }
-  .inline-input textarea:focus {
-    border-color: var(--cobalt);
-  }
-  .inline-input__actions {
+  .evidence__body {
     display: flex;
-    gap: 6px;
-    margin-top: 8px;
+    flex-direction: column;
+    gap: var(--s2);
+    padding: 0 var(--s4) var(--s4);
   }
 
-  .inline-success {
+  .evidence__kv {
+    max-width: var(--maxw-measure);
+  }
+
+  /* ── Правка и история версий ─────────────────────────────────────────── */
+
+  .thesis__actions {
+    margin-top: var(--s4);
+  }
+
+  .correction {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 12px 14px;
-    background: #e4f1e9;
-    border-radius: 10px;
-    color: var(--green);
-    font-size: 13px;
-    font-weight: 600;
-    margin-top: 10px;
+    flex-direction: column;
+    gap: var(--s3);
+    max-width: var(--maxw-narrow);
+    padding: var(--s4);
+    border: 1px solid var(--lavender-deep);
+    border-radius: var(--r-md);
+    background: var(--lavender);
   }
 
-  /* Feedback Form */
-  .feedback-form {
-    margin-top: 10px;
-    padding: 12px;
-    background: var(--surface);
-    border-radius: 10px;
-  }
-  .feedback-form__question {
-    margin: 0 0 8px;
-    font-size: 13px;
-    font-weight: 600;
-  }
-  .feedback-form__buttons {
+  .history {
     display: flex;
-    gap: 6px;
-    margin-bottom: 8px;
-  }
-  .feedback-form__buttons button {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 7px 14px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    background: white;
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--ink);
-    transition: all 0.12s;
-  }
-  .feedback-form__buttons button:hover {
-    border-color: var(--cobalt);
-  }
-  .feedback-btn--active {
-    border-color: var(--cobalt) !important;
-    background: #f0f4ff !important;
-    color: var(--cobalt) !important;
-  }
-  .feedback-form textarea {
-    display: block;
-    width: 100%;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-size: 13px;
-    line-height: 1.5;
-    resize: vertical;
-    min-height: 36px;
-    background: white;
-    color: var(--ink);
-    outline: 0;
-    margin-bottom: 8px;
-  }
-  .feedback-form textarea:focus {
-    border-color: var(--cobalt);
+    flex-direction: column;
+    gap: var(--s2);
+    margin-top: var(--s4);
+    padding-top: var(--s3);
+    border-top: 1px solid var(--line-soft);
   }
 
-  /* Input Area */
-  .chat-input-area {
-    flex-shrink: 0;
-    padding: 12px 0 0;
+  .history__label {
+    font-weight: 500;
+    color: var(--ink-2);
+  }
+
+  .version {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+    padding: var(--s3);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-sm);
+    background: var(--surface-sunk);
+  }
+
+  .version p {
+    overflow-wrap: anywhere;
+  }
+
+  .version :global(.status) {
+    vertical-align: middle;
+  }
+
+  /* ── Блоки расхождений и отзыва ──────────────────────────────────────── */
+
+  .block {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    padding: var(--s5);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-lg);
+    background: var(--surface-sunk);
+  }
+
+  .block__head {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+  }
+
+  .block .micro {
+    max-width: var(--maxw-measure);
+  }
+
+  .line {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    flex-wrap: wrap;
+    padding: var(--s3) 0;
     border-top: 1px solid var(--line);
   }
-  .chat-input-wrapper {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    background: white;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 8px;
-    box-shadow: 0 4px 16px rgb(36 45 39 / 6%);
-  }
-  .chat-input-wrapper textarea {
-    flex: 1;
-    border: 0;
-    outline: 0;
-    resize: none;
-    min-height: 24px;
-    max-height: 200px;
-    padding: 6px 8px;
-    font-size: 14px;
-    line-height: 1.5;
-    background: transparent;
-    color: var(--ink);
-    font-family: inherit;
-  }
-  .chat-input-wrapper textarea::placeholder {
-    color: var(--muted);
-  }
-  .chat-send-btn {
-    display: grid;
-    place-items: center;
-    width: 40px;
-    height: 40px;
-    border: 0;
-    border-radius: 10px;
-    background: var(--accent);
-    color: white;
-    cursor: pointer;
-    flex-shrink: 0;
-    transition: all 0.15s;
-  }
-  .chat-send-btn:hover:not(:disabled) {
-    background: var(--accent-dark);
-    transform: translateY(-1px);
-  }
-  .chat-send-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-  .chat-input-hint {
-    margin: 6px 0 0;
-    font-size: 11px;
-    color: var(--muted);
-    text-align: center;
+
+  .line p {
+    flex: 1 1 320px;
+    text-wrap: pretty;
+    overflow-wrap: anywhere;
   }
 
-  /* Graph Panel Overlay */
-  .graph-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    background: rgb(0 0 0 / 40%);
-    backdrop-filter: blur(2px);
-    display: flex;
-    justify-content: flex-end;
-    animation: overlay-fade 0.2s ease;
-  }
-  @keyframes overlay-fade {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  .graph-panel {
-    width: 60%;
-    min-width: 400px;
-    height: 100%;
-    background: white;
-    display: flex;
-    flex-direction: column;
-    box-shadow: -12px 0 40px rgb(0 0 0 / 15%);
-    animation: panel-slide 0.25s ease;
-  }
-  @keyframes panel-slide {
-    from { transform: translateX(100%); }
-    to { transform: translateX(0); }
-  }
-  .graph-panel__header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--line);
-    flex-shrink: 0;
-  }
-  .graph-panel__header h3 {
+  .verdicts {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin: 0;
-    font-size: 16px;
-    font-family: Georgia, serif;
-  }
-  .graph-panel__close {
-    display: grid;
-    place-items: center;
-    width: 36px;
-    height: 36px;
-    border: 0;
-    border-radius: 9px;
-    background: var(--surface);
-    cursor: pointer;
-    color: var(--ink);
-    transition: all 0.12s;
-  }
-  .graph-panel__close:hover {
-    background: #fde8e6;
-    color: var(--red);
-  }
-  .graph-panel__body {
-    flex: 1;
-    overflow: hidden;
-    padding: 16px;
-  }
-  .graph-panel__empty {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    height: 100%;
-    color: var(--muted);
-    text-align: center;
-  }
-  .graph-panel__empty p {
-    font-size: 14px;
+    gap: var(--s2);
+    flex-wrap: wrap;
   }
 
-  /* Responsive */
-  @media (max-width: 768px) {
-    .graph-panel {
-      width: 100%;
-      min-width: 0;
-    }
-    .msg__bubble { max-width: 85%; }
-    .msg--assistant .msg__content { max-width: 90%; }
-    .chat-header h1 { font-size: 20px; }
-    .chat-header p { font-size: 12px; }
-    .chat-status { display: none; }
+  .gap {
+    color: var(--ink-2);
+    text-wrap: pretty;
   }
 
-  /* Spinner (global .spin class from app.css applies to child components) */
+  .paper__empty,
+  .paper__empty .case__actions {
+    max-width: none;
+  }
 </style>
