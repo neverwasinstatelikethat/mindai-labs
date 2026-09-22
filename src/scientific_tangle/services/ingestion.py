@@ -1,21 +1,33 @@
 from __future__ import annotations
 
+import asyncio
+
 from scientific_tangle.domain.contracts import (
     DocumentReceipt,
     DocumentRequest,
     ExtractionResult,
     IngestionBundle,
 )
+from scientific_tangle.domain.relations import relations_for_extraction
 from scientific_tangle.services.knowledge import KnowledgeBase
 from scientific_tangle.services.ontology import OntologyValidator
 from scientific_tangle.services.provider import ModelProvider
 from scientific_tangle.services.resolution import EntityResolutionWorkbench
 
-EXTRACTION_SYSTEM = """Ты Extractor Agent платформы MindAI.
+# Словарь предикатов приходит из реестра отношений — из того же источника, который
+# проверяет ``ontology/shapes.ttl``. Примеры вместо закрытого списка обходятся
+# дорого: на реальном прогоне GigaChat додумывал STARTED_WITH и EQUIVALENT_TO,
+# импорт уходил в repair-раунд и падал уже после него.
+EXTRACTION_SYSTEM = f"""Ты Extractor Agent платформы MindAI.
 Извлеки только явно поддержанные текстом сущности и утверждения.
 Сохрани исходную формулировку evidence_quote. Не додумывай факты.
 Типы сущностей ограничены JSON Schema. Confidence оценивает качество evidence, а не красоту текста.
-Predicate записывай в UPPER_SNAKE_CASE, например TREATED_BY, PRODUCES, OPERATES_AT, USES.
+Predicate — ровно одно имя из закрытого словаря отношений графа, заглавными
+буквами через подчёркивание, без склонений и пояснений. Отношение вне словаря
+отклоняется проверкой, и импорт не состоится:
+{relations_for_extraction()}
+У каждого claim.subject обязана быть сущность в entities — по name, canonical_name
+или alias. Иначе утверждение считается неподдержанным.
 Для каждой сущности сформируй resolution proposal: link только при высокой уверенности,
 иначе create. Русские и английские синонимы своди к одному canonical_name.
 """
@@ -40,6 +52,12 @@ class IngestionService:
         self._resolution = resolution
 
     async def ingest(self, document: DocumentRequest) -> DocumentReceipt:
+        """Извлечение пакета — LLM, всё остальное убрано из event loop.
+
+        pyshacl-валидация строит RDF-граф и прогоняет shapes: на реальном
+        документе это секунды чистого CPU, и держать ими цикл обработки событий
+        нельзя (импорт идёт параллельно с запросами аналитиков).
+        """
         user_text = (
             f"Название: {document.title}\nЯзык: {document.language}\n"
             f"География: {document.geography}\nГод: {document.year}\n\n{document.text}"
@@ -51,7 +69,7 @@ class IngestionService:
         )
         extraction = self._apply_resolutions(bundle)
         try:
-            self._ontology.validate(extraction)
+            await asyncio.to_thread(self._ontology.validate, extraction)
         except ValueError as error:
             bundle = await self._provider.complete_model(
                 EXTRACTION_REPAIR_SYSTEM,
@@ -63,19 +81,21 @@ class IngestionService:
                 IngestionBundle,
             )
             extraction = self._apply_resolutions(bundle)
-            self._ontology.validate(extraction)
-        receipt = self._knowledge.ingest(document, extraction)
+            await asyncio.to_thread(self._ontology.validate, extraction)
+        receipt = await asyncio.to_thread(self._knowledge.ingest, document, extraction)
         if receipt.status == "created" and self._resolution:
-            self._resolution.register(bundle.resolutions)
+            await asyncio.to_thread(self._resolution.register, bundle.resolutions)
         return receipt
 
-    @staticmethod
-    def _apply_resolutions(bundle: IngestionBundle) -> ExtractionResult:
+    def _apply_resolutions(self, bundle: IngestionBundle) -> ExtractionResult:
         resolved = {
             item.mention.lower(): item.canonical_name
             for item in bundle.resolutions
             if item.confidence >= 0.7
         }
+        # Принятые ранее склейки имеют приоритет над новым решением модели:
+        # эксперт уже выбрал канон, и второй импорт не вправе его переопределить.
+        resolved.update(self._approved_aliases())
         entities = [
             entity.model_copy(
                 update={"canonical_name": resolved.get(entity.name.lower(), entity.canonical_name)}
@@ -98,3 +118,15 @@ class IngestionService:
             for claim in bundle.extraction.claims
         ]
         return bundle.extraction.model_copy(update={"entities": entities, "claims": claims})
+
+    def _approved_aliases(self) -> dict[str, str]:
+        """Карта «алиас → канон» принятых экспертом склеек (регистронезависимый ключ)."""
+        if self._resolution is None:
+            return {}
+        try:
+            return {
+                alias.lower(): canonical
+                for alias, canonical in self._resolution.alias_map().items()
+            }
+        except Exception:  # noqa: BLE001 — без карты продолжаем по решению модели
+            return {}

@@ -8,6 +8,7 @@
   import { tick } from 'svelte';
   import { countOf, num, plural } from '$lib/format';
   import { bandOf, groupIntervals } from '$lib/rail';
+  import { scrollRegion } from '$lib/scroll-region';
   import { session } from '$lib/sessionStore.svelte';
   import {
     AGENT_LABELS,
@@ -1201,7 +1202,7 @@
                         <dd class="num">{planView.filters}</dd>
                       </dl>
                       {#if filterRows.length}
-                        <div class="table-wrap">
+                        <div class="table-wrap" role="region" aria-label="Числовые условия вопроса" use:scrollRegion>
                           <table class="table">
                             <caption class="micro">
                               условия вопроса по числам

@@ -52,14 +52,25 @@ class NumericObservation(BaseModel):
 
     @model_validator(mode="after")
     def validate_shape(self) -> NumericObservation:
+        # Форма — одна на оператор. `observation_bounds` берёт сначала нормализованные
+        # границы, затем min/max: случайно заполненные границы у `eq` превращают точку
+        # в интервал, и детектор конфликтов сравнивает уже не те числа.
+        bounds = (self.min_value, self.max_value, self.normalized_min, self.normalized_max)
+        scalars = (self.value, self.normalized_value)
         if self.operator == "between":
-            if self.min_value is None or self.max_value is None:
-                raise ValueError("between требует min_value и max_value")
-            if self.min_value > self.max_value:
-                raise ValueError("min_value не может превышать max_value")
-            if self.normalized_min is None or self.normalized_max is None:
-                raise ValueError("between требует нормализованные границы")
-        elif self.value is None or self.normalized_value is None:
+            if any(item is not None for item in scalars):
+                raise ValueError(
+                    "between задаётся границами: value и normalized_value не заполняются"
+                )
+            low, high, norm_low, norm_high = bounds
+            if low is None or high is None or norm_low is None or norm_high is None:
+                raise ValueError("between требует min_value, max_value и нормализованные границы")
+            if low > high or norm_low > norm_high:
+                raise ValueError("нижняя граница не может превышать верхнюю")
+            return self
+        if any(item is not None for item in bounds):
+            raise ValueError(f"{self.operator} — одно значение; min/max принадлежат between")
+        if self.value is None or self.normalized_value is None:
             raise ValueError(f"{self.operator} требует value и normalized_value")
         return self
 
@@ -100,9 +111,7 @@ class NumericFilter(BaseModel):
         if self.operator in {"between", "range"} and (
             self.min_value is None or self.max_value is None
         ):
-            raise ValueError(
-                f"Оператор {self.operator} требует min_value и max_value"
-            )
+            raise ValueError(f"Оператор {self.operator} требует min_value и max_value")
         return self
 
 
@@ -110,7 +119,6 @@ class QueryPlan(BaseModel):
     question: str = Field(min_length=3)
     language: Literal["ru", "en"]
     mode: Literal["local", "global", "hybrid"] = "hybrid"
-    entity_ids: list[UUID] = Field(default_factory=list)
     entity_mentions: list[str] = Field(default_factory=list)
     numeric_filters: list[NumericFilter] = Field(default_factory=list)
     countries: list[str] = Field(default_factory=list)

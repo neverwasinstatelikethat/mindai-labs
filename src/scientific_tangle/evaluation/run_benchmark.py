@@ -4,6 +4,7 @@
 с lexical baseline (BM25 only) на gold-кейсах из реальных документов
 корпуса «Источники информации/Обзоры».
 """
+
 from __future__ import annotations
 
 import json
@@ -14,16 +15,20 @@ import sys
 from collections import Counter
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 # Добавляем src в путь для запуска как модуля или скрипта
 _SRC = Path(__file__).resolve().parents[2]
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from scientific_tangle.domain.contracts import EvidenceLocator, Finding
-from scientific_tangle.evaluation.gold_cases import REAL_GOLD_CASES
-from scientific_tangle.services.document_parser import parse_document
-from scientific_tangle.services.knowledge import stable_uuid
+# Импорты пакета идут после бутстрапа sys.path, иначе скрипт не запускается из
+# checkout без установки пакета.
+from scientific_tangle.domain.contracts import DocumentRequest, Finding  # noqa: E402
+from scientific_tangle.domain.models import EvidenceLocator  # noqa: E402
+from scientific_tangle.evaluation.gold_cases import REAL_GOLD_CASES  # noqa: E402
+from scientific_tangle.services.document_parser import parse_document  # noqa: E402
+from scientific_tangle.services.knowledge import stable_uuid  # noqa: E402
 
 # ── Константы ──────────────────────────────────────────────────────────
 
@@ -49,46 +54,182 @@ TOP_K_VALUES = [3, 5, 10]
 
 # ── Технические ключевые слова для фильтрации и entity boost ───────────
 
-TECH_KEYWORDS = frozenset({
-    # Элементы (русские и латинские)
-    "медь", "cu", "никель", "ni", "кобальт", "co", "железо", "fe",
-    "свинец", "pb", "золото", "au", "серебро", "ag", "платина", "pt",
-    "палладий", "pd", "литий", "li", "цинк", "zn", "висмут",
-    # Процессы
-    "выщелачивание", "флотация", "обжиг", "электролиз", "электроэкстракция",
-    "экстракция", "осаждение", "спекание", "конвертирование", "плавка",
-    "рафинирование", "очистка", "восстановление", "окисление", "кучное",
-    "хлорное", "цианидное", "автоклавное", "сульфатизирующий",
-    # Материалы
-    "штейн", "файнштейн", "шлак", "матт", "концентрат", "руда",
-    "раствор", "электролит", "магнетит", "гематит", "ярозит", "гетит",
-    "сподумен", "рассол", "сульфат", "хлорид", "цианид", "оксид",
-    "оксигидроксид", "пирит", "халькопирит", "пентландит", "малахит",
-    "азурит", "халькозин", "борнит", "ковеллин",
-    # Оборудование
-    "конвертер", "печь", "автоклав", "электропечь", "катод", "анод",
-    "реактор", "фильтр", "горелка", "электрод",
-    # Заводы и проекты
-    "nikkelverk", "niihama", "sandouville", "panton", "albion",
-    "михеевское", "томинское", "садбери", "sumitomo", "terrafame",
-    "tpox", "galvanox", "cesl", "platsol", "hybinette", "хибинетт",
-    "outotec", "neomet", "brixlegg", "hecla",
-    # Прочее
-    "мпг", "извлечение", "содержание", "температура", "давление",
-    "степень", "выход", "потери", "батарей", "промпродукт",
-})
+TECH_KEYWORDS = frozenset(
+    {
+        # Элементы (русские и латинские)
+        "медь",
+        "cu",
+        "никель",
+        "ni",
+        "кобальт",
+        "co",
+        "железо",
+        "fe",
+        "свинец",
+        "pb",
+        "золото",
+        "au",
+        "серебро",
+        "ag",
+        "платина",
+        "pt",
+        "палладий",
+        "pd",
+        "литий",
+        "li",
+        "цинк",
+        "zn",
+        "висмут",
+        # Процессы
+        "выщелачивание",
+        "флотация",
+        "обжиг",
+        "электролиз",
+        "электроэкстракция",
+        "экстракция",
+        "осаждение",
+        "спекание",
+        "конвертирование",
+        "плавка",
+        "рафинирование",
+        "очистка",
+        "восстановление",
+        "окисление",
+        "кучное",
+        "хлорное",
+        "цианидное",
+        "автоклавное",
+        "сульфатизирующий",
+        # Материалы
+        "штейн",
+        "файнштейн",
+        "шлак",
+        "матт",
+        "концентрат",
+        "руда",
+        "раствор",
+        "электролит",
+        "магнетит",
+        "гематит",
+        "ярозит",
+        "гетит",
+        "сподумен",
+        "рассол",
+        "сульфат",
+        "хлорид",
+        "цианид",
+        "оксид",
+        "оксигидроксид",
+        "пирит",
+        "халькопирит",
+        "пентландит",
+        "малахит",
+        "азурит",
+        "халькозин",
+        "борнит",
+        "ковеллин",
+        # Оборудование
+        "конвертер",
+        "печь",
+        "автоклав",
+        "электропечь",
+        "катод",
+        "анод",
+        "реактор",
+        "фильтр",
+        "горелка",
+        "электрод",
+        # Заводы и проекты
+        "nikkelverk",
+        "niihama",
+        "sandouville",
+        "panton",
+        "albion",
+        "михеевское",
+        "томинское",
+        "садбери",
+        "sumitomo",
+        "terrafame",
+        "tpox",
+        "galvanox",
+        "cesl",
+        "platsol",
+        "hybinette",
+        "хибинетт",
+        "outotec",
+        "neomet",
+        "brixlegg",
+        "hecla",
+        # Прочее
+        "мпг",
+        "извлечение",
+        "содержание",
+        "температура",
+        "давление",
+        "степень",
+        "выход",
+        "потери",
+        "батарей",
+        "промпродукт",
+    }
+)
 
 
 # ── Стеммизация (упрощённая для русского языка) ─────────────────────
 
-_STEM_SUFFIXES = sorted((
-    "ться", "тся", "ость", "ение",
-    "ого", "его", "ому", "ему", "ыми", "ими", "ами", "ями",
-    "ая", "яя", "ой", "ей", "ое", "ее", "ые", "ие", "ых", "их",
-    "ах", "ях", "ам", "ям", "ов", "ев", "ом", "ем", "ью", "ия",
-    "ть", "шь", "ет", "ют", "ит", "ят",
-    "а", "я", "о", "е", "ы", "и", "у", "ю", "ь",
-), key=len, reverse=True)
+_STEM_SUFFIXES = sorted(
+    (
+        "ться",
+        "тся",
+        "ость",
+        "ение",
+        "ого",
+        "его",
+        "ому",
+        "ему",
+        "ыми",
+        "ими",
+        "ами",
+        "ями",
+        "ая",
+        "яя",
+        "ой",
+        "ей",
+        "ое",
+        "ее",
+        "ые",
+        "ие",
+        "ых",
+        "их",
+        "ах",
+        "ях",
+        "ам",
+        "ям",
+        "ов",
+        "ев",
+        "ом",
+        "ем",
+        "ью",
+        "ия",
+        "ть",
+        "шь",
+        "ет",
+        "ют",
+        "ит",
+        "ят",
+        "а",
+        "я",
+        "о",
+        "е",
+        "ы",
+        "и",
+        "у",
+        "ю",
+        "ь",
+    ),
+    key=len,
+    reverse=True,
+)
 
 
 def _stem(word: str) -> str:
@@ -100,6 +241,7 @@ def _stem(word: str) -> str:
 
 # ── Токенизация + стеммизация ─────────────────────────────────────────
 
+
 def tokenize(text: str) -> list[str]:
     """Токенизация с упрощённой стеммизацией для русского языка."""
     text = text.lower()
@@ -109,12 +251,11 @@ def tokenize(text: str) -> list[str]:
 
 # ── BM25 индекс ────────────────────────────────────────────────────────
 
+
 class BM25Index:
     """BM25 ретривер для скоринга документов по запросу."""
 
-    def __init__(
-        self, corpus: list[list[str]], k1: float = 1.5, b: float = 0.75
-    ) -> None:
+    def __init__(self, corpus: list[list[str]], k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
         self.b = b
         self.n = len(corpus)
@@ -143,6 +284,7 @@ class BM25Index:
 
 
 # ── Извлечение находок из документов ───────────────────────────────────
+
 
 def _split_sentences(text: str) -> list[str]:
     """Разбивает текст на предложения."""
@@ -184,18 +326,35 @@ def _compute_confidence(sentence: str) -> float:
 def _extract_subject(sentence: str) -> str:
     s = sentence.lower()
     for kw in (
-        "выщелачивание", "флотация", "обжиг", "электролиз",
-        "электроэкстракция", "экстракция", "осаждение", "спекание",
-        "штейн", "файнштейн", "шлак", "раствор", "сподумен",
-        "медь", "никель", "кобальт", "железо", "литий", "свинец",
-        "цианид", "магнетит", "гематит",
+        "выщелачивание",
+        "флотация",
+        "обжиг",
+        "электролиз",
+        "электроэкстракция",
+        "экстракция",
+        "осаждение",
+        "спекание",
+        "штейн",
+        "файнштейн",
+        "шлак",
+        "раствор",
+        "сподумен",
+        "медь",
+        "никель",
+        "кобальт",
+        "железо",
+        "литий",
+        "свинец",
+        "цианид",
+        "магнетит",
+        "гематит",
     ):
         if kw in s:
             return kw
     return "процесс"
 
 
-def extract_findings_from_document(doc) -> list[Finding]:
+def extract_findings_from_document(doc: DocumentRequest) -> list[Finding]:
     """Извлекает findings из документа: разбор предложений + фильтр."""
     findings: list[Finding] = []
     counter = 0
@@ -238,6 +397,7 @@ def extract_findings_from_document(doc) -> list[Finding]:
 
 # ── Retrieval ─────────────────────────────────────────────────────────
 
+
 def lexical_retrieval(
     query: str,
     findings: list[Finding],
@@ -246,9 +406,7 @@ def lexical_retrieval(
 ) -> list[Finding]:
     """Лексический baseline: BM25 только по statement."""
     q_tokens = tokenize(query)
-    scores = [
-        (bm25_stmt.score(q_tokens, i), i) for i in range(len(findings))
-    ]
+    scores = [(bm25_stmt.score(q_tokens, i), i) for i in range(len(findings))]
     scores.sort(reverse=True)
     return [findings[idx] for _, idx in scores[:top_k]]
 
@@ -269,6 +427,14 @@ def hybrid_retrieval(
     """
     q_tokens = tokenize(query)
     q_long = [t for t in q_tokens if len(t) >= 4]
+    # Технические токены запроса не зависят от finding: считаем один раз,
+    # а не на каждый документ.
+    q_tech_tokens = set()
+    for t in q_long:
+        for kw in TECH_KEYWORDS:
+            if kw in t or t in kw:
+                q_tech_tokens.add(t)
+                break
 
     scores: list[tuple[float, int]] = []
     for i in range(len(findings)):
@@ -284,12 +450,6 @@ def hybrid_retrieval(
         doc_boost = title_overlap * 0.2
         # 4) Entity boost — пересечение технических токенов (substring matching)
         f_tokens = set(tokenize(f.statement))
-        q_tech_tokens = set()
-        for t in q_long:
-            for kw in TECH_KEYWORDS:
-                if kw in t or t in kw:
-                    q_tech_tokens.add(t)
-                    break
         entity_boost = len(q_tech_tokens & f_tokens) * 0.5 * f.confidence
         total = stmt + 0.3 * ev + doc_boost + entity_boost
         scores.append((total, i))
@@ -299,6 +459,7 @@ def hybrid_retrieval(
 
 
 # ── Метрики ────────────────────────────────────────────────────────────
+
 
 def _source(finding: Finding) -> str:
     if finding.evidence:
@@ -311,26 +472,33 @@ def compute_case_metrics(
     expected: set[str],
     top_k_values: list[int],
 ) -> dict[str, float]:
-    """Вычисляет recall@k, precision@k, MRR, NDCG@3 для одного кейса."""
+    """Вычисляет recall@k, hit@k, precision@k, MRR и NDCG@3 для одного кейса.
+
+    recall@k — доля ожидаемых источников, найденных в top-k. Прежняя реализация
+    клала в эту метрику «найдён ли хотя бы один» (то есть hit-rate) и тем самым
+    завышала результат ровно вдвое на кейсах с двумя источниками.
+    """
     results: dict[str, float] = {}
+    total_expected = len(expected)
     for k in top_k_values:
         top_k = retrieved[:k]
         rel = [1 if _source(f) in expected else 0 for f in top_k]
-        # recall@k: 1 если ожидаемый источник найден в top-k, иначе 0
-        found = any(r == 1 for r in rel)
-        results[f"recall@{k}"] = 1.0 if found else 0.0
+        found = len({_source(f) for f in top_k} & expected)
+        results[f"recall@{k}"] = found / total_expected if total_expected else 0.0
+        # Отдельная метрика, а не переименование: порог приёмки исторически
+        # смотрит на «хоть что-то нашлось», и это надо видеть рядом с recall.
+        results[f"hit@{k}"] = 1.0 if found else 0.0
         if k in (3, 5):
             results[f"precision@{k}"] = sum(rel) / k
     # MRR
-    first_rank = next(
-        (i for i, f in enumerate(retrieved, 1) if _source(f) in expected), None
-    )
+    first_rank = next((i for i, f in enumerate(retrieved, 1) if _source(f) in expected), None)
     results["mrr"] = 1.0 / first_rank if first_rank else 0.0
-    # NDCG@3
+    # NDCG@3: идеал строится по известным релевантным источникам, а не по тем,
+    # что случайно попали в top-3, — иначе промах не снижал оценку вообще.
     rel3 = [1 if _source(f) in expected else 0 for f in retrieved[:3]]
     dcg = sum(r / math.log2(i + 2) for i, r in enumerate(rel3))
-    ideal = sum(rel3)  # кол-во релевантных в top-3
-    idcg = sum(1 / math.log2(i + 2) for i in range(ideal))
+    ideal_hits = min(total_expected, 3)
+    idcg = sum(1 / math.log2(i + 2) for i in range(ideal_hits))
     results["ndcg@3"] = dcg / idcg if idcg > 0 else 0.0
     return results
 
@@ -344,6 +512,7 @@ def aggregate(case_metrics: list[dict[str, float]]) -> dict[str, float]:
 
 # ── Отчёт ──────────────────────────────────────────────────────────────
 
+
 def _fmt(val: float) -> str:
     return f"{val:.3f}"
 
@@ -353,7 +522,7 @@ def print_report(
     doc_count: int,
     hybrid: dict[str, float],
     lexical: dict[str, float],
-    case_details: list[dict],
+    case_details: list[dict[str, Any]],
     latencies: list[float],
 ) -> None:
     sep = "=" * 72
@@ -363,6 +532,11 @@ def print_report(
     print(sep)
     print("  BENCHMARK RETRIEVAL НА РЕАЛЬНЫХ ДОКУМЕНТАХ")
     print("  Научный Клубок — Agentic GraphRAG")
+    # Граница измерения: этот прогон сравнивает две функции ранжирования поверх
+    # эвристического извлечения тезисов. Продуктовый гибридный поиск (Neo4j +
+    # Elasticsearch + эмбеддинги GigaChat) и LLM-извлечение здесь не участвуют,
+    # поэтому цифры не являются метриками качества ответа продукта.
+    print("  Ранжирование: локальные BM25/гибрид бенчмарка, не продуктовый retrieval")
     print(sep)
     print()
     print(f"  Корпус: {doc_count} документов, {findings_count} findings")
@@ -375,26 +549,29 @@ def print_report(
     print(thin)
     print()
     print(f"  {'Метрика':<20s} {'Hybrid':>10s}   {'Lexical':>10s}   {'Diff':>8s}")
-    print(f"  {'─'*20} {'─'*10}   {'─'*10}   {'─'*8}")
+    print(f"  {'─' * 20} {'─' * 10}   {'─' * 10}   {'─' * 8}")
 
     metric_order = [
-        "recall@3", "recall@5", "recall@10",
-        "precision@3", "precision@5",
-        "mrr", "ndcg@3",
+        "recall@3",
+        "recall@5",
+        "recall@10",
+        "hit@3",
+        "hit@10",
+        "precision@3",
+        "precision@5",
+        "mrr",
+        "ndcg@3",
     ]
     for key in metric_order:
         if key in hybrid:
             h = hybrid[key]
-            l = lexical.get(key, 0.0)
-            delta = h - l
+            low = lexical.get(key, 0.0)
+            delta = h - low
             sign = "+" if delta >= 0 else ""
-            print(
-                f"  {key:<20s} {_fmt(h):>10s}   {_fmt(l):>10s}   "
-                f"{sign}{delta:.3f}"
-            )
+            print(f"  {key:<20s} {_fmt(h):>10s}   {_fmt(low):>10s}   {sign}{delta:.3f}")
     print()
 
-    # ─<arg_value> Детали по кейсам ──
+    # ── Детали по кейсам ──
     print(thin)
     print("  ДЕТАЛИ ПО КЕЙСАМ")
     print(thin)
@@ -417,8 +594,11 @@ def print_report(
 
     # ── Латентность ──
     print(thin)
-    print("  ЛАТЕНТНОСТЬ")
+    print("  ЛАТЕНТНОСТЬ (только hybrid-ранжирование)")
     print(thin)
+    print()
+    print("  Замер охватывает только hybrid_retrieval: lexical и построение индексов")
+    print("  в него не входят.")
     print()
     avg_lat = sum(latencies) / max(len(latencies), 1)
     sorted_lat = sorted(latencies)
@@ -434,17 +614,13 @@ def print_report(
     print(thin)
     print()
     recall10 = hybrid.get("recall@10", 0.0)
+    hit10 = hybrid.get("hit@10", 0.0)
     recall_pass = recall10 >= 0.90
     latency_pass = p95 <= 3.0
     hybrid_better = hybrid.get("mrr", 0) > lexical.get("mrr", 0)
-    print(
-        f"  recall@10 >= 0.90:  {'✓' if recall_pass else '✗'} "
-        f"({recall10:.3f})"
-    )
-    print(
-        f"  p95 latency <= 3s:  {'✓' if latency_pass else '✗'} "
-        f"({p95:.3f}s)"
-    )
+    print(f"  recall@10 >= 0.90 (полнота):  {'✓' if recall_pass else '✗'} ({recall10:.3f})")
+    print(f"  hit@10 (хотя бы один):  {hit10:.3f} — справочно, порога не имеет")
+    print(f"  p95 latency <= 3s:  {'✓' if latency_pass else '✗'} ({p95:.3f}s)")
     print(
         f"  Hybrid > Lexical:  {'✓' if hybrid_better else '✗'} "
         f"(MRR: {_fmt(hybrid.get('mrr', 0))} vs {_fmt(lexical.get('mrr', 0))})"
@@ -456,10 +632,13 @@ def print_report(
 
 # ── Main ───────────────────────────────────────────────────────────────
 
+
 def main() -> None:
-    # Кодировка stdout в UTF-8 для корректного вывода Unicode
+    # Кодировка stdout в UTF-8 для корректного вывода Unicode (консоль Windows
+    # по умолчанию в cp866); mypy видит sys.stdout как абстрактный TextIO
+    # без reconfigure, поэтому игнорируем ошибку по месту.
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     except AttributeError:
         pass
 
@@ -477,10 +656,7 @@ def main() -> None:
             findings = extract_findings_from_document(doc)
             all_findings.extend(findings)
             doc_titles.append(doc.title)
-            print(
-                f" Parsed: {doc.title}  "
-                f"({len(findings)} findings, {len(doc.text)} chars)"
-            )
+            print(f" Parsed: {doc.title}  ({len(findings)} findings, {len(doc.text)} chars)")
         except Exception as exc:
             print(f" FAILED: {item['path']} — {exc}")
 
@@ -500,7 +676,7 @@ def main() -> None:
     max_k = max(TOP_K_VALUES)
     hybrid_case_metrics: list[dict[str, float]] = []
     lexical_case_metrics: list[dict[str, float]] = []
-    case_details: list[dict] = []
+    case_details: list[dict[str, Any]] = []
     latencies: list[float] = []
 
     for case in REAL_GOLD_CASES:
@@ -508,17 +684,13 @@ def main() -> None:
 
         # Hybrid
         t0 = perf_counter()
-        hybrid_res = hybrid_retrieval(
-            case.query, all_findings, bm25_stmt, bm25_ev, max_k
-        )
+        hybrid_res = hybrid_retrieval(case.query, all_findings, bm25_stmt, bm25_ev, max_k)
         latencies.append(perf_counter() - t0)
         h_metrics = compute_case_metrics(hybrid_res, expected, TOP_K_VALUES)
         hybrid_case_metrics.append(h_metrics)
 
         # Lexical
-        lexical_res = lexical_retrieval(
-            case.query, all_findings, bm25_stmt, max_k
-        )
+        lexical_res = lexical_retrieval(case.query, all_findings, bm25_stmt, max_k)
         l_metrics = compute_case_metrics(lexical_res, expected, TOP_K_VALUES)
         lexical_case_metrics.append(l_metrics)
 

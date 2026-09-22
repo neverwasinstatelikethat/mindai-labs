@@ -40,6 +40,9 @@ class ComparableValue(BaseModel):
 
 class ResearchClaim(BaseModel):
     id: str = Field(min_length=1)
+    # finding_id отделяет идентичность числового наблюдения (id) от происхождения
+    # тезиса: два наблюдения одного finding не должны выглядеть самоконфликтом.
+    finding_id: str = Field(min_length=1)
     subject_id: str = Field(min_length=1)
     predicate: str = Field(pattern=r"^[A-Z][A-Z0-9_]*$")
     value: ComparableValue
@@ -75,17 +78,17 @@ class IntelligenceReport(BaseModel):
 
 
 class Principal(BaseModel):
+    """Субъект доступа — владелец подтверждённой серверной сессии.
+
+    Прав здесь намеренно нет: единственным источником истины остаётся таблица
+    политик в ``services/governance.py``, а ``review_enabled`` — единственный
+    признак, который учётная запись несёт с собой. Разрешения нельзя назначить
+    вручную и нельзя разойтись с политикой (раньше ``roles`` + ``permissions``
+    давали два независимых основания для доступа).
+    """
+
     id: str
-    roles: set[
-        Literal[
-            "researcher",
-            "analyst",
-            "project_manager",
-            "administrator",
-            "external_partner",
-        ]
-    ]
-    permissions: set[str] = Field(default_factory=set)
+    review_enabled: bool = False
     allowed_projects: set[str] = Field(default_factory=set)
 
 
@@ -102,7 +105,7 @@ class AccessDecision(BaseModel):
         "allowed",
         "missing_permission",
         "project_scope_denied",
-        "restricted_role_required",
+        "restricted_review_required",
     ]
 
 
@@ -115,30 +118,3 @@ class AuditEvent(BaseModel):
     correlation_id: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
-
-
-class PipelineStage(StrEnum):
-    REGISTER = "register"
-    PARSE = "parse"
-    EXTRACT = "extract"
-    RESOLVE = "resolve"
-    VALIDATE = "validate"
-    PERSIST = "persist"
-    INDEX = "index"
-
-
-class StageResult(BaseModel):
-    stage: PipelineStage
-    status: Literal["pending", "running", "completed", "partial", "failed"]
-    processed: int = Field(default=0, ge=0)
-    failed: int = Field(default=0, ge=0)
-    message: str = ""
-
-
-class PipelineRun(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    document_id: UUID
-    checksum: str
-    status: Literal["running", "completed", "partial", "failed"] = "running"
-    stages: list[StageResult] = Field(default_factory=list)
-    correlation_id: str

@@ -68,12 +68,15 @@ class PreloadService:
     @staticmethod
     def _sample_document(document: DocumentRequest, max_fragments: int) -> DocumentRequest:
         fragments = document.fragments
-        if len(fragments) <= max_fragments:
-            selected = fragments
+        limit = max(max_fragments, 1)
+        # Равномерная выборка требует минимум двух опорных точек: при limit=1
+        # знаменатель (limit - 1) обнулялся и падать должен был на ноль.
+        if len(fragments) <= limit or limit < 2:
+            selected = fragments[:limit]
         else:
             positions = {
-                round(index * (len(fragments) - 1) / (max_fragments - 1))
-                for index in range(max_fragments)
+                round(index * (len(fragments) - 1) / (limit - 1))
+                for index in range(limit)
             }
             selected = [fragments[index] for index in sorted(positions)]
         text = "\n\n".join(fragment.text for fragment in selected)

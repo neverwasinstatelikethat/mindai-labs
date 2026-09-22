@@ -2,7 +2,7 @@
 
 ## Целевой результат
 
-Работающий конкурсный продукт MindAI, который на реальном RU/EN корпусе строит evidence-centric knowledge graph и превосходит baseline vector RAG в multi-hop вопросах с числовыми, географическими и временными ограничениями.
+Работающий продукт «Научный Клубок», который на реальном RU/EN корпусе строит evidence-centric knowledge graph и превосходит baseline vector RAG в multi-hop вопросах с числовыми, географическими и временными ограничениями.
 
 ## Definition of victory
 
@@ -120,15 +120,18 @@
 
 ## Этапы и зависимости
 
+> Историческая карта этапа подачи: E0–E6 закрыты. Актуальные приоритеты развития
+> продукта для аналитиков — раздел «Что предстоит» в README.
+
 | Этап | Содержание | Зависит от | Выход |
 |---|---|---|---|
 | E0 Foundation | repo, CI, contracts, Compose, seed layout | — | воспроизводимая среда |
 | E1 Evidence slice | W1 + W2 + Neo4j write | E0 | документ → Claim → source |
 | E2 Answer slice | W3 + W4 + basic W5 | E1 | вопрос → grounded answer |
-| E3 Differentiators | conflict/gap, communities, feedback | E2 | конкурсное преимущество |
-| E4 Product | утверждённая MindAI identity + W6 | E2 | полный demo flow |
+| E3 Differentiators | conflict/gap, communities, feedback | E2 | отличающие механизмы |
+| E4 Product | утверждённая MindAI identity + W6 | E2 | полный пользовательский сценарий |
 | E5 Proof | W7 + W8 + baseline | E2–E4 | метрики и production story |
-| E6 Submission | QA, video, deck, deploy, archive | E5 | комплект для жюри |
+| E6 Submission | QA, video, deck, deploy, archive | E5 | комплект подачи |
 
 ## Первые задачи в backlog
 

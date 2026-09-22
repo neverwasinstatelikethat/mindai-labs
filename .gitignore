@@ -5,46 +5,86 @@ __pycache__/
 dist/
 build/
 .venv/
+venv/
+env/
+.ipynb_checkpoints/
 
 # Frontend
+node_modules/
+.svelte-kit/
 frontend/node_modules/
 frontend/.svelte-kit/
 frontend/build/
 
-# Тестирование и линтеры
+# Тестирование, линтеры и отчёты проверок
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 coverage.xml
 .coverage
+.coverage.*
+htmlcov/
+playwright-report/
+test-results/
 
-# IDE и редакторы
+# Агентские каталоги, IDE и редакторы
 .idea/
 .vscode/
 .qoder/
 .claude/
 .codex/
 .codex-*.png
+.cursor/
+.cursorrules
+.windsurf/
+.aider*
+.superpowers/
+.impeccable/
+.playwright-mcp/
 
-# Документация и инструкции агентов (не версионируются)
-.agents/
+# Инструкции агентов и локальная документация (не версионируются)
 AGENTS.md
+agents.md
+CLAUDE.md
+GEMINI.md
+QODER.md
+PRODUCT.md
+product.md
+.agents/
+# Локальные заметки и дампы, сгенерированные вне репозитория
+DESIGN.md
+preferences.md
+vibe_images/
+*.canvas.data.json
+# docs/* игнорируется целиком; версионируемые проектные документы
+# (architecture, requirements, product-design, ...) добавляются через git add -f
 docs/*
 
 # Окружение
 .env
-.env.local
+.env.*
+!.env.example
 
 # Docker (конфигурации версионируются, данные — нет)
-data/raw/
-data/processed/
+data/
 artifacts/
+exports/
+out/
 
 # Корпус документов (большие файлы, не для репозитория)
 Источники информации/
 
 # Временные и вспомогательные файлы (префикс _)
 _*
+
+# Временные файлы, бэкапы и следы слияний
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+*.rej
+*.pid
 
 # Презентации и временные материалы
 *.pptx
@@ -59,4 +99,5 @@ graph_output*.json
 # Операционная система
 .DS_Store
 Thumbs.db
+desktop.ini
 *.log

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from '$lib/api';
   import { countOf, num, pct } from '$lib/format';
+  import { scrollRegion } from '$lib/scroll-region';
   import { session } from '$lib/sessionStore.svelte';
   import { AGENT_LABELS, knownTerm } from '$lib/terms';
   import {
@@ -521,8 +522,15 @@
 
         {#if llm.length}
           <!-- Русского имени структуры ответа в словаре нет: служебное имя идёт
-               моно-подписью при строке и не становится заголовком сам по себе. -->
-          <div class="table-wrap dash__table">
+               моно-подписью при строке и не становится заголовком сам по себе.
+               `use:scrollRegion` даёт полосе прокрутки точку фокуса только когда
+               прокручивать действительно есть что. -->
+          <div
+            class="table-wrap dash__table"
+            role="region"
+            aria-label="Вызовы модели по структуре ответа"
+            use:scrollRegion
+          >
             <table class="table">
               <caption class="dash__caption">
                 Вызовы модели по структуре ответа. Служебное имя структуры приведено только для

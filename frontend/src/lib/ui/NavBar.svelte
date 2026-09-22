@@ -171,7 +171,7 @@
 
   {#if links.length > 0}
     <div class="pill-nav__links" bind:this={rail}>
-      <div class="seg" role="navigation" aria-label="Разделы" bind:this={seg}>
+      <div class="seg" bind:this={seg}>
         <span class="seg__ind" aria-hidden="true"></span>
         {#each links as link (link.href)}
           <a class="seg__item" href={link.href} aria-current={isCurrent(link.href) ? 'page' : undefined}>

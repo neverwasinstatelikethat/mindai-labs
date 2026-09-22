@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import EvidenceLocator, NumericObservation, QueryPlan
+
+# Валидатор email без новой зависимости (pydantic[email] тянет email-validator):
+# грубой проверки формата достаточно — настоящий контроль даёт подтверждение
+# адреса, а оно появится вместе с почтовым контуром.
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]{2,}")
 
 
 class NodeType(StrEnum):
@@ -29,6 +36,7 @@ class GraphNode(BaseModel):
     label: str
     type: NodeType
     confidence: float = Field(default=1, ge=0, le=1)
+    data_class: DataClass = DataClass.PUBLIC
     metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
@@ -38,6 +46,7 @@ class GraphEdge(BaseModel):
     target: str
     relation: str
     confidence: float = Field(default=1, ge=0, le=1)
+    data_class: DataClass = DataClass.PUBLIC
 
 
 class GraphSnapshot(BaseModel):
@@ -58,7 +67,10 @@ class Finding(BaseModel):
     subject: str | None = None
     predicate: str | None = None
     scope: dict[str, str] = Field(default_factory=dict)
-    data_class: str = "public"
+    # Единственный источник истины для классификации доступа. Статус finding
+    # (consensus/disputed/hypothesis) — про степень консенсуса, а не про права,
+    # и не может служить вторым, независимым основанием для ACL.
+    data_class: DataClass = DataClass.PUBLIC
     reviewer_id: str | None = None
     review_date: str | None = None
     review_reason: str | None = None
@@ -82,9 +94,42 @@ class AgentMetricSnapshot(BaseModel):
     p95_duration_ms: float = Field(ge=0)
 
 
+class LlmMetricSnapshot(BaseModel):
+    schema_name: str = Field(min_length=1)
+    calls: int = Field(ge=0)
+    failures: int = Field(ge=0)
+    # Schema-repair попытки: повтор был у обращения к модели, а не у агента.
+    retries: int = Field(default=0, ge=0)
+    average_duration_ms: float = Field(ge=0)
+    p95_duration_ms: float = Field(ge=0)
+
+
 class AgentMetricsResponse(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     agents: list[AgentMetricSnapshot]
+    llm: list[LlmMetricSnapshot] = Field(default_factory=list)
+    total_prompt_tokens: int = Field(default=0, ge=0)
+    total_completion_tokens: int = Field(default=0, ge=0)
+    # Приём агентных прогонов: saturation обязана быть наблюдаемой, иначе 429
+    # выглядят как случайные отказы сервиса.
+    agent_runs_active: int = Field(default=0, ge=0)
+    agent_runs_limit: int = Field(default=0, ge=0)
+    agent_runs_refused: int = Field(default=0, ge=0)
+    llm_calls_in_flight: int = Field(default=0, ge=0)
+    llm_calls_waiting: int = Field(default=0, ge=0)
+    llm_slots: int = Field(default=0, ge=0)
+
+
+ModelMode = Literal["gigachat", "scripted", "unavailable"]
+# Темы ленты, которые продукт действительно порождает: новая тема появляется
+# вместе с вызовом _notify, а не как свободная строка клиента.
+NotificationTopic = Literal["claim.superseded", "proposal.accepted"]
+ServiceState = Literal["ready", "configured", "fallback", "disabled"]
+AccountsMode = Literal["postgres", "in-memory"]
+# Общий выбор контура хранения для серверного состояния (сессии, ответы,
+# экспертные решения): postgres — рабочий контур, in-memory — тесты и запуск
+# без базы.
+StoreBackend = AccountsMode
 
 
 class AnswerPayload(BaseModel):
@@ -101,7 +146,10 @@ class AnswerPayload(BaseModel):
     graph: GraphSnapshot
     trace: list[AgentEvent]
     confidence: float = Field(ge=0, le=1)
-    model_mode: Literal["yandex", "gigachat", "fallback", "scripted"]
+    model_mode: ModelMode
+    # Честная сигнализация деградации: какие ограничения не дали собрать ответ
+    # полностью (дедлайн, лимит рекурсии, пустое доказательное покрытие).
+    degradation_reasons: list[str] = Field(default_factory=list)
 
 
 class QueryRequest(BaseModel):
@@ -125,9 +173,6 @@ class IntentClassification(BaseModel):
     secondary: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
-    requires_external_action: bool = False
-    requires_user_confirmation: bool = False
-    confirmation_reason: str | None = None
 
 
 class ToolAction(BaseModel):
@@ -150,7 +195,7 @@ class ToolAction(BaseModel):
 
 class AgentActionPlan(BaseModel):
     rationale: str
-    actions: list[ToolAction] = Field(min_length=1, max_length=8)
+    actions: list[ToolAction] = Field(min_length=1, max_length=6)
     completion_criteria: list[str] = Field(min_length=1)
 
 
@@ -170,6 +215,9 @@ class ToolObservation(BaseModel):
     finding_ids: list[str] = Field(default_factory=list)
     graph_node_ids: list[str] = Field(default_factory=list)
     facts: list[str] = Field(default_factory=list)
+    # Сколько фактов срезано потолком выдачи: полем, а не разбором строки среза,
+    # чтобы счётчики не зависели от формулировки текста для человека.
+    omitted_count: int = Field(default=0, ge=0)
     root_cause_hint: str | None = None
     safe_retry: str | None = None
     stop_condition: str | None = None
@@ -188,7 +236,8 @@ class RetrievalPlan(BaseModel):
     relation_types: list[str]
     max_hops: int = Field(ge=1, le=4)
     use_global_context: bool
-    community_question: str | None = None
+    use_community_context: bool = False
+    use_local_graph: bool = True
 
 
 class ExtractedEntity(BaseModel):
@@ -205,6 +254,8 @@ class ExtractedEntity(BaseModel):
             "facility": NodeType.LOCATION,
             "company": NodeType.ORGANIZATION,
             "organisation": NodeType.ORGANIZATION,
+            "device": NodeType.EQUIPMENT,
+            "apparatus": NodeType.EQUIPMENT,
         }
         return aliases.get(str(value).lower(), value)
 
@@ -233,6 +284,16 @@ class EntityResolutionProposal(BaseModel):
 
 
 class EntityMergeProposal(BaseModel):
+    """Предложение склейки сущностей.
+
+    ``id`` — детерминированный uuid5 от пары (алиас, канон): регистрация той же
+    пары на каждом импорте обязана обновлять запись, а не плодить предложения в
+    неограниченной очереди. ``source_id``/``target_id`` — реальные ``id`` узлов
+    графа (идентичность сущности в этом коде живёт в ``id``, а ``label``
+    описателен); заполняются при принятии и остаются пустыми, пока узлы не
+    найдены.
+    """
+
     id: UUID = Field(default_factory=uuid4)
     source: str
     target: str
@@ -240,6 +301,10 @@ class EntityMergeProposal(BaseModel):
     rationale: str
     status: Literal["proposed", "accepted", "rejected", "reverted"] = "proposed"
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    reviewed_at: datetime | None = None
+    reviewer_id: str | None = None
+    source_id: str | None = None
+    target_id: str | None = None
 
 
 class MergeReviewRequest(BaseModel):
@@ -278,6 +343,7 @@ class DocumentRequest(BaseModel):
     language: Literal["ru", "en"] = "ru"
     geography: str | None = None
     year: int | None = Field(default=None, ge=1800, le=2100)
+    data_class: DataClass = DataClass.PUBLIC
     fragments: list[DocumentFragment] = Field(default_factory=list)
 
 
@@ -293,6 +359,10 @@ class DocumentReceipt(BaseModel):
     checksum: str
     status: Literal["created", "duplicate"]
     extracted_claims: int
+    # Промпт извлечения ограничен бюджетом: молча не досылать часть документа —
+    # приём числа из хвоста не должен выглядеть «в корпусе такого нет».
+    prompt_truncated: bool = False
+    omitted_characters: int = Field(default=0, ge=0)
 
 
 class PreloadDocumentResult(BaseModel):
@@ -319,6 +389,7 @@ class StructuralDocumentReceipt(BaseModel):
     checksum: str
     status: Literal["created", "duplicate"]
     chunks: int
+    vectors_indexed: int = 0
 
 
 class CorpusCompileReport(BaseModel):
@@ -342,12 +413,16 @@ class CorpusStats(BaseModel):
     claims: int = Field(ge=0)
     entities: int = Field(ge=0)
     semantic_documents: int = Field(ge=0)
+    vectors_indexed: int = Field(default=0, ge=0)
 
 
 class EvaluationMetrics(BaseModel):
     citation_coverage: float = Field(ge=0, le=1)
     numeric_support: float = Field(ge=0, le=1)
-    evidence_precision: float = Field(ge=0, le=1)
+    # Средне-заявленная confidence findings заменена честной парой метрик:
+    # доля выводов без поддержки и само-оценка модели не одно и то же.
+    unsupported_claim_ratio: float = Field(ge=0, le=1)
+    mean_finding_confidence: float = Field(ge=0, le=1)
     overall: float = Field(ge=0, le=1)
 
 
@@ -383,12 +458,18 @@ class RetrievalCaseResult(BaseModel):
 
 class RetrievalBenchmark(BaseModel):
     gold_cases: int = Field(ge=0)
+    # Кейсы, которые вообще возможно засчитать: ожидаемый источник лежит в
+    # текущем корпусе. Остальные дают recall=0 не из-за плохого поиска, а
+    # потому что измерять нечего.
+    scored_cases: int = Field(ge=0)
     corpus_documents: int = Field(ge=0)
     top_k: int = Field(ge=1)
     hybrid: RankingMetrics
     lexical_baseline: RankingMetrics
     cases: list[RetrievalCaseResult]
-    leakage_checks: dict[str, bool]
+    # Инварианты корректности замера (не «утечки»): baseline обязан быть слабее
+    # или равен hybrid, ожидаемый источник обязан быть в корпусе.
+    validity_checks: dict[str, bool]
     passed: bool
 
 
@@ -397,6 +478,9 @@ class PipelineVariantMetrics(BaseModel):
     citation_coverage: float = Field(ge=0, le=1)
     pass_rate: float = Field(ge=0, le=1)
     average_latency_ms: float = Field(ge=0)
+    p95_latency_ms: float = Field(default=0, ge=0)
+    retries_per_case: float = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
 
 
 class PipelineCaseResult(BaseModel):
@@ -405,6 +489,7 @@ class PipelineCaseResult(BaseModel):
     expected_sources: list[str]
     retrieved_sources: list[str]
     latency_ms: float = Field(ge=0)
+    degradation_reasons: list[str] = Field(default_factory=list)
     passed: bool
 
 
@@ -423,6 +508,7 @@ class EvolutionExperiment(BaseModel):
     baseline: PipelineVariantMetrics
     candidate: PipelineVariantMetrics
     delta_pass_rate: float = Field(ge=-1, le=1)
+    regressions: list[str] = Field(default_factory=list)
     decision: Literal["promote", "reject"]
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -430,6 +516,11 @@ class EvolutionExperiment(BaseModel):
 class QueryResponse(BaseModel):
     answer: AnswerPayload
     evaluation: EvaluationRun
+    # Идентификатор запроса для разбора инцидента: тот же correlation_id, что
+    # попадает в журнал аудита и в заголовок ответа. В SSE он едет в каждом
+    # событии, поэтому и в JSON-ответе обязан быть — иначе клиент не свяжет
+    # свой запрос с записью в журнале.
+    correlation_id: str = ""
 
 
 class FeedbackRequest(BaseModel):
@@ -451,14 +542,39 @@ class EvolutionProposal(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class FeedbackResult(BaseModel):
+    """Экспертное решение и предложение по нему — разные по надёжности части.
+
+    Замена утверждения записывается всегда; proposal генерирует LLM, и без
+    настроенной модели экспертное исправление не должно теряться.
+    """
+
+    proposal: EvolutionProposal | None = None
+    superseded: Finding | None = None
+    degradation_reasons: list[str] = Field(default_factory=list)
+
+
 class ProposalReviewRequest(BaseModel):
     accepted: bool
 
 
 class SystemStatus(BaseModel):
     status: Literal["ready", "degraded"]
-    model_mode: Literal["yandex", "gigachat", "fallback", "scripted"]
-    services: dict[str, Literal["ready", "configured", "fallback"]]
+    model_mode: ModelMode
+    services: dict[str, ServiceState]
+    # Фактическое хранилище учётных записей: "in-memory" означает, что Postgres
+    # был недоступен на старте и сессии переживают перезапуск только в памяти.
+    accounts: AccountsMode = "in-memory"
+    # Тот же выбор для серверных копий ответов и экспертных решений: на памяти
+    # экспорт возможен только до перезапуска процесса.
+    state_backend: StoreBackend = "in-memory"
+    # Причина деградации словами: интерфейс показывает её вместо обещаний
+    # «история решений сохранена», которых на этом контуре нет.
+    degradation_reasons: list[str] = Field(default_factory=list)
+    # Пропускная способность агентного контура: сколько прогонов одновременно
+    # принимает сервис, а сколько — уже отказ.
+    agent_runs_limit: int = Field(default=0, ge=0)
+    agent_runs_active: int = Field(default=0, ge=0)
 
 
 # ── FT-12/26: Comparison models ─────────────────────────────────────────────
@@ -489,21 +605,64 @@ class ComparisonRequest(BaseModel):
     language: Literal["ru", "en"] = "ru"
 
 
-# ── FT-23: Export models ───────────────────────────────────────────────────
+# ── FT-23: Export models ────────────────────────────────────────────────────
+
+
+ExportFormat = Literal["markdown", "json-ld", "pdf"]
 
 
 class ExportRequest(BaseModel):
-    answer: AnswerPayload
-    format: Literal["markdown", "json-ld", "pdf"] = "markdown"
+    """Экспортируется серверный ответ по ``query_id``, а не присланный клиентом.
+
+    Прежняя форма принимала весь ``AnswerPayload``: клиент мог переклеить
+    ``data_class: restricted → public`` в теле и получить закрытый текст
+    файлом, потому что ACL фильтровал именно присланные данные. Пост-генерационная
+    фильтрация контролем доступа не считается (см. services/governance.py),
+    поэтому источник данных — только серверное хранилище ответов.
+    ``extra="forbid"``: лишние поля (в том числе подставленный ``answer``) —
+    явная ошибка 422, а не молчаливо проигнорированный вход.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query_id: UUID
+    format: ExportFormat = "markdown"
 
 
-class ExportResponse(BaseModel):
-    content: str
-    content_type: str
-    filename: str
+class StoredAnswerInfo(BaseModel):
+    """Метаданные серверной копии ответа (для диагностики и истории)."""
+
+    query_id: UUID
+    owner_id: str
+    created_at: datetime
+    data_classes: list[str]
+    findings: int = Field(ge=0)
 
 
-# ── FT-08: Fact versioning ─────────────────────────────────────────────────
+class ExpertDecision(BaseModel):
+    """Дurable-запись экспертного решения: перезапуск процесса её не стирает.
+
+    Свободного текста из источников здесь нет — только идентификаторы и
+    структурированные признаки, чтобы журнал решений не становился каналом
+    утечки restricted-содержимого.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    actor_id: str
+    action: Literal[
+        "proposal.created",
+        "proposal.reviewed",
+        "resolution.reviewed",
+        "claim.superseded",
+        "answer.exported",
+    ]
+    object_id: str
+    outcome: Literal["success", "denied", "failure"] = "success"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+# ── FT-08: Claim versioning ─────────────────────────────────────────────────
 
 
 class ClaimHistoryEntry(BaseModel):
@@ -522,20 +681,64 @@ class ClaimHistory(BaseModel):
     versions: list[ClaimHistoryEntry]
 
 
-# ── FT-20/21: ACL models ───────────────────────────────────────────────────
+# ── FT-20/21: Учётные записи и доступ ───────────────────────────────────────
 
 
-class RoleInfo(BaseModel):
-    role: str
-    permissions: list[str]
-    data_classes: list[str]
+class EmailRequest(BaseModel):
+    """Общая форма email для запросов входа и регистрации.
+
+    Нормализация (strip + lower) здесь, а не только в хранилище: «Ivan@…» и
+    «ivan@…» — один и тот же аккаунт на всём пути запроса.
+    """
+
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not _EMAIL_RE.fullmatch(normalized):
+            raise ValueError("Некорректный email")
+        return normalized
 
 
-class PrincipalInfo(BaseModel):
-    user_id: str
-    role: str
-    permissions: list[str]
-    allowed_data_classes: list[str]
+class AccountRegisterRequest(EmailRequest):
+    """Запрос саморегистрации. Минимальную длину пароля задаёт не схема, а
+    ``settings.password_min_length`` — обработчик проверяет её после валидации."""
+
+    display_name: str = Field(min_length=1, max_length=120)
+    # Потолок нужен, чтобы scrypt не считал бесконечный ввод клиента.
+    password: str = Field(min_length=1, max_length=256)
+
+
+class AccountLoginRequest(EmailRequest):
+    password: str = Field(min_length=1, max_length=256)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=1, max_length=256)
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+
+
+class AccountInfo(BaseModel):
+    """Ответ ``/api/v1/auth/*``: профиль плюс фактические возможности аккаунта.
+
+    ``capabilities`` и ``data_classes`` всегда приходят из таблицы политик
+    (services/governance.py), а не из сохранённых полей, поэтому интерфейс не
+    может показать права, которых на самом деле нет.
+    """
+
+    id: str
+    email: str
+    display_name: str
+    review_enabled: bool
+    created_at: datetime
+    capabilities: list[str] = Field(default_factory=list)
+    data_classes: list[str] = Field(default_factory=list)
 
 
 # ── FT-25: Dashboard models ────────────────────────────────────────────────
@@ -556,6 +759,7 @@ class DashboardResponse(BaseModel):
     evidence: int = Field(ge=0)
     conflicts: int = Field(ge=0)
     gaps: int = Field(ge=0)
+    gaps_omitted: int = Field(default=0, ge=0)
     recent_activity: list[ActivityEntry]
     agent_metrics: AgentMetricsResponse
 
@@ -565,11 +769,6 @@ class DashboardResponse(BaseModel):
 
 class Notification(BaseModel):
     id: UUID = Field(default_factory=uuid4)
-    topic: str
-    message: str
+    topic: NotificationTopic
+    message: str = Field(min_length=1, max_length=500)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
-class SubscriptionRequest(BaseModel):
-    topic: str = Field(min_length=1)
-    subscriber_id: str = Field(min_length=1)

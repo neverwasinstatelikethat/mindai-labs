@@ -365,10 +365,6 @@
   padding-block: clamp(var(--s8), 9vw, var(--s10));
 }
 
-.section--tight {
-  padding-block: clamp(var(--s6), 6vw, var(--s8));
-}
-
 .stack {
   display: flex;
   flex-direction: column;
@@ -382,17 +378,8 @@
   flex-wrap: wrap;
 }
 
-.row--top {
-  align-items: flex-start;
-}
-
 .row--between {
   justify-content: space-between;
-}
-
-.row--spread {
-  justify-content: space-between;
-  flex-wrap: nowrap;
 }
 
 .grow {
@@ -408,10 +395,6 @@
 
 .grid--2 {
   grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
-}
-
-.grid--3 {
-  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
 }
 
 .grid--4 {
@@ -1122,34 +1105,6 @@
   box-shadow: var(--shadow-soft);
 }
 
-.card-note--left {
-  transform: rotate(-1deg);
-}
-
-.card-note--right {
-  transform: rotate(1deg);
-}
-
-.signature {
-  display: flex;
-  align-items: center;
-  gap: var(--s3);
-  margin-top: var(--s5);
-}
-
-.signature::before {
-  content: '';
-  width: var(--s7);
-  height: 1px;
-  background: var(--line-strong);
-}
-
-.signature span {
-  font-family: var(--font-hand);
-  font-size: var(--t-h3);
-  color: var(--ink-3);
-}
-
 .panel__head {
   display: flex;
   align-items: baseline;
@@ -1512,21 +1467,9 @@
     transition-delay: var(--reveal-delay, 0ms);
   }
 
-  html.motion-ok .reveal--blur {
-    filter: blur(10px);
-    transform: translateY(18px) scale(0.985);
-    transition: opacity var(--dur-reveal) var(--ease-enter), transform var(--dur-reveal) var(--ease-enter),
-      filter var(--dur-reveal) var(--ease-enter);
-  }
-
-  html.motion-ok .reveal--right {
-    transform: translateX(-26px);
-  }
-
   html.motion-ok .reveal.is-in {
     opacity: 1;
     transform: none;
-    filter: none;
   }
 }
 
@@ -1589,22 +1532,13 @@ html.motion-ok .prompt {
   }
 }
 
-.prompt:focus-within,
-.prompt--armed:focus-within {
+.prompt:focus-within {
   border-color: var(--line-soft);
   background: var(--surface);
   box-shadow: var(--shadow-aura);
 }
 
 .prompt:focus-within::before {
-  opacity: 1;
-}
-
-.prompt--armed::before {
-  opacity: 0.45;
-}
-
-.prompt--armed:focus-within::before {
   opacity: 1;
 }
 
@@ -2055,13 +1989,6 @@ html.motion-ok .card-note {
     border-color: var(--line);
   }
 
-  html.motion-ok .card-note--left:hover {
-    transform: translateY(-4px) rotate(0deg);
-  }
-
-  html.motion-ok .card-note--right:hover {
-    transform: translateY(-4px) rotate(0deg);
-  }
 }
 
 .table th,

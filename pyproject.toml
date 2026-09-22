@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Evidence-centric Agentic GraphRAG for mining and metallurgy R&D"
 requires-python = ">=3.12"
 dependencies = [
+  "certifi>=2024.12.23",
   "elasticsearch>=8.17,<9",
   "fastapi>=0.115,<1",
   "gigachat>=0.1,<1",
@@ -63,3 +64,11 @@ select = ["E", "F", "I", "N", "UP", "B"]
 python_version = "3.12"
 strict = true
 packages = ["scientific_tangle"]
+
+# Научные обёртки без pypa-совместимой типизации (py.typed отсутствует):
+# igraph/leidenalg/networkx — резервные ветки community detection, fitz и
+# pytesseract — оптическая обработка сканов. Проверка типов на них не
+# распространяется, но границы вызовов типизированы в нашем коде.
+[[tool.mypy.overrides]]
+module = ["fitz.*", "pytesseract.*", "networkx.*", "igraph.*", "leidenalg.*"]
+ignore_missing_imports = true

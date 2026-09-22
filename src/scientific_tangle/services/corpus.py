@@ -3,8 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from scientific_tangle.domain.contracts import CorpusCompileReport
-from scientific_tangle.services.document_parser import SUPPORTED_EXTENSIONS, parse_document
+from scientific_tangle.services.document_parser import (
+    SUPPORTED_EXTENSIONS,
+    UnsupportedDocumentError,
+    parse_document,
+)
 from scientific_tangle.services.knowledge import KnowledgeBase
+
+# Единственный признак «в файле есть текст, но мы его не достали»: парсер ставит его,
+# когда извлечено меньше 20 символов. Любая другая ошибка — отказ пайплайна, а не
+# скан без текстового слоя, и в OCR-бэклог его записывать нельзя.
+_OCR_NEEDED_MARK = "не удалось извлечь достаточно текста"
 
 
 class CorpusCompiler:
@@ -41,11 +50,16 @@ class CorpusCompiler:
                 created += receipt.status == "created"
                 duplicates += receipt.status == "duplicate"
                 chunks += receipt.chunks
-            except Exception as error:
-                if path.suffix.lower() == ".pdf":
+            except UnsupportedDocumentError as error:
+                # OCR-бэклог — только про текстовый слой самого файла.
+                if path.suffix.lower() == ".pdf" and _OCR_NEEDED_MARK in str(error).lower():
                     ocr_required += 1
                 else:
                     failed += 1
+                if len(errors) < 50:
+                    errors.append(f"{relative}: {str(error)[:240]}")
+            except Exception as error:
+                failed += 1
                 if len(errors) < 50:
                     errors.append(f"{relative}: {str(error)[:240]}")
         processed = created + duplicates
@@ -60,6 +74,10 @@ class CorpusCompiler:
             skipped_unsupported=len(all_files) - len(supported),
             skipped_oversize=len(supported) - len(eligible),
             ocr_required=ocr_required,
-            coverage=round(processed / max(len(all_files), 1), 4),
+            # Знаменатель — файлы, которые пайплайн вообще мог обработать при текущем
+            # лимите. Прежний len(all_files) считал неподдерживаемые форматы и всё,
+            # что не вошло в лимит, как непокрытые: coverage не доходил до 1 даже
+            # при полностью скомпилированном корпусе.
+            coverage=round(processed / max(len(selected), 1), 4),
             errors=errors,
         )

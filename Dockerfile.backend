@@ -13,6 +13,9 @@ RUN addgroup --system mindai && adduser --system --ingroup mindai mindai
 WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY src ./src
+# Публичный корневой сертификат УЦ, к которому GigaChat прикладывает цепочку TLS:
+# GIGACHAT_TRUSTED_ROOTS указывает на файл относительно рабочей директории /app.
+COPY certs ./certs
 USER mindai
 EXPOSE 8000
 HEALTHCHECK --interval=20s --timeout=5s --retries=5 \

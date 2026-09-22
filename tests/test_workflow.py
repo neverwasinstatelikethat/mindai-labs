@@ -82,7 +82,7 @@ async def test_llm_driven_workflow_reaches_grounded_answer() -> None:
         ),
         ReasoningResult(
             summary="Комбинированная схема использует обратный осмос после pretreatment.",
-            finding_ids=["finding-ro", "finding-ion"],
+            finding_ids=["finding-ro", "finding-ro-pilot"],
             conflicts=["Энергозатраты требуют нормализации условий."],
             knowledge_gaps=["Мало пилотных данных для холодного климата."],
             recommendations=["Система поставила пилот на реальном составе воды в очередь."],
@@ -97,16 +97,14 @@ async def test_llm_driven_workflow_reaches_grounded_answer() -> None:
 
     assert answer.model_mode == "scripted"
     assert [event.agent for event in answer.trace] == [
-        "intent_router",
-        "planner",
-        "action_planner",
+        "planning_agent",
         "tool_executor",
         "controller",
         "reasoner",
         "critic",
         "synthesizer",
     ]
-    assert {finding.id for finding in answer.findings} == {"finding-ro", "finding-ion"}
+    assert {finding.id for finding in answer.findings} == {"finding-ro", "finding-ro-pilot"}
     assert provider.calls == [
         "PlanningBundle",
         "AgentControlDecision",
@@ -145,9 +143,19 @@ async def test_controller_autonomously_replans_missing_evidence() -> None:
     )
 
     agents = [event.agent for event in answer.trace]
-    assert agents.count("action_planner") == 2
-    assert agents.count("tool_executor") == 2
-    assert agents.count("controller") == 2
+    # Контроллер сам решает добрать доказательства: второй проход
+    # action_planner → tool_executor → controller без участия пользователя.
+    assert agents == [
+        "planning_agent",
+        "tool_executor",
+        "controller",
+        "action_planner",
+        "tool_executor",
+        "controller",
+        "reasoner",
+        "critic",
+        "synthesizer",
+    ]
     assert len(answer.tool_observations) == 4
 
 
@@ -186,3 +194,73 @@ async def test_ingestion_and_self_evolve_are_model_driven() -> None:
     assert receipt.status == "created"
     assert proposal.kind == "gold_case"
     assert provider.calls == ["IngestionBundle", "EvolutionDraft"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent", ["graph_edit", "report_generation"])
+async def test_intents_without_retrieval_exit_before_the_tool_loop(intent: str) -> None:
+    """Запросам вне action space не нужен ни retrieval, ни цикл критика."""
+    provider = ScriptedProvider(
+        planning_bundle().model_copy(
+            update={"intent": IntentClassification(primary=intent, entities=["шахтная вода"])}
+        )
+    )
+
+    answer = await ResearchWorkflow(provider=provider).run(
+        QueryRequest(question="Перестрой граф по новым документам и собери отчёт")
+    )
+
+    assert provider.calls == ["PlanningBundle"], "ни tools, ни reasoner, ни critic не запускаются"
+    assert [event.agent for event in answer.trace] == ["planning_agent", "synthesizer"]
+    assert answer.findings == []
+    assert answer.degradation_reasons, "ответ вне action space обязан быть помечен"
+
+
+@pytest.mark.asyncio
+async def test_revision_prompts_keep_draft_and_critique_sections() -> None:
+    """Секции, ради которых узел вызывается, обязаны доходить до модели.
+
+    Без резерва в бюджете ``fit_sections`` сбрасывала хвост: Critic получал
+    доказательство без черновика, Improver — черновик без замечаний. Экранирование
+    кириллицы в юникод-последовательности раздувало промпт и само по себе
+    выталкивало секции за бюджет.
+    """
+    provider = ScriptedProvider(
+        planning_bundle(),
+        AgentControlDecision(decision="reason", rationale="Доказательств достаточно."),
+        ReasoningResult(
+            summary="Обратный осмос обеспечивает удаление 95–99% растворённых солей.",
+            finding_ids=["finding-ro"],
+            conflicts=[],
+            knowledge_gaps=[],
+            recommendations=[],
+        ),
+        CritiqueResult(
+            approved=False,
+            issues=["Не названа границ применимости по сухому остатку."],
+            revision_instructions=["Указать сухой остаток ≤1000 мг/л."],
+        ),
+        ReasoningResult(
+            summary="Обратный осмос даёт 95–99% задержания при сухом остатке ≤1000 мг/л.",
+            finding_ids=["finding-ro"],
+            conflicts=[],
+            knowledge_gaps=[],
+            recommendations=[],
+        ),
+        CritiqueResult(approved=True, issues=[], revision_instructions=[]),
+    )
+
+    answer = await ResearchWorkflow(provider=provider).run(
+        QueryRequest(question="Какие методы обессоливания подходят для шахтной воды?")
+    )
+
+    assert [event.agent for event in answer.trace].count("improver") == 1
+    critic_prompt = provider.prompt_for("CritiqueResult", 0)
+    assert "DRAFT" in critic_prompt
+    assert "Обратный осмос обеспечивает удаление" in critic_prompt
+    improver_prompt = provider.prompt_for("ReasoningResult", 1)
+    assert "CRITIQUE" in improver_prompt
+    assert "Не названа границ применимости" in improver_prompt
+    for prompt in (critic_prompt, improver_prompt):
+        assert "\\u04" not in prompt, "кириллица не должна уходить в ASCII-экранирование"
+        assert "FINDINGS" in prompt, "доказательство не вправо жертвовать бюджет"

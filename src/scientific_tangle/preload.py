@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from scientific_tangle.config import get_settings
 from scientific_tangle.services.corpus import CorpusCompiler
-from scientific_tangle.services.infrastructure import build_knowledge_base
+from scientific_tangle.services.infrastructure import (
+    Neo4jElasticsearchKnowledgeBase,
+    build_knowledge_base,
+)
 from scientific_tangle.services.ingestion import IngestionService
 from scientific_tangle.services.preload import PreloadService
 from scientific_tangle.services.provider import build_provider
@@ -33,16 +37,20 @@ async def main() -> None:
 
     # Перестройка доменного графа знаний: сущности, рёбра, утверждения
     domain_stats = None
-    if hasattr(knowledge, "rebuild_domain_graph"):
+    if isinstance(knowledge, Neo4jElasticsearchKnowledgeBase):
         domain_stats = knowledge.rebuild_domain_graph()
         print(f"Domain graph rebuilt: {domain_stats}")
 
     print(
-        "{\n"
-        f'  "structural": {structural.model_dump_json(indent=2) if structural else "null"},\n'
-        f'  "semantic": {semantic.model_dump_json(indent=2) if semantic else "null"},\n'
-        f'  "domain_graph": {domain_stats}\n'
-        "}"
+        json.dumps(
+            {
+                "structural": json.loads(structural.model_dump_json()) if structural else None,
+                "semantic": json.loads(semantic.model_dump_json()) if semantic else None,
+                "domain_graph": domain_stats,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     )
     if semantic and semantic.failed:
         raise SystemExit(1)

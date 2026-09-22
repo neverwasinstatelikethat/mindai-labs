@@ -2,12 +2,28 @@
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 @prefix mind: <https://mindai.local/ontology/> .
 
+# Словари ниже — копия подписи из domain/relations.py (ярус semantic) и перечисления
+# NodeType. Держать их здесь, а не в коде, нужно затем, чтобы импорт документа
+# проверялся машиной SHACL: предикат вне словаря иначе попадает в граф как есть и
+# навсегда остаётся «немым» ребром, которое обход агента не пересечёт.
+# Расхождение словарей ловит tests/test_ontology_shapes.py.
+
 mind:ClaimShape a sh:NodeShape ;
     sh:targetClass mind:Claim ;
     sh:property [
         sh:path mind:predicate ;
         sh:minCount 1 ;
-        sh:pattern "^[A-Z][A-Z0-9_]*$"
+        sh:maxCount 1 ;
+        sh:datatype xsd:string ;
+        sh:pattern "^[A-Z][A-Z0-9_]*$" ;
+        sh:in (
+            "CONTAINS" "TREATED_BY" "PROCESSES" "PROCESSED_BY" "PRODUCES" "PRODUCED_FROM"
+            "FEEDS" "REMOVES" "REDUCES" "CONVERTED_TO" "DISSOLVED_BY" "USES" "USED_BY"
+            "USED_IN" "USED_FOR" "REQUIRES" "REQUIRES_MIN_TEMPERATURE" "OPERATES_AT"
+            "ACHIEVES" "MEASURED_IN" "AFFECTED_BY" "AFFECTS" "PRECEDES" "HAS_GRADE"
+            "HAS_EFFICIENCY" "HAS_ENERGY_RATIO" "LOCATED_IN" "ALTERNATIVE_TO" "EXPERT_IN"
+            "HAS_PROPERTY"
+        )
     ] ;
     sh:property [
         sh:path mind:evidenceQuote ;
@@ -19,4 +35,17 @@ mind:ClaimShape a sh:NodeShape ;
         sh:minCount 1 ;
         sh:minInclusive 0 ;
         sh:maxInclusive 1
+    ] .
+
+mind:EntityShape a sh:NodeShape ;
+    sh:targetClass mind:Entity ;
+    sh:property [
+        sh:path mind:entityType ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:datatype xsd:string ;
+        sh:in (
+            "material" "process" "equipment" "condition" "claim" "experiment"
+            "publication" "expert" "chunk" "location" "organization"
+        )
     ] .

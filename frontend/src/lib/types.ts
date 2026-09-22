@@ -1,5 +1,3 @@
-export type Mode = 'answer' | 'graph' | 'changes';
-
 export type Capability =
   | 'knowledge:read'
   | 'query:ask'
@@ -294,24 +292,6 @@ export interface EvolutionExperiment {
   created_at?: string;
 }
 
-// ── Entity Resolution ─────────────────────────────────────────────
-
-export interface EntityMergeProposal {
-  id: string;
-  source: string;
-  target: string;
-  confidence: number;
-  rationale: string;
-  status: 'proposed' | 'accepted' | 'rejected' | 'reverted';
-  created_at?: string;
-  // След решения и реальные id узлов пары: мерж идёт по id, а label лишь
-  // описателен, поэтому без этих полей «принято» неотличимо от «откатано».
-  reviewed_at?: string | null;
-  reviewer_id?: string | null;
-  source_id?: string | null;
-  target_id?: string | null;
-}
-
 // ── System Status & Documents ─────────────────────────────────────
 
 export interface SystemStatus {
@@ -362,54 +342,6 @@ export interface GoldCase {
   expected_source_titles: string[];
 }
 
-export interface RankingMetrics {
-  recall_at_3: number;
-  precision_at_3: number;
-  mrr: number;
-  ndcg_at_3: number;
-}
-
-export interface RetrievalCaseResult {
-  case_id: string;
-  expected_sources: string[];
-  retrieved_sources: string[];
-  reciprocal_rank: number;
-}
-
-export interface RetrievalBenchmark {
-  gold_cases: number;
-  // Кейсы, которые вообще возможно засчитать (ожидаемый источник есть в
-  // корпусе): вне корпуса recall=0 означает «измерять нечего».
-  scored_cases: number;
-  corpus_documents: number;
-  top_k: number;
-  hybrid: RankingMetrics;
-  lexical_baseline: RankingMetrics;
-  cases: RetrievalCaseResult[];
-  // Инварианты корректности замера (hybrid не слабее baseline, ожидаемый
-  // источник есть в корпусе), а не прежние «утечки».
-  validity_checks: Record<string, boolean>;
-  passed: boolean;
-}
-
-export interface PipelineCaseResult {
-  case_id: string;
-  question: string;
-  expected_sources: string[];
-  retrieved_sources: string[];
-  latency_ms: number;
-  degradation_reasons: string[];
-  passed: boolean;
-}
-
-export interface PipelineBenchmark {
-  cases: number;
-  agentic_graphrag: PipelineVariantMetrics;
-  lexical_baseline: RankingMetrics;
-  results: PipelineCaseResult[];
-  passed: boolean;
-}
-
 // ── FT-20/21: RBAC / ACL ──────────────────────────────────────────
 
 // Аккаунт и сессия: единственный источник прав — /api/v1/auth/me.
@@ -421,19 +353,6 @@ export interface AccountInfo {
   created_at: string;
   capabilities: Capability[];
   data_classes: DataClass[];
-}
-
-export interface AuditEvent {
-  id?: string;
-  actor_id: string;
-  action: string;
-  // Идентификатор объекта (query_id, id предложения, sha-ориентир для текста),
-  // а не сам текст: журнал читают не только авторы записи.
-  object_id: string;
-  outcome: string;
-  correlation_id?: string;
-  created_at: string;
-  metadata?: Record<string, string | number | boolean>;
 }
 
 // ── FT-08: Claim Versioning ───────────────────────────────────────
@@ -474,24 +393,9 @@ export interface ComparisonTable {
   rows: ComparisonRow[];
 }
 
-export interface ComparisonRequest {
-  question: string;
-  entities: string[];
-  dimensions: string[];
-  language: string;
-}
-
 // ── FT-23: Export ─────────────────────────────────────────────────
 
 export type ExportFormat = 'markdown' | 'json-ld' | 'pdf';
-
-// Экспортируется серверная копия ответа по query_id: клиентский AnswerPayload из
-// контракта убран, потому что ACL фильтровал бы присланные клиентом данные.
-// Лишнее поле (в том числе подставленный answer) — ошибка 422 на сервере.
-export interface ExportRequest {
-  query_id: string;
-  format: ExportFormat;
-}
 
 // ── Обратная связь и решения эксперта ─────────────────────────────
 
@@ -502,36 +406,6 @@ export interface FeedbackResult {
   proposal: EvolutionProposal | null;
   superseded: Finding | null;
   degradation_reasons: string[];
-}
-
-export type ExpertDecisionAction =
-  | 'proposal.created'
-  | 'proposal.reviewed'
-  | 'resolution.reviewed'
-  | 'claim.superseded'
-  | 'answer.exported';
-
-// Durable-запись решения эксперта (contracts.ExpertDecision): свободный текст
-// источников здесь отсутствует намеренно.
-export interface ExpertDecision {
-  id: string;
-  actor_id: string;
-  action: ExpertDecisionAction;
-  object_id: string;
-  outcome: 'success' | 'denied' | 'failure';
-  created_at: string;
-  metadata: Record<string, string | number | boolean>;
-}
-
-// ── FT-24: Лента событий разбора ──────────────────────────────────
-// Лента в postgres-контуре переживает перезапуск; в in-memory — нет, и это
-// показывает state_backend в /health/ready, а не обещание интерфейса.
-// Интерфейс ленту не опрашивает: доставки и подписок на темы в продукте нет.
-export interface Notification {
-  id: string;
-  topic: string;
-  message: string;
-  created_at: string;
 }
 
 // ── FT-25: Dashboard ──────────────────────────────────────────────

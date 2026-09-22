@@ -1,16 +1,54 @@
+# VCS и локальные инструкции
 .git
+.gitignore
+.dockerignore
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+QODER.md
+PRODUCT.md
+
+# Агентские каталоги и локальные артефакты
 .agents
 .claude
 .codex
+.cursor
+.qoder
+.superpowers
+.windsurf
+.playwright-mcp
+.impeccable
+DESIGN.md
+preferences.md
+vibe_images
+docs
+screenshots
+*.pptx
+capture_screenshots.py
+graph_output*.json
+
+# Окружение и секреты
 .env
+.env.*
+
+# Кэши проверок и сборки
 .mypy_cache
 .pytest_cache
 .ruff_cache
+.langgraph_api
 **/__pycache__
 **/*.pyc
-frontend/node_modules
-frontend/.svelte-kit
+**/node_modules
+**/.svelte-kit
 frontend/build
-Источники информации
+data
 artifacts
+exports
+out
+tmp
+temp
+*.log
+*.tmp
 
+# Корпус документов передаётся только как read-only mount
+Источники информации

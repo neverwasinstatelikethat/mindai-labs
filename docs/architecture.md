@@ -1,8 +1,11 @@
 # ADS-001: Hybrid Evidence-Centric Agentic GraphRAG
 
-- Статус: proposed
+- Статус: принят (реализовано в текущем коде)
 - Дата: 2026-07-02
-- Контекст: хакатон «Научный Клубок»
+- Контекст: «Научный Клубок» — исходная архитектура первого этапа. Продукт
+  развился в рабочую платформу для аналитиков, поэтому решение остаётся базой,
+  а ограничения и следующие шаги перечислены в README (разделы «Ограничения и
+  открытые задачи» и «Что предстоит»).
 
 ## Решение
 
@@ -70,7 +73,7 @@ flowchart LR
 | Improver | feedback → eval case/rule proposal | human approval; no autonomous fact writes |
 | Recommender | adjacent cases/experts/gaps | отдельная маркировка hypotheses |
 
-Агенты — наблюдаемые узлы одного state machine, а не автономные чаты. Это снижает latency, стоимость и непредсказуемость при сохранении конкурсной наглядности.
+Агенты — наблюдаемые узлы одного state machine, а не автономные чаты. Это снижает latency, стоимость и непредсказуемость, сохраняя наглядность разбора для проверяющего аналитика.
 
 ## Онтология
 
@@ -102,7 +105,7 @@ Conflict — не просто semantic dissimilarity. Сравниваются 
 
 ## Self-improvement
 
-Feedback создаёт `EvaluationCase`, обновляет alias/rule proposal и измеряет regression suite. Автономное переобучение и автоматическая публикация фактов исключены из MVP. Это полезный замкнутый цикл, который можно доказать на демо.
+Feedback создаёт `EvaluationCase`, обновляет alias/rule proposal и измеряет regression suite. Автономное переобучение и автоматическая публикация фактов исключены из объёма: решение о публикации утверждает эксперт с разрешением `proposal:review`. Цикл замкнут и проверяется на эталонных случаях и A/B-эксперименте, а не только на показе интерфейса.
 
 ## Стек
 
@@ -111,13 +114,14 @@ Feedback создаёт `EvaluationCase`, обновляет alias/rule proposal
 - Elasticsearch 8.x, Redis, S3/MinIO;
 - Docling/Unstructured + OCR, pandas/openpyxl;
 - multilingual embeddings/reranker и provider-agnostic LLM gateway;
-- React/Next.js для конкурсного UI; Cytoscape.js для evidence graph;
+- SvelteKit + Svelte 5 для рабочего интерфейса; Cytoscape.js для evidence graph;
 - OpenTelemetry, Prometheus, Grafana;
-- Docker Compose для demo, Kubernetes/Helm как production target.
+- Docker Compose для локального контура; промышленный контур развёртывания —
+  открытая задача.
 
 ## Оценка революционности
 
-Компоненты по отдельности не революционны: Knowledge Graph, GraphRAG, agents и human-in-loop известны. Сильная и практически полезная новизна — их предметная композиция вокруг evidence-bearing claims и числовой fidelity. Победное преимущество появится только при доказательстве на сложном вопросе и сравнении с baseline vector RAG.
+Компоненты по отдельности не революционны: Knowledge Graph, GraphRAG, agents и human-in-loop известны. Сильная и практически полезная новизна — их предметная композиция вокруг evidence-bearing claims и числовой fidelity. Заявляемое преимущество подтверждается только на сложном вопросе и в сравнении с baseline vector RAG.
 
 ## Риски и меры
 
