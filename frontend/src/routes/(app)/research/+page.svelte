@@ -570,7 +570,7 @@
           проверяем доступ…
         {:else}
           доступа нет — запрос не запустится.
-          <a href="/login">Войти</a>
+          <a href={`/login?next=${encodeURIComponent(page.url.pathname)}`}>Войти</a>
         {/if}
       </p>
     {:else if !canAsk}

@@ -6,7 +6,6 @@
   import Button from '$lib/ui/Button.svelte';
   import Field from '$lib/ui/Field.svelte';
   import Notice from '$lib/ui/Notice.svelte';
-  import Panel from '$lib/ui/Panel.svelte';
 
   // Открытого редиректа не будет: принимаем только внутренний путь. `//host` и
   // `/\host` — не внутренние пути, их отбрасываем вместе с чужими доменами.
@@ -78,8 +77,10 @@
       const status = caught instanceof ApiError ? caught.status : null;
       if (status === 409) {
         taken = true;
-        errors = { ...errors, email: 'Этот email уже зарегистрирован.' };
-        formError = 'Аккаунт с таким email уже есть: войдите в него, пароль меняется в профиле.';
+        // Факт звучит один раз: поле называет отказ, подсказка ниже — только то,
+        // чего не делает кнопка входа.
+        errors = { ...errors, email: 'Такой email уже оформлен.' };
+        formError = 'Пароль меняется в профиле после входа.';
       } else if (status === 429) {
         formError = 'Слишком много попыток подряд. Данные сохранены — повторите через минуту.';
       } else if (status === 422) {
@@ -126,6 +127,7 @@
           autocomplete="email"
           inputmode="email"
           placeholder="analyst@example.org"
+          autofocus
           bind:value={email}
           error={errors.email ?? ''}
         />
@@ -178,21 +180,18 @@
         <Button href="/login" variant="link" size="sm">Уже есть аккаунт? Войти</Button>
       </div>
 
-      <Panel tone="sunk">
-        <p class="small">
-          Сразу после регистрации открываются рабочее пространство с запросами агенту, находки,
-          карта связей, сравнение технологий и конфликты. Экспертные действия — разбор предложений
-          эволюции, аудит и закрытые данные — доступны при расширенном доступе.
-        </p>
-      </Panel>
+      <p class="small muted">
+        Сразу после регистрации открываются рабочее пространство с запросами агенту, находки,
+        карта связей, сравнение технологий и конфликты. Экспертные действия — разбор предложений
+        эволюции, аудит и закрытые данные — доступны при расширенном доступе.
+      </p>
     </form>
   </div>
 </div>
 
 <style>
+  /* Центрирование и высоту даёт page--cover; здесь только свои отступы. */
   .auth {
-    display: grid;
-    align-content: center;
     padding-block: var(--s6) var(--s8);
   }
 

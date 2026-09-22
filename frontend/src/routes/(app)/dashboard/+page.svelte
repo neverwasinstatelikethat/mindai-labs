@@ -1,14 +1,15 @@
 <script lang="ts">
   import { api } from '$lib/api';
-  import { countOf, num, pct } from '$lib/format';
+  import { countOf, dateTime, num, pct } from '$lib/format';
   import { scrollRegion } from '$lib/scroll-region';
   import { session } from '$lib/sessionStore.svelte';
-  import { AGENT_LABELS, knownTerm } from '$lib/terms';
+  import { AGENT_LABELS, knownTerm, MODEL_MODE_LABELS } from '$lib/terms';
   import {
     type CorpusStats,
     type DashboardData,
     type EvaluationRun,
     type FindingListItem,
+    type SystemStatus,
   } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
@@ -52,15 +53,18 @@
 
   // Действие читают по русскому имени: ключ журнала остаётся за кадром, а id
   // объекта идёт подписью при строке — сам заголовком ячейки он не является.
-  function actionTerm(action: string): string {
-    return knownTerm(ACTION_LABELS, action) ?? 'Действие из журнала';
+  // Неизвестное словарю действие не остаётся безликим: при общей подписи
+  // показывается и ключ, иначе два разных неизвестных действия выглядят одним.
+  function actionTerm(action: string): { name: string; named: boolean } {
+    const known = knownTerm(ACTION_LABELS, action);
+    return known ? { name: known, named: true } : { name: 'Действие из журнала', named: false };
   }
 
-  // Имя шага прохода: AGENT_LABELS даёт русское название, служебное имя узла
-  // остаётся подписью при нём.
-  function agentLabel(agent: string): { name: string; named: boolean } {
-    const known = knownTerm(AGENT_LABELS, agent);
-    return known ? { name: known, named: true } : { name: 'шаг прохода', named: false };
+  // Имя шага прохода: AGENT_LABELS даёт русское название, а для неизвестного
+  // словарю шага — общую подпись. Служебное имя узла идёт рядом моно-подписью
+  // всегда: без него два разных неизвестных шага были бы неразличимы.
+  function agentLabel(agent: string): string {
+    return knownTerm(AGENT_LABELS, agent) ?? 'шаг прохода';
   }
 
   const METRICS: { key: keyof EvaluationRun['metrics']; label: string }[] = [
@@ -99,6 +103,9 @@
   // Не пришедшие разделы перечисляются человеческими строками: экран говорит,
   // чего именно он не дочитал, без кодов ответов и путей.
   let failed = $state<string[]>([]);
+  // Состояние модели приходит из /health/ready: не дочиталось — строки нет,
+  // экран не выдумывает ни живую модель, ни её деградацию.
+  let health = $state<SystemStatus | null>(null);
 
   const canEvaluate = $derived(session.can('evaluation:view'));
   const canAudit = $derived(session.can('audit:read'));
@@ -125,21 +132,17 @@
     return total > 0 ? Math.max(0, Math.min(100, Math.round((part / total) * 100))) : 0;
   }
 
-  function dateTime(iso: string): string {
-    const parsed = new Date(iso);
-    return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleString('ru-RU');
-  }
-
   async function load(): Promise<void> {
     loading = true;
     fatal = '';
     failed = [];
 
-    const [panel, corpus, log, evals] = await Promise.allSettled([
+    const [panel, corpus, log, evals, state] = await Promise.allSettled([
       api.dashboard(),
       api.corpusStats(),
       api.findings(),
       canEvaluate ? api.evaluations() : Promise.resolve(null),
+      api.status(),
     ]);
 
     if (panel.status === 'fulfilled') {
@@ -165,6 +168,10 @@
       runs = null;
       failed.push('Не пришли прогоны оценки.');
     }
+
+    // Сбой чтения состояния — не ошибка раздела: строку состояния модели
+    // просто не показываем, вместо неё ничего не придумываем.
+    health = state.status === 'fulfilled' ? state.value : null;
 
     loading = false;
   }
@@ -193,6 +200,12 @@
         {loading ? 'Считываем…' : 'Обновить показания'}
       </Button>
     </SectionHead>
+
+    <!-- Состояние модели — одна строка словаря терминов: деградация видна на
+         панели, а не только внутри ответа запроса. -->
+    {#if health}
+      <p class="micro muted">{MODEL_MODE_LABELS[health.model_mode]}</p>
+    {/if}
 
     {#if loading && !dash}
       <Panel tone="sunk">
@@ -345,7 +358,7 @@
             {#snippet action()}
               <div class="row">
                 <Button variant="action" href="/research">Открыть рабочее пространство</Button>
-                <Button variant="quiet" icon="refresh" onclick={() => void load()}>Прочитать снова</Button>
+                <Button variant="quiet" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>Прочитать снова</Button>
               </div>
             {/snippet}
           </Empty>
@@ -473,15 +486,31 @@
           lead="Счётчики ведёт процесс сервиса: в них попадают все вызовы агентов с его запуска, а не только ваши запросы. Задержки считаются по последним 1000 вызовам каждого шага. Снимок датирован {dateTime(dash.agent_metrics.generated_at)}."
         />
 
+        <!-- Занятость контура — числа процесса, а не шагов: стоят над таблицей,
+             потому что имеют смысл и при пустом списке шагов, и объясняют 429. -->
+        <div class="stack dash__occupancy">
+          <p class="micro muted">
+            Проходов сейчас: <span class="num">{num(dash.agent_metrics.agent_runs_active)}</span> из
+            <span class="num">{num(dash.agent_metrics.agent_runs_limit)}</span>
+          </p>
+          <p class="micro muted">
+            Отказано приёму: <span class="num">{num(dash.agent_metrics.agent_runs_refused)}</span>
+          </p>
+          <p class="micro muted">
+            У модели занято <span class="num">{num(dash.agent_metrics.llm_calls_in_flight)}</span> из
+            <span class="num">{num(dash.agent_metrics.llm_slots)}</span> слотов, в ожидании
+            <span class="num">{num(dash.agent_metrics.llm_calls_waiting)}</span>
+          </p>
+        </div>
+
         {#if agents.length}
           <Panel>
             {#each agents as metric (metric.agent)}
-              {@const agent = agentLabel(metric.agent)}
               <div class="dash__ratio">
                 <div class="row row--between">
                   <p class="small">
-                    {agent.name}
-                    {#if agent.named}<code class="tech">{metric.agent}</code>{/if}
+                    {agentLabel(metric.agent)}
+                    <code class="tech">{metric.agent}</code>
                   </p>
                   <span class="tag num">{share(metric.successes, metric.calls)} %</span>
                 </div>
@@ -596,6 +625,7 @@
               </thead>
               <tbody>
                 {#each activity as entry, i (i)}
+                  {@const action = actionTerm(entry.action)}
                   <tr>
                     <td><time datetime={entry.created_at}>{dateTime(entry.created_at)}</time></td>
                     {#if canAudit}
@@ -607,8 +637,12 @@
                     {/if}
                     <td>
                       <!-- Русское имя действия — заголовок строки, id объекта —
-                           моно-подпись при нём. -->
-                      <p class="small">{actionTerm(entry.action)}</p>
+                           моно-подпись при нём. Неизвестное словарю действие
+                           показывает и ключ: без него строки неразличимы. -->
+                      <p class="small">
+                        {action.name}
+                        {#if !action.named}<code class="tech">{entry.action}</code>{/if}
+                      </p>
                       {#if entry.object_id}
                         <p class="micro muted">
                           объект <code class="tech">{entry.object_id}</code>
@@ -835,6 +869,12 @@
 
   .dash__legend {
     max-width: 88ch;
+    margin-top: var(--s4);
+  }
+
+  /* Занятость контура: три короткие micro-строки плотным столбиком над таблицей шагов. */
+  .dash__occupancy {
+    --gap: var(--s1);
     margin-top: var(--s4);
   }
 

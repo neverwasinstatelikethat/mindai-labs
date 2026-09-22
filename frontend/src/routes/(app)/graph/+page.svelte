@@ -5,6 +5,7 @@
   import GraphCanvas, { classOf, relationLabel, typeLabel } from '$lib/GraphCanvas.svelte';
   import { plural } from '$lib/format';
   import { session } from '$lib/sessionStore.svelte';
+  import { OPERATOR_WORD, STATUS_SHORT } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
   import Icon from '$lib/ui/Icon.svelte';
@@ -64,20 +65,6 @@
   function fmt(v: number): string {
     return nf.format(v);
   }
-
-  const STATUS_RU: Record<string, string> = {
-    consensus: 'согласуется',
-    hypothesis: 'гипотеза',
-    disputed: 'оспаривается',
-  };
-  const OPERATOR_RU: Record<string, string> = {
-    eq: 'равно',
-    lt: 'меньше',
-    lte: 'не выше',
-    gt: 'больше',
-    gte: 'не ниже',
-    between: 'в диапазоне',
-  };
 
   const typeCount = $derived(new Set(graph.nodes.map((n) => n.type)).size);
   const classCount = $derived(new Set(graph.nodes.map((n) => n.data_class)).size);
@@ -230,10 +217,14 @@
     const rows: [string, string][] = [];
     for (const [key, value] of Object.entries(node.metadata)) {
       if (META_SKIP.has(key)) continue;
+      const label = META_LABELS[key];
+      // Без словарного перевода строку пропускаем: сырой snake_case-ключ не
+      // становится видимой подписью.
+      if (!label) continue;
       const text = String(value);
       // год=0 — сервисный маркер «года нет», печатать его нельзя
       if (text.trim() === '' || (key === 'year' && text === '0')) continue;
-      rows.push([META_LABELS[key] ?? key, text]);
+      rows.push([label, text]);
     }
     return rows;
   }
@@ -401,7 +392,7 @@
                 {#each nodeObs.rows as obs, i (`${selected.id}-nobs-${i}`)}
                   <tr>
                     <td><code>{obs.property_name}</code></td>
-                    <td>{OPERATOR_RU[obs.operator] ?? obs.operator} <code>{obs.operator}</code></td>
+                    <td>{OPERATOR_WORD[obs.operator]} <code>{obs.operator}</code></td>
                     <td class="num">{obsValue(obs)}</td>
                     <td><code>{obs.unit || '—'}</code></td>
                     <td class="num">{obsNormalized(obs)}</td>
@@ -425,7 +416,7 @@
                 {#if finding.predicate}· <code>{finding.predicate}</code>{/if}
                 · версия <span class="num">{finding.version}</span>
               </p>
-              <StatusPill status={finding.status} label={STATUS_RU[finding.status] ?? finding.status} />
+              <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
             </div>
 
             <h4 class="h4">{finding.statement}</h4>
@@ -469,7 +460,7 @@
                       <tr>
                         <td><code>{obs.property_name}</code></td>
                         <td>
-                          {OPERATOR_RU[obs.operator] ?? obs.operator} <code>{obs.operator}</code>
+                          {OPERATOR_WORD[obs.operator]} <code>{obs.operator}</code>
                         </td>
                         <td class="num">{obsValue(obs)}</td>
                         <td><code>{obs.unit || '—'}</code></td>
@@ -637,7 +628,7 @@
               <p class="small">{plural(graph.edges.length, 'связь', 'связи', 'связей')}</p>
               <p class="micro muted">отношения читаются у выбранного узла</p>
             </Panel>
-            <Panel tone="coral" class="map__gauge">
+            <Panel tone="default" class="map__gauge">
               <p class="metric__num num">{graph.communities.length}</p>
               <p class="small">
                 {plural(graph.communities.length, 'сообщество', 'сообщества', 'сообществ')}
@@ -962,7 +953,7 @@
     }
   }
 
-  @media (max-width: 700px) {
+  @media (max-width: 640px) {
     .map__conn-list li {
       grid-template-columns: 20px minmax(0, 1fr) 52px;
     }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
+  import { page } from '$app/state';
   import { tick } from 'svelte';
   import { ApiError, api } from '$lib/api';
   import { countOf, num, pct, plural } from '$lib/format';
@@ -10,6 +11,7 @@
     PREDICATE_LABELS,
     PROPERTY_LABELS,
     STATUS_SHORT,
+    STATUS_SUPERSEDED,
     SUBJECT_LABELS,
     describeScope,
     knownTerm,
@@ -50,6 +52,10 @@
 
   const ACCEPT_ATTR = '.pdf,.docx,.xlsx,.json,.txt';
   const ACCEPT_NOTE = '.pdf · .docx · .xlsx · .json · .txt';
+
+  // Возврат после входа — на этот же экран, а не в раздел по умолчанию:
+  // сессия прервалась посреди отбора, и сбрасывать его незачем.
+  const LOGIN_HREF = $derived(`/login?next=${encodeURIComponent(page.url.pathname)}`);
 
   type Failure = {
     kind: 'session' | 'forbidden' | 'model' | 'backend' | 'other';
@@ -347,17 +353,26 @@
     active = null;
   }
 
-  async function loadIndex(): Promise<void> {
+  // Приёмка документа не должна стирать отбор аналитика: при preserveFilters
+  // черновики, применённые условия и глубина среза выживают, а строки
+  // перечитываются по прежним условиям — срез остаётся срезом.
+  async function loadIndex(preserveFilters = false): Promise<void> {
     phase = 'loading';
     failure = null;
     try {
       index = await api.findings();
-      rows = index;
-      subjectDraft = '';
-      statusDraft = '';
-      appliedSubject = '';
-      appliedStatus = '';
-      shown = PAGE_SIZE;
+      if (preserveFilters && (appliedSubject || appliedStatus)) {
+        rows = await api.findings(appliedSubject || undefined, appliedStatus || undefined);
+      } else {
+        rows = index;
+        if (!preserveFilters) {
+          subjectDraft = '';
+          statusDraft = '';
+          appliedSubject = '';
+          appliedStatus = '';
+          shown = PAGE_SIZE;
+        }
+      }
       active = null;
       phase = 'ready';
     } catch (reason) {
@@ -455,7 +470,7 @@
       }
     }
     uploading = false;
-    if (accepted) await loadIndex();
+    if (accepted) await loadIndex(true);
   }
 
   function pickDocuments(event: Event): void {
@@ -516,9 +531,12 @@
       <div class="findings__head">
         <p class="micro findings__count" role="status" aria-live="polite">{sliceNote}</p>
         {#if canRead}
-          <!-- Кнопка называет следующее действие в обоих состояниях, поэтому
-               раскрытие читается и без aria-expanded: его ui/Button не пробрасывает. -->
-          <Button size="sm" icon="upload" onclick={() => (importOpen = !importOpen)}>
+          <Button
+            size="sm"
+            icon="upload"
+            expanded={importOpen}
+            onclick={() => (importOpen = !importOpen)}
+          >
             {importOpen ? 'Свернуть импорт' : 'Пополнить корпус'}
           </Button>
         {/if}
@@ -595,11 +613,21 @@
                         {item.receipt.status === 'duplicate'
                           ? 'Дубликат: документ уже в корпусе'
                           : 'Документ принят'}
-                        · <code class="code">{item.receipt.document_id}</code> · извлечено{' '}
+                        · <span class="micro muted">код документа</span>
+                        <code class="tech">{item.receipt.document_id}</code> · извлечено{' '}
                         {countOf(item.receipt.extracted_claims, 'утверждение', 'утверждения', 'утверждений')}
                         · контрольная сумма
-                        <code class="code">{item.receipt.checksum.slice(0, 12)}</code>
+                        <code class="code">{item.receipt.checksum}</code>
                       </p>
+                      {#if item.receipt.prompt_truncated}
+                        <!-- Хвост документа за бюджетом промпта — не «в корпусе
+                             такого нет»: число утверждений из неполного разбора
+                             обязано быть помечено. -->
+                        <p class="micro">
+                          Разбор дошёл не до конца: без внимания осталось
+                          {item.receipt.omitted_characters} символов.
+                        </p>
+                      {/if}
                     {:else if item.failure}
                       <p class="micro upload__err">
                         {#if item.failure.kind === 'session'}
@@ -635,7 +663,7 @@
             <!-- Второго действия здесь нет: повторный опрос с неподтверждённым
                  входом даст тот же отказ, поэтому ведёт только одна кнопка. -->
             <div class="row">
-              <Button href="/login" variant="action">Войти заново</Button>
+              <Button href={LOGIN_HREF} variant="action">Войти заново</Button>
             </div>
           {/snippet}
         </Empty>
@@ -674,7 +702,7 @@
         </Notice>
         {#if failure?.kind === 'session'}
           <div class="row">
-            <Button href="/login" variant="action">Войти заново</Button>
+            <Button href={LOGIN_HREF} variant="action">Войти заново</Button>
           </div>
         {:else}
           <div class="row">
@@ -791,7 +819,13 @@
               {#if appliedSubject || appliedStatus}
                 <p class="micro muted">Отбор: {appliedEcho}.</p>
               {/if}
-              {#if failure?.kind === 'forbidden'}
+              {#if failure?.kind === 'session'}
+                <!-- Повтор опроса с неподтверждённым входом даст тот же отказ:
+                     двигает решение только повторный вход. -->
+                <div class="row">
+                  <Button href={LOGIN_HREF} variant="action">Войти заново</Button>
+                </div>
+              {:else if failure?.kind === 'forbidden'}
                 <!-- Повтор отказа по доступу даёт тот же отказ: здесь только то,
                      что действительно двигает решение. -->
                 <div class="row">
@@ -1042,7 +1076,7 @@
       {plural(finding.observations.length, 'наблюдение', 'наблюдения', 'наблюдений')}
     </p>
     {#if finding.observations.length > 0}
-      {#each finding.observations as obs (`${finding.id}-${obs.property_name}-${obs.raw_text}`)}
+      {#each finding.observations as obs, i (`${finding.id}-obs-${i}`)}
         {@const m = measureOf(obs)}
         <div class="measure">
           <div class="measure__caption">
@@ -1065,7 +1099,7 @@
                   style="left:{m.band.left}%;width:{m.band.width}%"
                 ></span>
               </span>
-              {#each m.limits as limit (limit.label)}
+              {#each m.limits as limit, li (`${finding.id}-lim-${li}`)}
                 <span
                   class="measure__limit"
                   style="left:{limit.at}%"
@@ -1183,7 +1217,12 @@
                     <p class="micro">Основание: {version.review_reason}</p>
                   {/if}
                 </td>
-                <td><StatusPill status={version.status} label={statusLabel(version.status)} /></td>
+                <td>
+                  <StatusPill status={version.status} label={statusLabel(version.status)} />
+                  {#if version.superseded_by}
+                    <StatusPill status="superseded" label={STATUS_SUPERSEDED} />
+                  {/if}
+                </td>
                 <td>
                   {#if version.reviewer_id}
                     <code class="code">{version.reviewer_id}</code>
@@ -1407,13 +1446,12 @@
     top: calc(var(--topbar-h) + var(--s4));
   }
 
+  /* Список субъектов растёт вместе с панелью: единственным скроллом остаётся
+     страница, второй прокрутки внутри sticky-рельса не заводим. */
   .subjects {
     display: flex;
     flex-direction: column;
     gap: var(--s2);
-    max-height: 60vh;
-    overflow-y: auto;
-    scrollbar-width: thin;
   }
 
   .subject {
@@ -1668,9 +1706,11 @@
     flex-wrap: wrap;
   }
 
-  /* Длинные идентификаторы (код утверждения, код документа) печатаем целиком:
-     перенос вместо обрезки, иначе полное значение негде прочесть. */
+  /* Длинные идентификаторы (код утверждения, код документа, контрольная сумма
+     приёмки) печатаем целиком: перенос вместо обрезки, иначе полное значение
+     негде прочесть. */
   .evidence__loc .code,
+  .upload__ok .code,
   .kv dd {
     overflow-wrap: anywhere;
   }
@@ -1695,10 +1735,6 @@
     .findings__rail {
       position: static;
       order: 2;
-    }
-
-    .subjects {
-      max-height: none;
     }
   }
 </style>

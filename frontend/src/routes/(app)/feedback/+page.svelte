@@ -4,7 +4,7 @@
   // принимает эксперт; без расширенного доступа экран объясняет, что именно
   // недоступно, а не показывает мёртвую кнопку.
   import { api, ApiError } from '$lib/api';
-  import { countOf, num, pct } from '$lib/format';
+  import { countOf, dateTime, num, pct } from '$lib/format';
   import { session } from '$lib/sessionStore.svelte';
   import { PREDICATE_LABELS, SUBJECT_LABELS, STATUS_SHORT, knownTerm, termOf } from '$lib/terms';
   import {
@@ -141,15 +141,6 @@
     return 'Не получилось. Проверьте соединение и повторите попытку.';
   }
 
-  // Даты форматированием чисел в $lib/format не покрыты, поэтому локально
-  // остаётся только человекочитаемый вывод времени.
-  function ruDate(iso: string): string {
-    const date = new Date(iso);
-    return Number.isNaN(date.getTime())
-      ? iso
-      : date.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
-  }
-
   const canGive = $derived(session.can('feedback:give'));
   const canRead = $derived(session.can('knowledge:read'));
   const canEvaluate = $derived(session.can('evaluation:view'));
@@ -167,12 +158,21 @@
   let proposalLimit = $state(PROPOSAL_PAGE_SIZE);
   let runsShown = $state(RUNS_PAGE_SIZE);
   let experiments = $state<EvolutionExperiment[]>([]);
+  // Сбой чтения журнала не маскируем пустотой: у каждого — своя строка-объяснение.
+  let experimentsFailure = $state('');
   let corpus = $state<FindingListItem[]>([]);
+  let corpusFailure = $state('');
+  // Счётчики печатаются, только когда журналы реально прочитаны loadAll:
+  // иначе у читателя без прав стояли бы честные, но бессмысленные нули.
+  let ledgerLoaded = $state(false);
   let softFailure = $state('');
 
   let target = $state<Target | null>(null);
   let questionDraft = $state('');
   let asking = $state(false);
+  // Attempt, а не «форма невалидна»: претензия к вопросу — после попытки,
+  // как у вердикта; кнопка из-за короткого текста не гаснет.
+  let askAttempted = $state(false);
   let askFailure = $state<Failure | null>(null);
 
   let verdict = $state<'accept' | 'reject' | 'correct' | null>(null);
@@ -200,10 +200,15 @@
   // Утверждение, чья цепочка открыта: шторка обязана называть свой предмет и
   // тогда, когда запрос версий не прошёл — данных истории в этот момент нет.
   let historyClaim = $state('');
+  // Человекочитаемая формулировка того же утверждения: UUID остаётся подписью,
+  // а не именем предмета.
+  let historyClaimText = $state('');
   let history = $state<ClaimHistory | null>(null);
   let historyFailure = $state('');
   // Утверждение, правку которого только что записали: по нему и открываем цепочку.
   let lastCorrected = $state('');
+  // Его формулировка: шторка версий называет предмет по-русски, id — подпись.
+  let lastCorrectedStatement = $state('');
 
   /** Русская связка темы или пустая строка: сырой ключ в текст не подставляем. */
   function topicOf(finding: FindingListItem): string {
@@ -233,6 +238,16 @@
         : `Нужен комментарий от 3 символов: сейчас ${comment.trim().length}.`,
   );
 
+  // Вопрос к корпусу — тот же принцип: претензия появляется после попытки,
+  // а кнопка не гаснет из-за ещё не набранного текста.
+  const questionError = $derived(
+    questionDraft.trim().length >= 3 || (!askAttempted && questionDraft.trim().length === 0)
+      ? ''
+      : questionDraft.trim().length === 0
+        ? 'Нужен вопрос корпусу: без него прогон не запустить.'
+        : `Нужен вопрос от 3 символов: сейчас ${questionDraft.trim().length}.`,
+  );
+
   const candidates = $derived.by(() => {
     const pool = target?.findings.length ? target.findings : corpus;
     const query = findingQuery.trim().toLowerCase();
@@ -246,6 +261,10 @@
       : pool;
     return list.slice(0, 12);
   });
+
+  // Пул для замены пуст и без поиска: «уточните поиск» про другое — про фильтр,
+  // который ничего не отобрал из существующего пула.
+  const poolEmpty = $derived(!target?.findings.length && corpus.length === 0);
 
   const openCount = $derived(proposals.filter((item) => item.status === 'proposed').length);
   // Журнал предложений растёт вместе с корпусом: лист разбит на порции, чтобы
@@ -363,6 +382,7 @@
 
   async function askQuestion(): Promise<void> {
     const question = questionDraft.trim();
+    askAttempted = true;
     if (question.length < 3) return;
     asking = true;
     askFailure = null;
@@ -412,11 +432,18 @@
       if (parsed.proposal) proposals = [parsed.proposal, ...proposals];
       if (correctedFinding) {
         lastCorrected = correctedFinding;
+        // Формулировку берём из того же пула, из которого выбирали: шторка
+        // называет утверждение по-русски, id остаётся подписью.
+        lastCorrectedStatement =
+          (target?.findings.length ? target.findings : corpus).find(
+            (item) => item.id === correctedFinding,
+          )?.statement ?? '';
         // Цепочку версий читаем сразу и открываем в шторке: правку без
         // показанной цепочки не проверяешь глазами.
-        await loadHistory(correctedFinding, true);
+        await loadHistory(correctedFinding, lastCorrectedStatement, true);
         try {
           corpus = await api.findings();
+          corpusFailure = '';
         } catch {
           softFailure = 'Правка записана, но указатель находок не перечитан. Обновите лист позже.';
         }
@@ -439,8 +466,10 @@
       ]);
       if (proposalsResult.status === 'fulfilled') proposals = proposalsResult.value;
       else softFailure = 'Журнал предложений не перечитан.';
-      if (experimentsResult.status === 'fulfilled') experiments = experimentsResult.value;
-      else softFailure = 'Результаты A/B-прогонов не перечитаны.';
+      if (experimentsResult.status === 'fulfilled') {
+        experiments = experimentsResult.value;
+        experimentsFailure = '';
+      } else softFailure = 'Результаты A/B-прогонов не перечитаны.';
     } catch {
       softFailure = 'Лист не перечитан: проверьте соединение и повторите попытку.';
     }
@@ -478,16 +507,24 @@
       const ab = await api.runExperiment(proposal.id);
       experiments = [ab, ...experiments];
       experimentNotice = `A/B-прогон «${proposal.title}»: решение ${ab.decision === 'promote' ? 'продвигать' : 'не продвигать'}`;
-    } catch {
-      experimentFailure = 'A/B-прогон не выполнен. Проверьте соединение и повторите прогон.';
+    } catch (reason) {
+      const failureKind = classify(reason);
+      experimentFailure =
+        failureKind.kind === 'denied'
+          ? EXPERT_GATE
+          : failureKind.kind === 'conflict'
+            ? 'Прогон не выполнен: предложение изменилось, обновите лист.'
+            : 'A/B-прогон не выполнен. Проверьте соединение и повторите прогон.';
     } finally {
       runningId = '';
     }
   }
 
   // Цепочка версий утверждения: все версии с тем, кто проверял и чем заменено.
-  async function loadHistory(claimId: string, afterCorrection = false): Promise<void> {
+  // Формулировка утверждения идёт рядом с id: шторка называет предмет по-русски.
+  async function loadHistory(claimId: string, claimText = '', afterCorrection = false): Promise<void> {
     historyClaim = claimId;
+    historyClaimText = claimText;
     history = null;
     historyFailure = '';
     historyBusy = true;
@@ -537,6 +574,9 @@
     phase = 'loading';
     failure = null;
     runsFailure = '';
+    experimentsFailure = '';
+    corpusFailure = '';
+    ledgerLoaded = false;
     softFailure = '';
     const [proposalsResult, findingsResult, runsResult, experimentsResult] = await Promise.allSettled([
       api.proposals(),
@@ -550,10 +590,25 @@
       return;
     }
     proposals = proposalsResult.value;
-    experiments = experimentsResult.status === 'fulfilled' ? experimentsResult.value : [];
-    corpus = findingsResult.status === 'fulfilled' ? findingsResult.value : [];
+    // Сбой чтения не равен пустому журналу: пустота у каждого своя объяснённая,
+    // а сбой — отдельной строкой у своей секции.
+    if (experimentsResult.status === 'fulfilled') {
+      experiments = experimentsResult.value;
+      experimentsFailure = '';
+    } else {
+      experiments = [];
+      experimentsFailure = 'Не удалось прочитать результаты A/B-прогонов. Обновите лист ещё раз.';
+    }
+    if (findingsResult.status === 'fulfilled') {
+      corpus = findingsResult.value;
+      corpusFailure = '';
+    } else {
+      corpus = [];
+      corpusFailure = 'Не удалось прочитать указатель находок. Обновите лист ещё раз.';
+    }
     if (runsResult.status === 'fulfilled') runs = runsResult.value;
     else runsFailure = 'Не удалось прочитать журнал прогонов. Обновите лист ещё раз.';
+    ledgerLoaded = true;
     phase = 'ready';
   }
 
@@ -587,12 +642,25 @@
       eyebrow="Проверка решений · верстак"
       title="Отзыв, правка и разбор предложений"
       lead="Отзыв привязывается к конкретному ответу системы, правка — к утверждению с доказательством. Модель лишь формулирует предложение эволюции: решение о применении принимает эксперт — сначала A/B-прогон, затем «Принять».">
-      {#if phase === 'ready'}
+      {#if phase === 'ready' && ledgerLoaded}
         <p class="micro muted work__counts">
           предложений <span class="num">{proposals.length}</span> · ожидают решения
-          <span class="num">{openCount}</span> · прогонов
-          <span class="num">{runs.length}</span> · A/B <span class="num">{experiments.length}</span>
+          <span class="num">{openCount}</span>
+          {#if canEvaluate}
+            · прогонов <span class="num">{runs.length}</span>
+          {/if}
+          · A/B <span class="num">{experiments.length}</span>
         </p>
+        {#if canEvaluate && runs.length >= 200}
+          <p class="micro muted work__counts">
+            прогоны: показаны последние <span class="num">{num(runs.length)}</span> записей журнала
+          </p>
+        {/if}
+        {#if experiments.length >= 50}
+          <p class="micro muted work__counts">
+            A/B: показаны последние <span class="num">{num(experiments.length)}</span> записей журнала
+          </p>
+        {/if}
       {/if}
     </SectionHead>
 
@@ -612,6 +680,14 @@
         <p class="micro muted">
           Предложения эволюции, результаты A/B-прогонов, журнал прогонов оценки и указатель находок.
         </p>
+        <!-- Выход из подвешенного листа: если сессия не ответила, чтение может
+             не начаться вовсе — выход здесь, а не вечный «считываем». -->
+        <div class="row work__actions">
+          <p class="micro muted">Если показания не появляются — проверьте соединение.</p>
+          <Button variant="quiet" size="sm" onclick={() => void session.refresh()}>
+            Проверить соединение
+          </Button>
+        </div>
       </div>
     {:else if phase === 'failed'}
       <Notice tone={failure?.kind === 'denied' ? 'warn' : 'error'} title="Лист не собран">
@@ -666,9 +742,10 @@
                 placeholder="напр. какие пределы по сухому остатку для шахтной воды"
                 bind:value={questionDraft}
                 onenter={() => void askQuestion()}
+                error={questionError}
                 hint="Тот же запрос, что и в рабочем пространстве."
               />
-              <Button type="submit" variant="action" busy={asking} disabled={questionDraft.trim().length < 3}>
+              <Button type="submit" variant="action" busy={asking}>
                 {asking ? 'Прогон запроса…' : 'Спросить'}
               </Button>
             </form>
@@ -679,7 +756,7 @@
                 <p class="small target__provenance">
                   {target.provenance}
                   {#if target.createdAt}
-                    · <time class="num" datetime={target.createdAt}>{ruDate(target.createdAt)}</time>
+                    · <time class="num" datetime={target.createdAt}>{dateTime(target.createdAt)}</time>
                   {/if}
                 </p>
                 {#if target.summary}<p class="small target__summary">{target.summary}</p>{/if}
@@ -707,7 +784,7 @@
                         <span class="micro num">{claim.version}</span>
                         <span class="small grow">{claim.statement}</span>
                         <StatusPill status={claim.status} label={STATUS_SHORT[claim.status]} />
-                        <Button variant="ghost" size="sm" icon="clock" onclick={() => void loadHistory(claim.id)}>
+                        <Button variant="ghost" size="sm" icon="clock" onclick={() => void loadHistory(claim.id, claim.statement)}>
                           версии
                         </Button>
                       </div>
@@ -756,7 +833,7 @@
                     </p>
                     {#each runs.slice(0, runsShown) as run (run.id)}
                       <div class="run">
-                        <time class="micro muted" datetime={run.created_at}>{ruDate(run.created_at)}</time>
+                        <time class="micro muted" datetime={run.created_at}>{dateTime(run.created_at)}</time>
                         <span class="micro">цитаты <span class="num">{pct(run.metrics.citation_coverage)}</span></span>
                         <span class="micro">без поддержки <span class="num">{pct(run.metrics.unsupported_claim_ratio)}</span></span>
                         <span class="micro">итог <span class="num">{num(run.metrics.overall)}</span></span>
@@ -844,7 +921,7 @@
                         variant="quiet"
                         size="sm"
                         icon="clock"
-                        onclick={() => void loadHistory(lastCorrected, true)}>
+                        onclick={() => void loadHistory(lastCorrected, lastCorrectedStatement, true)}>
                         Цепочка версий
                       </Button>
                     </span>
@@ -914,7 +991,26 @@
                       placeholder="по формулировке или субъекту"
                       bind:value={findingQuery}
                     />
-                    {#if candidates.length === 0}
+                    {#if corpusFailure}
+                      <Notice tone="error" title="Указатель находок не прочитан">{corpusFailure}</Notice>
+                    {:else if poolEmpty}
+                      <!-- Пустой пул и пустой поиск — разные состояния: первый
+                           лечится чтением листа и пополнением корпуса. -->
+                      <Empty
+                        icon="list"
+                        title="Утверждений для замены пока нет"
+                        body="Здесь появятся утверждения: обновите лист, когда корпус пополнен, или загрузите документ в указателе находок."
+                      >
+                        {#snippet action()}
+                          <div class="row">
+                            <Button variant="quiet" size="sm" icon="refresh" onclick={() => void reloadLedgers()}>
+                              Обновить лист
+                            </Button>
+                            <Button href="/findings" variant="ghost" size="sm">Пополнить корпус</Button>
+                          </div>
+                        {/snippet}
+                      </Empty>
+                    {:else if candidates.length === 0}
                       <p class="micro muted">Совпадений нет — уточните поиск по формулировке.</p>
                     {:else}
                       <div class="picks__list">
@@ -942,7 +1038,7 @@
                               size="sm"
                               icon="clock"
                               title="Цепочка версий этого утверждения"
-                              onclick={() => void loadHistory(finding.id)}>
+                              onclick={() => void loadHistory(finding.id, finding.statement)}>
                               версии
                             </Button>
                             <p class="pick__locs">
@@ -1079,6 +1175,11 @@
             </Notice>
           </div>
         {/if}
+        {#if experimentsFailure}
+          <div class="work__note">
+            <Notice tone="error" title="Результаты A/B-прогонов не прочитаны">{experimentsFailure}</Notice>
+          </div>
+        {/if}
 
         {#if proposals.length === 0}
           <Empty
@@ -1108,7 +1209,7 @@
                     <StatusPill status={PROPOSAL_TONE[proposal.status]} label={PROPOSAL_STATUS[proposal.status]} />
                     <p class="micro muted row-card__src">
                       {#if proposal.created_at}
-                        <time datetime={proposal.created_at}>{ruDate(proposal.created_at)}</time> ·
+                        <time datetime={proposal.created_at}>{dateTime(proposal.created_at)}</time> ·
                       {/if}
                       {#if proposal.source_query_id === NIL_QUERY_ID}
                         без привязки к ответу
@@ -1196,7 +1297,7 @@
                         </p>
                       {/if}
                     </div>
-                  {:else if measurable}
+                  {:else if measurable && !experimentsFailure}
                     <p class="micro ab__none">
                       Прогона нет: без измеренной пары решение не принимается. Сначала A/B-прогон на
                       эталонных кейсах.
@@ -1325,9 +1426,16 @@
     title="Цепочка версий утверждения"
     description="Все версии утверждения: чем заменены и кто проверял."
     onclose={closeHistory}>
-    <!-- Предмет шторки виден до ответа сервера: по id находки цепочку сверяют
-         с «Находками», и при отказе истории называть её нечем. -->
-    <p class="micro muted">Утверждение <span class="hist__id">{historyClaim}</span></p>
+    <!-- Предмет шторки виден до ответа сервера: формулировка — имя утверждения,
+         id — подпись, по которой цепочку сверяют с «Находками». -->
+    <p class="micro muted">
+      {#if historyClaimText}
+        {historyClaimText}
+        <span class="tech">{historyClaim}</span>
+      {:else}
+        Утверждение <span class="tech">{historyClaim}</span>
+      {/if}
+    </p>
     {#if historyBusy}
       <div class="row hist__busy"><span class="spinner spinner--quiet"></span> читаем версии…</div>
     {:else if historyFailure}
@@ -1349,7 +1457,7 @@
             <p class="micro muted hist__meta">
               {#if version.reviewer_id}{reviewerOf(version.reviewer_id)}{/if}
               {#if version.review_date}
-                · <time datetime={version.review_date}>{ruDate(version.review_date)}</time>
+                · <time datetime={version.review_date}>{dateTime(version.review_date)}</time>
               {/if}
               {#if version.review_reason}· {version.review_reason}{/if}
               {#if version.superseded_by}
@@ -1452,7 +1560,6 @@
   }
 
   .target__label {
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
@@ -1643,7 +1750,6 @@
   }
 
   .row-card__kind {
-    font-family: var(--font-data);
     font-size: var(--t-small);
     font-weight: 600;
     color: var(--ink);
@@ -1686,7 +1792,6 @@
     display: flex;
     gap: var(--s2);
     flex-wrap: wrap;
-    font-family: var(--font-data);
     color: var(--ink-2);
   }
 
@@ -1708,7 +1813,6 @@
   }
 
   .ab__label {
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
@@ -1722,7 +1826,6 @@
   }
 
   .ab__who {
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
@@ -1795,7 +1898,7 @@
     flex-wrap: wrap;
   }
 
-  @media (max-width: 820px) {
+  @media (max-width: 900px) {
     .ask {
       grid-template-columns: minmax(0, 1fr);
     }
@@ -1805,7 +1908,7 @@
     }
 
     .ab__line {
-      grid-template-columns: 58px minmax(0, 1fr) 60px;
+      grid-template-columns: auto minmax(0, 1fr) auto;
     }
   }
 </style>

@@ -12,7 +12,7 @@
     tone?: 'default' | 'sunk' | 'sage' | 'lav' | 'coral' | 'ink';
     flush?: boolean;
     raised?: boolean;
-    tag?: 'section' | 'div' | 'article' | 'aside' | 'li';
+    tag?: 'section' | 'div' | 'article' | 'aside' | 'li' | 'form';
     class?: string;
     children?: Snippet;
   } = $props();

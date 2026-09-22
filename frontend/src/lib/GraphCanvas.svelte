@@ -1,7 +1,11 @@
 <script module lang="ts">
   // Словарь карты — единственный на компонент и на страницу-инспектор:
   // маршрут импортирует translate-функции отсюда и не заводит своё зеркало.
-  import type { GraphNode } from './types';
+  // Переводы связей и классов данных берутся из общих словарей $lib/terms и
+  // $lib/types; связи, которых в terms нет, читаются фолбэком «связь» рядом
+  // с техническим кодом ребра.
+  import { RELATION_LABELS } from './terms';
+  import { DATA_CLASS_LABELS, type DataClass, type GraphNode } from './types';
 
   export const TYPE_ORDER: string[] = [
     'material', 'process', 'equipment', 'condition', 'claim', 'experiment',
@@ -15,22 +19,9 @@
     organization: 'Организация', chunk: 'Фрагмент',
   };
 
-  // relation — технический код ребра; человекочитаемый перевод рядом, код остаётся
-  export const RELATION_LABELS: Record<string, string> = {
-    CONTAINS: 'содержит', TREATED_BY: 'обрабатывается методом',
-    PRODUCES: 'даёт результат', REQUIRES: 'требует', EXPERT_IN: 'экспертиза по',
-    ASSERTS: 'утверждает о', SUPPORTED_BY: 'подтверждён документом',
-    SUPERSEDES: 'заменяет', MENTIONS: 'упоминает', DERIVED_FROM: 'получен из',
-    MEASURED_BY: 'измерено', APPLIES_TO: 'применимо к', LOCATED_IN: 'находится в',
-    RUN_BY: 'выполнено',
-  };
-
   // Класс данных узла приходит из контракта GraphNode (`data_class`): он метит
-  // права, а не степень консенсуса источников.
-  export const CLASS_RU: Record<string, string> = {
-    public: 'публичный', internal: 'внутренний', restricted: 'закрытый',
-  };
-
+  // права, а не степень консенсуса источников; русские имена — DATA_CLASS_LABELS
+  // из $lib/types.
   // Легенда классов данных читается теми же StatusPill, что и находки:
   // публичный согласуется, внутренний — гипотеза, закрытый — оспаривается.
   export const CLASS_PILL: Record<string, 'consensus' | 'hypothesis' | 'disputed'> = {
@@ -47,7 +38,7 @@
 
   export function classOf(node: GraphNode): { code: string; ru: string; pill: 'consensus' | 'hypothesis' | 'disputed' } {
     const code = node.data_class;
-    return { code, ru: CLASS_RU[code] ?? code, pill: CLASS_PILL[code] ?? 'consensus' };
+    return { code, ru: DATA_CLASS_LABELS[code] ?? code, pill: CLASS_PILL[code] ?? 'consensus' };
   }
 
   // Тип узла задаёт тон диска; группа тонов — коралл / шалфей / лаванда.
@@ -192,7 +183,7 @@
     const extra = [...counts.keys()].filter((code) => !order.includes(code)).sort();
     return [...known, ...extra].map((code) => ({
       code,
-      ru: CLASS_RU[code] ?? code,
+      ru: DATA_CLASS_LABELS[code as DataClass] ?? code,
       pill: CLASS_PILL[code] ?? 'consensus',
       count: counts.get(code) ?? 0,
     }));
@@ -344,9 +335,13 @@
   }
 
   // ── Выбор, фильтрация, масштаб ──────────────────────────────────────────
-  function select(node: GraphNode | null): void {
+  // fromField — выбор начат на самом поле (клик или клавиатура по диску):
+  // только он переносит фокус в узел; выбор из текстового списка и инспектора
+  // фокус не отнимает — узел им показывает эффект скроллом поля.
+  function select(node: GraphNode | null, fromField = false): void {
     onselect?.(node);
     if (node) {
+      if (fromField) focusNode(node.id);
       const links = degree.get(node.id) ?? 0;
       announcement =
         `Выбран узел «${node.label}», ${typeLabel(node.type)}, уверенность ${fmt(node.confidence)}. ` +
@@ -357,9 +352,13 @@
     }
   }
 
-  function focusNode(id: string): void {
+  function nodeElement(id: string): HTMLElement | null {
     const escaped = id.replace(/["\\]/g, '\\$&');
-    fieldEl?.querySelector<HTMLElement>(`[data-node-id="${escaped}"]`)?.focus();
+    return fieldEl?.querySelector<HTMLElement>(`[data-node-id="${escaped}"]`) ?? null;
+  }
+
+  function focusNode(id: string): void {
+    nodeElement(id)?.focus();
   }
 
   /** Стрелки уводят к ближайшему узлу в направлении: проекция + штраф за снос. */
@@ -495,9 +494,10 @@
   let helpOpen = $state(false);
 
   $effect(() => {
-    // Выбранный узел может лежать вне видимой части поля — доводим фокус,
-    // и скролл сам выносит его в кадр.
-    if (selectedId) focusNode(selectedId);
+    // Выбранный узел может лежать вне видимой части поля — доводим его в кадр
+    // скроллом. Фокус переносит только выбор с самого поля (select с fromField):
+    // из списка и инспектора узел показывается без захвата фокуса.
+    if (selectedId) nodeElement(selectedId)?.scrollIntoView({ block: 'nearest' });
   });
 </script>
 
@@ -638,9 +638,9 @@
                   !neighbourIds.has(item.node.id)}
                 data-node-id={item.node.id}
                 aria-pressed={selectedId === item.node.id}
-                aria-label="{typeLabel(item.node.type)}: {item.node.label}. Уверенность {fmt(item.node.confidence)}, связей {item.links}, класс данных {classOf(item.node).ru}."
+                aria-label="{typeLabel(item.node.type)}: {item.node.label}. Уверенность {fmt(item.node.confidence)}, связей {item.links}, класс данных {classOf(item.node).ru} ({item.node.data_class})."
                 style="left: {item.cx}px; top: {item.cy}px; --map-disc: {item.r * 2}px"
-                onclick={() => select(item.node)}
+                onclick={() => select(item.node, true)}
                 onkeydown={(event: KeyboardEvent) => onNodeKeydown(event, item)}
                 onfocus={() => (focusedId = item.node.id)}
                 onblur={() => (focusedId = null)}
@@ -654,7 +654,7 @@
                   aria-hidden="true"
                 >{item.node.label}</span>
                 {#if item.node.data_class !== 'public'}
-                  <span class="map-node__class num" aria-hidden="true">{item.node.data_class}</span>
+                  <span class="map-node__class micro" aria-hidden="true">{DATA_CLASS_LABELS[item.node.data_class] ?? ''}</span>
                 {/if}
               </button>
             {/each}
@@ -709,7 +709,7 @@
               {#each classKey as item (item.code)}
                 <span class="map__class-item">
                   <StatusPill status={item.pill} label={item.ru} />
-                  <code class="num">{item.code}</code>
+                  <code class="tech">{item.code}</code>
                   <span class="num">{item.count}</span>
                 </span>
               {/each}
@@ -774,7 +774,7 @@
                     {labelOf(edge.source)}
                   </button>
                   <span class="micro muted map__edge-rel">
-                    {relationLabel(edge.relation)} <code>{edge.relation}</code>
+                    {relationLabel(edge.relation)} <code class="tech">{edge.relation}</code>
                   </span>
                   <button type="button" class="map__list-target" onclick={() => select(nodeById.get(edge.target) ?? null)}>
                     {labelOf(edge.target)}
@@ -978,8 +978,10 @@
     transition: opacity var(--dur-fast) var(--ease-soft), stroke var(--dur-fast) var(--ease-soft);
   }
 
+  /* Подсветка выбранных связей — нейтральные чернила: это выделение чтения,
+     а не статус действия, поэтому коралл здесь не участвует. */
   .map__edge--on {
-    stroke: var(--action-deep);
+    stroke: var(--ink-3);
     stroke-width: 2px;
     opacity: 1;
   }
@@ -995,7 +997,7 @@
   }
 
   .map__mark--on {
-    fill: var(--action-deep);
+    fill: var(--ink-3);
     opacity: 1;
   }
 
@@ -1073,7 +1075,7 @@
   }
 
   .map-node__conf {
-    font-size: 10px;
+    font-size: var(--t-micro);
     line-height: 1;
     color: var(--ink-2);
     opacity: 0;
@@ -1110,7 +1112,7 @@
 
   .map-node__label {
     font-family: var(--font-ui);
-    font-size: 12px;
+    font-size: var(--t-micro);
     line-height: 1.28;
     color: var(--ink);
     display: -webkit-box;
@@ -1128,7 +1130,7 @@
   }
 
   .map-node__class {
-    font-size: 10px;
+    font-size: var(--t-micro);
     color: var(--ink-3);
   }
 
@@ -1204,11 +1206,6 @@
     color: var(--ink-3);
   }
 
-  .map__class-item code {
-    font-family: var(--font-data);
-    color: var(--ink-2);
-  }
-
   .map__text {
     display: grid;
     gap: var(--s4);
@@ -1279,11 +1276,6 @@
     align-items: baseline;
     gap: var(--s2);
     flex-wrap: wrap;
-  }
-
-  .map__edge-rel code {
-    font-family: var(--font-data);
-    color: var(--ink-3);
   }
 
   /* Мобильная композиция поля: строка фильтров идёт текучей полосой, а не

@@ -6,7 +6,8 @@
    * подтверждённой сессии (`session.can`), а не из выбора на клиенте.
    */
   import { tick } from 'svelte';
-  import { countOf, num, plural } from '$lib/format';
+  import { page } from '$app/state';
+  import { countOf, duration, num, plural } from '$lib/format';
   import { bandOf, groupIntervals } from '$lib/rail';
   import { scrollRegion } from '$lib/scroll-region';
   import { session } from '$lib/sessionStore.svelte';
@@ -37,6 +38,7 @@
   import Notice from '$lib/ui/Notice.svelte';
   import Panel from '$lib/ui/Panel.svelte';
   import PromptInput from '$lib/ui/PromptInput.svelte';
+  import Sheet from '$lib/ui/Sheet.svelte';
   import StatusPill from '$lib/ui/StatusPill.svelte';
   import type {
     AgentEvent,
@@ -113,8 +115,9 @@
     focusKey: string | null;
     busy: 'correction' | 'feedback' | 'export' | 'import' | null;
     notice: SheetNotice | null;
-    // Вопрос, пришедший со входа в раздел: им лишь заполняется поле,
-    // сам проход по нему не запускается.
+    // Вопрос, пришедший со входа в раздел: подставляется в поле и сразу
+    // запускается — человек уже отправил его с входной страницы. Пока сессия
+    // не подтверждена, ждём: права на проход приходят с сервера.
     seed: string;
     onask: (question: string) => void;
     onstop: () => void;
@@ -245,6 +248,12 @@
   let trailUser = $state<boolean | null>(null);
   let scaleUser = $state<boolean | null>(null);
 
+  // Разбор тезиса — шторка (DESIGN.md называет это подписью продукта): открыта
+  // максимум для одного тезиса. Выбор тезиса (подсветка в шкале и на карточке)
+  // живёт отдельно в openClaimId, поэтому ответ прогона подсвечивает первый
+  // тезис, но шторку сам не распахивает.
+  let sheetClaimId = $state<string | null>(null);
+
   const canAsk = $derived(session.can('query:ask'));
   const canExport = $derived(session.can('export:run'));
   const canFeedback = $derived(session.can('feedback:give'));
@@ -255,6 +264,11 @@
   // Ответ уже лёг в лист, а проход ещё открыт: это реальный момент, когда
   // маскот «говорит», а не выдуманное состояние.
   const answerArriving = $derived(running && answer !== null);
+  // Тезис, чей разбор открыт в шторке: ищется в текущем ответе, поэтому новый
+  // прогон закрывает шторку сам — прежнего тезиса в листе больше нет.
+  const sheetFinding = $derived(
+    answer?.findings.find((finding) => finding.id === sheetClaimId) ?? null,
+  );
 
   // Вопрос со входа в раздел подставляется в поле один раз и сразу запускается:
   // человек уже отправил его с входной страницы, повторять нажатие не нужно.
@@ -265,6 +279,9 @@
     draft = value;
     if (!canAsk) return;
     seeded = true;
+    // Поле очищается, как при обычном ask(): вопрос уходит в проход,
+    // а не остаётся набранным текстом.
+    draft = '';
     queueMicrotask(() => onask(value.trim()));
   });
 
@@ -275,8 +292,11 @@
 
   // Узкий экран — одна вертикальная композиция: шкала и след убираются в
   // раскрытия. $effect.pre, чтобы не мелькать развёрнутым списком на мобильном.
+  // 900px — контрактная точка компоновки из DESIGN.md (диапазон 640–900 —
+  // планшет): JS-переключатель обязан совпадать с media-правилами стилей ниже,
+  // иначе шкала свёрнута, а её сетка ещё двухколоночная.
   $effect.pre(() => {
-    const query = window.matchMedia('(max-width: 1119px)');
+    const query = window.matchMedia('(max-width: 900px)');
     const sync = () => {
       narrow = query.matches;
     };
@@ -322,10 +342,9 @@
   );
 
   // ── Форматирование ──────────────────────────────────────────────────────
-
-  function seconds(ms: number): string {
-    return `${(ms / 1000).toFixed(1)} с`;
-  }
+  // Длительности — общий `duration` из `$lib/format`, как на остальных экранах:
+  // до минуты — десятые доли секунды, дальше — минуты, иначе отсчёт листа
+  // расходился бы с «Проверкой решений» и журналом.
 
   function shortCode(value: string | null | undefined, size = 8): string {
     if (!value) return '—';
@@ -449,7 +468,7 @@
 
   function stepNote(step: TrailStep): string {
     if (step.duration_ms == null) return 'нет данных';
-    return step.duration_ms > 0 ? seconds(step.duration_ms) : '—';
+    return step.duration_ms > 0 ? duration(step.duration_ms) : '—';
   }
 
   function signOf(operator: string): string {
@@ -458,6 +477,9 @@
   }
 
   function labelOf(operator: string): string {
+    // «range» — синоним «between» из плана, но ключа в словаре у него нет:
+    // сырым английским словом он бы и остался.
+    if (operator === 'range') return OPERATOR_WORD.between;
     return OPERATOR_WORD[operator as NumericObservation['operator']] ?? operator;
   }
 
@@ -492,10 +514,12 @@
     max_value?: number;
     unit: string;
   }): string {
+    // Поля фильтра опциональны: отсутствующее значение — «—», а не фиктивный
+    // ноль, который выглядел бы настоящим пределом плана.
     if (filter.operator === 'between' || filter.operator === 'range') {
-      return `${num(filter.min_value ?? 0)}–${num(filter.max_value ?? 0)} ${filter.unit}`;
+      return `${num(filter.min_value)}–${num(filter.max_value)} ${filter.unit}`;
     }
-    return `${signOf(filter.operator)} ${num(filter.value ?? 0)} ${filter.unit}`;
+    return `${signOf(filter.operator)} ${num(filter.value)} ${filter.unit}`;
   }
 
   // Источник тезиса: название документа, а не идентификатор записи — UUID сам
@@ -570,14 +594,19 @@
 
   type Filter = AnswerPayload['query_plan']['numeric_filters'][number];
 
-  function filterRange(filter: Filter): [number, number] {
+  // Пределы фильтра для шкалы и покрытия. Частично заданный диапазон интервала
+  // не образует, а точка без значения — не ноль: такой фильтр предела не даёт
+  // вовсе, и выдумывать за планом его нечего.
+  function filterRange(filter: Filter): [number, number] | null {
     if (filter.operator === 'between' || filter.operator === 'range') {
-      return [filter.min_value ?? 0, filter.max_value ?? 0];
+      return filter.min_value != null && filter.max_value != null
+        ? [filter.min_value, filter.max_value]
+        : null;
     }
-    if (filter.operator === 'lte' || filter.operator === 'lt') return [-Infinity, filter.value ?? 0];
-    if (filter.operator === 'gte' || filter.operator === 'gt') return [filter.value ?? 0, Infinity];
-    const point = filter.value ?? 0;
-    return [point, point];
+    if (filter.value == null) return null;
+    if (filter.operator === 'lte' || filter.operator === 'lt') return [-Infinity, filter.value];
+    if (filter.operator === 'gte' || filter.operator === 'gt') return [filter.value, Infinity];
+    return [filter.value, filter.value];
   }
 
   function measureOf(finding: Finding, observation: NumericObservation, index: number): Measure {
@@ -710,20 +739,33 @@
     return finding.observations.map(describeValue).join(' · ');
   }
 
+  // Фильтр вовсе без значений не показывает строку в условиях: «равно —» или
+  // «в диапазоне —–—» условия не задают. Без вычислимых пределов нет и покрытия —
+  // вместо счётчика честно стоит «—».
   const filterRows = $derived(
-    (answer?.query_plan.numeric_filters ?? []).map((filter) => {
-      const [lo, hi] = filterRange(filter);
-      const covered = (answer?.findings ?? [])
-        .flatMap((finding) => finding.observations)
-        .filter((observation) => {
-          const range = envelope(observation);
-          if (!range || observation.property_name.toLowerCase() !== filter.property_name.toLowerCase()) {
-            return false;
-          }
-          return range[1] >= lo && range[0] <= hi;
-        }).length;
-      return { filter, covered };
-    }),
+    (answer?.query_plan.numeric_filters ?? [])
+      .filter(
+        (filter) =>
+          filter.value != null || filter.min_value != null || filter.max_value != null,
+      )
+      .map((filter) => {
+        const range = filterRange(filter);
+        const covered = range
+          ? (answer?.findings ?? [])
+              .flatMap((finding) => finding.observations)
+              .filter((observation) => {
+                const bounds = envelope(observation);
+                if (
+                  !bounds ||
+                  observation.property_name.toLowerCase() !== filter.property_name.toLowerCase()
+                ) {
+                  return false;
+                }
+                return bounds[1] >= range[0] && bounds[0] <= range[1];
+              }).length
+          : null;
+        return { filter, covered };
+      }),
   );
 
   // ── Что показывать внутри стадии: только реальные поля ответа прогона ─────
@@ -837,9 +879,22 @@
     onask(trimmed);
   }
 
-  function toggleClaim(id: string): void {
+  // Открытие разбора: тезис остаётся выбранным (подсветка шкалы и карточки),
+  // а полный разбор с цитатами, локаторами и историей уходит в шторку.
+  function openClaim(id: string): void {
     onfocus(null);
-    onselect(openClaimId === id ? null : id);
+    onselect(id);
+    sheetClaimId = id;
+  }
+
+  function closeClaim(): void {
+    // Esc закрывает и шторку, и раскрытую цитату сразу: сначала сворачиваем
+    // цитату, иначе одно нажатие отнимает весь разбор.
+    if (focusKey) {
+      onfocus(null);
+      return;
+    }
+    sheetClaimId = null;
   }
 
   function toggleEvidence(key: string): void {
@@ -1040,7 +1095,11 @@
                 Повторить проход
               </Button>
               {#if error.login}
-                <a class="small" href="/login">Войти заново</a>
+                <!-- По гайдлайну 401 вход возвращает на текущий лист, а не на
+                     страницу по умолчанию: вопрос здесь остался нетронутым. -->
+                <a class="small" href={`/login?next=${encodeURIComponent(page.url.pathname)}`}
+                  >Войти заново</a
+                >
               {/if}
             </div>
           {/if}
@@ -1082,17 +1141,21 @@
               </p>
             </div>
             <div class="trail__meter">
-              <span class="trail__elapsed">{seconds(elapsedMs)}</span>
+              <span class="trail__elapsed">{duration(elapsedMs)}</span>
               <!-- Живая область вне сворачиваемого тела: объявление доходит и
-                   тогда, когда след закрыт (так он закрыт по умолчанию). -->
+                   тогда, когда след закрыт (так он закрыт по умолчанию).
+                   Внутри — только счётчик шагов: тикающие каждую секунду
+                   сотые доли объявляли бы себя каждые 100 мс. -->
               <p class="micro trail__count" role="status" aria-live="polite" aria-atomic="true">
-                {#if running}
-                  получено {countOf(trailSteps.length, 'шаг', 'шага', 'шагов')} · идёт {seconds(elapsedMs)}
-                {:else}
-                  получено {countOf(trailSteps.length, 'шаг', 'шага', 'шагов')} · проход занял
-                  {seconds(elapsedMs)}
+                получено {countOf(trailSteps.length, 'шаг', 'шага', 'шагов')}{#if !running}
+                  · проход занял {duration(elapsedMs)}
                 {/if}
               </p>
+              {#if running}
+                <!-- Слово «идёт» держит признак живого отсчёта: сами сотые доли
+                     читают глазами, и две строки с одним числом не нужны. -->
+                <span class="micro trail__tick">идёт…</span>
+              {/if}
               <Button
                 variant="quiet"
                 size="sm"
@@ -1226,8 +1289,12 @@
                                   </td>
                                   <td class="num">{filterText(row.filter)}</td>
                                   <td class="num">
-                                    {row.covered}
-                                    {plural(row.covered, 'наблюдение', 'наблюдения', 'наблюдений')}
+                                    {#if row.covered != null}
+                                      {row.covered}
+                                      {plural(row.covered, 'наблюдение', 'наблюдения', 'наблюдений')}
+                                    {:else}
+                                      —
+                                    {/if}
                                   </td>
                                 </tr>
                               {/each}
@@ -1312,7 +1379,7 @@
           <div class="paper__bar">
             <dl class="kv paper__kv">
               <dt>затрачено</dt>
-              <dd class="num">{seconds(elapsedMs)}</dd>
+              <dd class="num">{duration(elapsedMs)}</dd>
               <dt>утверждений · ссылок</dt>
               <dd class="num">{payload.findings.length} · {evidenceTotal}</dd>
               <dt>расхождений · пробелов</dt>
@@ -1501,13 +1568,12 @@
 
             <div class="theses">
               {#each payload.findings as finding (finding.id)}
-                {@const open = finding.id === openClaimId}
-                {@const rivals = rivalsOf(finding)}
+                {@const selected = finding.id === openClaimId}
                 <!-- subject/predicate объявляются на уровне перебора: {@const}
                      внутри <div> компилятор Svelte не принимает. -->
                 {@const subject = subjectTerm(finding)}
                 {@const predicate = predicateTerm(finding)}
-                <article class="thesis" class:thesis--open={open} data-claim={finding.id}>
+                <article class="thesis" class:thesis--selected={selected} data-claim={finding.id}>
                   <div class="thesis__head">
                     <div class="thesis__marks">
                       <StatusPill status={finding.status} label={STATUS_PHRASE[finding.status]} />
@@ -1542,299 +1608,22 @@
                       variant="quiet"
                       size="sm"
                       class="thesis__toggle"
-                      expanded={open}
-                      controls={`trace-${finding.id}`}
-                      onclick={() => toggleClaim(finding.id)}
+                      onclick={() => openClaim(finding.id)}
                     >
-                      {open ? 'Свернуть разбор' : 'Открыть разбор'}
+                      Открыть разбор
                     </Button>
                   </div>
 
-                  <div id={`trace-${finding.id}`}>
-                    {#if !open}
-                      <p class="micro thesis__closed">
-                        {valueSummary(finding)} ·
-                        {countOf(finding.evidence.length, 'доказательство', 'доказательства', 'доказательств')} —
-                        откройте тезис, чтобы прочитать цитаты и локаторы
-                      </p>
-                    {:else}
-                      {#if finding.observations.length}
-                        <div class="measures">
-                          <p class="micro measures__label">
-                            числовые наблюдения · нормализация и положение относительно условия вопроса
-                          </p>
-                          {#each measuresOf(finding) as measure (measure.key)}
-                            <div class="measure">
-                              <div class="measure__top">
-                                <span class="micro">
-                                  {measure.property}
-                                  {#if measure.propertyCode}<code class="code tech">{measure.propertyCode}</code>{/if}
-                                  · {measure.operatorLabel}
-                                </span>
-                                <span class="measure__value num">{measure.valueText} {measure.unit}</span>
-                              </div>
-                              <div class="bar measure__track">
-                                <span
-                                  class="bar__fill {bandClass(finding.status)}"
-                                  data-status={finding.status}
-                                  style="left: {measure.left}%; width: {measure.width}%;"
-                                ></span>
-                                {#each measure.limits as limit, position (position)}
-                                  <span class="measure__limit" style="left: {limit.at}%"></span>
-                                {/each}
-                              </div>
-                              <p class="micro measure__scale">
-                                шкала <span class="num">{measure.scaleFrom}–{measure.scaleTo} {measure.normalizedUnit}</span>
-                                · норм. <span class="num">{measure.normalizedText} {measure.normalizedUnit}</span>
-                              </p>
-                              {#if measure.limits.length}
-                                <p class="micro measure__limits">
-                                  {#each measure.limits as limit, position (position)}
-                                    <span class="tag num">{limit.label}</span>
-                                  {/each}
-                                </p>
-                              {/if}
-                              <p class="micro">в источнике: «{measure.raw}»</p>
-                              {#if measure.filterNote}
-                                <p class="micro measure__filter" class:outside={measure.outsideFilter}>
-                                  {measure.filterNote}{#if measure.outsideFilter} · наблюдение вне фильтра{/if}
-                                </p>
-                              {/if}
-                            </div>
-                          {/each}
-                        </div>
-                      {:else}
-                        <p class="thesis__bare">
-                          числовых наблюдений нет — тезис держится только на цитате
-                        </p>
-                      {/if}
-
-                      {#if rivals.length}
-                        <div class="rivals">
-                          <p class="micro rivals__label">
-                            расхождение на одном интервале · {subjectTerm(finding).label} ›
-                            {predicateTerm(finding).label}
-                          </p>
-                          <div class="rivals__row" data-self>
-                            <span class="small">{sourceOf(finding)} · этот тезис</span>
-                            <span class="num">{valueSummary(finding)}</span>
-                          </div>
-                          {#each rivals as rival (rival.finding.id)}
-                            <div class="rivals__row">
-                              <span class="small">{sourceOf(rival.finding)}</span>
-                              <span class="num">{valueSummary(rival.finding)}</span>
-                            </div>
-                            <p class="micro">
-                              нормализованные границы не пересекаются на
-                              <b class="num">{num(rival.delta)}</b>
-                              {finding.observations[0]?.normalized_unit ?? ''}
-                            </p>
-                          {/each}
-                          <p class="micro">
-                            Полный разбор — в разделе «Расхождения»; там видно, какая пара попала в
-                            противоречие по всем условиям.
-                          </p>
-                        </div>
-                      {/if}
-
-                      <!-- Каждое доказательство раскрывается с клавиатуры -->
-                      <div class="trace">
-                        <p class="micro trace__label">
-                          доказательство ·
-                          {countOf(finding.evidence.length, 'ссылка', 'ссылки', 'ссылок')} на фрагменты
-                        </p>
-                        {#if !finding.evidence.length}
-                          <Notice tone="error" title="Тезис не трассируется">
-                            <p>
-                              Утверждение пришло без единого локатора: проверить его по
-                              первоисточнику нельзя, пока разбор не добавит доказательство.
-                            </p>
-                          </Notice>
-                        {:else}
-                          {#each finding.evidence as evidence, index (index)}
-                            {@const itemKey = keyOf(finding, index)}
-                            {@const expanded = itemKey === focusKey}
-                            <div
-                              class="evidence"
-                              class:evidence--open={expanded}
-                              data-evidence={itemKey}
-                            >
-                              <button
-                                class="evidence__head"
-                                type="button"
-                                aria-expanded={expanded}
-                                aria-controls={`body-${itemKey.replace('#', '-')}`}
-                                onclick={() => toggleEvidence(itemKey)}
-                              >
-                                <span class="evidence__src">
-                                  <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={16} />
-                                  <b>{evidence.source_title}</b>
-                                </span>
-                                <span class="locator">
-                                  {#each locParts(evidence) as part, position (part)}
-                                    {#if position > 0}<span class="locator__sep" aria-hidden="true">·</span>{/if}
-                                    <span>{part}</span>
-                                  {/each}
-                                </span>
-                                <span class="micro">{expanded ? 'скрыть цитату' : 'прочитать цитату'}</span>
-                              </button>
-                              <div
-                                class="evidence__body"
-                                id={`body-${itemKey.replace('#', '-')}`}
-                                hidden={!expanded}
-                              >
-                                <p class="quote">«{evidence.quote}»</p>
-                                <dl class="kv evidence__kv">
-                                  <dt>источник</dt>
-                                  <dd>{evidence.source_title || 'запись корпуса'}</dd>
-                                  {#if evidence.page != null}
-                                    <dt>страница</dt><dd class="num">{evidence.page}</dd>
-                                  {/if}
-                                  {#if evidence.sheet}
-                                    <dt>лист</dt><dd>{evidence.sheet}</dd>
-                                  {/if}
-                                  {#if evidence.cell_range}
-                                    <dt>ячейки</dt><dd class="num">{evidence.cell_range}</dd>
-                                  {/if}
-                                  {#if evidence.char_start != null}
-                                    <dt>смещение символов</dt>
-                                    <dd class="num">{evidence.char_start}–{evidence.char_end ?? evidence.char_start}</dd>
-                                  {/if}
-                                </dl>
-                                <p class="micro">
-                                  Esc — закрыть раскрытие; тот же фрагмент доступен в «Находках» и на
-                                  карте связей.
-                                </p>
-                              </div>
-                            </div>
-                          {/each}
-                        {/if}
-                      </div>
-
-                      {#if canSupersede}
-                        <div class="thesis__actions">
-                          {#if correctionFor === finding.id}
-                            <div class="correction">
-                              <Field
-                                label="Причина правки"
-                                name={`correction-comment-${finding.id}`}
-                                type="textarea"
-                                rows={2}
-                                placeholder="Что не так с формулировкой или числом"
-                                hint="Минимум три символа — иначе правку не принять."
-                                bind:value={correctionComment}
-                              />
-                              <Field
-                                label="Исправленное утверждение"
-                                name={`correction-text-${finding.id}`}
-                                type="textarea"
-                                rows={2}
-                                hint="Минимум три символа — текст станет новой версией утверждения."
-                                bind:value={correctionText}
-                              />
-                              <Notice tone="info" title="Правка относится к этому тезису">
-                                <p>
-                                  Она создаёт новую версию утверждения и оставляет прежнюю в истории
-                                  связей — ответ целиком не меняется.
-                                </p>
-                              </Notice>
-                              <div class="row">
-                                <Button
-                                  variant="action"
-                                  size="sm"
-                                  busy={busy === 'correction'}
-                                  disabled={busy === 'correction'
-                                    || correctionComment.trim().length < 3
-                                    || correctionText.trim().length < 3}
-                                  onclick={() => void sendCorrection(finding)}
-                                >
-                                  Заменить версию
-                                </Button>
-                                <Button variant="quiet" size="sm" onclick={() => (correctionFor = null)}>
-                                  Отмена
-                                </Button>
-                              </div>
-                            </div>
-                          {:else}
-                            <Button
-                              variant="quiet"
-                              size="sm"
-                              icon="plus"
-                              disabled={running}
-                              onclick={() => startCorrection(finding)}
-                            >
-                              Исправить это утверждение
-                            </Button>
-                          {/if}
-                        </div>
-                      {:else if canFeedback}
-                        <p class="micro thesis__note">
-                          Замена утверждения доступна при расширенном доступе. Отзыв по ответу
-                          целиком — ниже.
-                        </p>
-                      {/if}
-
-                      <!-- История версий открытого утверждения: состояние своё у
-                           каждого тезиса, отказ — тоже свой. -->
-                      {@const hist = historyState(finding.id)}
-                      <div class="history">
-                        <p class="micro history__label">история версий утверждения</p>
-                        <div class="row">
-                          <Button
-                            variant="quiet"
-                            size="sm"
-                            icon="clock"
-                            busy={hist.busy}
-                            disabled={hist.busy}
-                            onclick={() => void loadHistory(finding.id)}
-                          >
-                            {hist.busy ? 'Читаем…' : hist.data ? 'Обновить версии' : 'Запросить версии'}
-                          </Button>
-                        </div>
-                        {#if hist.error}
-                          <Notice tone="error" title="История версий не получена">
-                            <p>{hist.error}</p>
-                            <div class="row">
-                              <Button
-                                variant="quiet"
-                                size="sm"
-                                icon="refresh"
-                                onclick={() => void loadHistory(finding.id)}
-                              >
-                                Повторить запрос
-                              </Button>
-                            </div>
-                          </Notice>
-                        {:else if hist.data}
-                          {#if !hist.data.versions.length}
-                            <p class="micro">других версий у этого тезиса нет.</p>
-                          {:else}
-                            {#each hist.data.versions as version (version.finding_id + version.version)}
-                              <div class="version">
-                                <p class="small">{version.statement}</p>
-                                <p class="micro">
-                                  версия <b class="num">{version.version}</b> ·
-                                  <StatusPill
-                                    status={version.status}
-                                    label={STATUS_PHRASE[version.status]}
-                                  />
-                                  {#if version.review_date}
-                                    <time datetime={version.review_date}>{reviewDate(version.review_date)}</time>
-                                  {:else}
-                                    разбор не проводился
-                                  {/if}
-                                  {#if version.reviewer_id}
-                                    · правил <code class="code tech">{shortCode(version.reviewer_id)}</code>
-                                  {/if}
-                                </p>
-                                {#if version.review_reason}<p class="micro">{version.review_reason}</p>{/if}
-                              </div>
-                            {/each}
-                          {/if}
-                        {/if}
-                      </div>
-                    {/if}
-                  </div>
+                  <p class="micro thesis__closed">
+                    {valueSummary(finding)} ·
+                    {countOf(
+                      finding.evidence.length,
+                      'доказательство',
+                      'доказательства',
+                      'доказательств',
+                    )}
+                    — цитаты, локаторы первоисточника и версии читает разбор
+                  </p>
                 </article>
               {/each}
             </div>
@@ -1982,6 +1771,311 @@
     {/if}
   </div>
 </div>
+
+{#if sheetFinding}
+  <Sheet
+    title="Разбор утверждения"
+    description="Числовые наблюдения, цитаты с локаторами первоисточника и история версий этого тезиса."
+    width="840px"
+    onclose={closeClaim}
+  >
+    {#snippet footer()}
+      <Button variant="quiet" onclick={closeClaim}>Закрыть разбор</Button>
+    {/snippet}
+    {@render thesisTrace(sheetFinding)}
+  </Sheet>
+{/if}
+
+{#snippet thesisTrace(finding: Finding)}
+  <div class="sheet__thesis">
+    <div class="thesis__marks">
+      <StatusPill status={finding.status} label={STATUS_PHRASE[finding.status]} />
+      <span class="tag">{DATA_CLASS_LABELS[finding.data_class]}</span>
+      <span class="tag">версия <b class="num">{finding.version}</b></span>
+    </div>
+    <h3 class="h4">{finding.statement}</h3>
+    <p class="micro muted">
+      {sourceOf(finding)} · {scopeText(finding.scope)} ·
+      {countOf(finding.evidence.length, 'ссылка', 'ссылки', 'ссылок')} на фрагменты
+    </p>
+  </div>
+  {@const rivals = rivalsOf(finding)}
+  {#if finding.observations.length}
+    <div class="measures">
+      <p class="micro measures__label">
+        числовые наблюдения · нормализация и положение относительно условия вопроса
+      </p>
+      {#each measuresOf(finding) as measure (measure.key)}
+        <div class="measure">
+          <div class="measure__top">
+            <span class="micro">
+              {measure.property}
+              {#if measure.propertyCode}<code class="code tech">{measure.propertyCode}</code>{/if}
+              · {measure.operatorLabel}
+            </span>
+            <span class="measure__value num">{measure.valueText} {measure.unit}</span>
+          </div>
+          <div class="bar measure__track">
+            <span
+              class="bar__fill {bandClass(finding.status)}"
+              data-status={finding.status}
+              style="left: {measure.left}%; width: {measure.width}%;"
+            ></span>
+            {#each measure.limits as limit, position (position)}
+              <span class="measure__limit" style="left: {limit.at}%"></span>
+            {/each}
+          </div>
+          <p class="micro measure__scale">
+            шкала <span class="num">{measure.scaleFrom}–{measure.scaleTo} {measure.normalizedUnit}</span>
+            · норм. <span class="num">{measure.normalizedText} {measure.normalizedUnit}</span>
+          </p>
+          {#if measure.limits.length}
+            <p class="micro measure__limits">
+              {#each measure.limits as limit, position (position)}
+                <span class="tag num">{limit.label}</span>
+              {/each}
+            </p>
+          {/if}
+          <p class="micro">в источнике: «{measure.raw}»</p>
+          {#if measure.filterNote}
+            <p class="micro measure__filter" class:outside={measure.outsideFilter}>
+              {measure.filterNote}{#if measure.outsideFilter} · наблюдение вне фильтра{/if}
+            </p>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {:else}
+    <p class="thesis__bare">
+      числовых наблюдений нет — тезис держится только на цитате
+    </p>
+  {/if}
+
+  {#if rivals.length}
+    <div class="rivals">
+      <p class="micro rivals__label">
+        расхождение на одном интервале · {subjectTerm(finding).label} ›
+        {predicateTerm(finding).label}
+      </p>
+      <div class="rivals__row" data-self>
+        <span class="small">{sourceOf(finding)} · этот тезис</span>
+        <span class="num">{valueSummary(finding)}</span>
+      </div>
+      {#each rivals as rival (rival.finding.id)}
+        <div class="rivals__row">
+          <span class="small">{sourceOf(rival.finding)}</span>
+          <span class="num">{valueSummary(rival.finding)}</span>
+        </div>
+        <p class="micro">
+          нормализованные границы не пересекаются на
+          <b class="num">{num(rival.delta)}</b>
+          {finding.observations[0]?.normalized_unit ?? ''}
+        </p>
+      {/each}
+      <p class="micro">
+        Полный разбор — в разделе «Расхождения»; там видно, какая пара попала в
+        противоречие по всем условиям.
+      </p>
+    </div>
+  {/if}
+
+  <!-- Каждое доказательство раскрывается с клавиатуры -->
+  <div class="trace">
+    <p class="micro trace__label">
+      доказательство ·
+      {countOf(finding.evidence.length, 'ссылка', 'ссылки', 'ссылок')} на фрагменты
+    </p>
+    {#if !finding.evidence.length}
+      <Notice tone="error" title="Тезис не трассируется">
+        <p>
+          Утверждение пришло без единого локатора: проверить его по
+          первоисточнику нельзя, пока разбор не добавит доказательство.
+        </p>
+      </Notice>
+    {:else}
+      {#each finding.evidence as evidence, index (index)}
+        {@const itemKey = keyOf(finding, index)}
+        {@const expanded = itemKey === focusKey}
+        <div
+          class="evidence"
+          class:evidence--open={expanded}
+          data-evidence={itemKey}
+        >
+          <button
+            class="evidence__head"
+            type="button"
+            aria-expanded={expanded}
+            aria-controls={`body-${itemKey.replace('#', '-')}`}
+            onclick={() => toggleEvidence(itemKey)}
+          >
+            <span class="evidence__src">
+              <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={16} />
+              <b>{evidence.source_title}</b>
+            </span>
+            <span class="locator">
+              {#each locParts(evidence) as part, position (part)}
+                {#if position > 0}<span class="locator__sep" aria-hidden="true">·</span>{/if}
+                <span>{part}</span>
+              {/each}
+            </span>
+            <span class="micro">{expanded ? 'скрыть цитату' : 'прочитать цитату'}</span>
+          </button>
+          <div
+            class="evidence__body"
+            id={`body-${itemKey.replace('#', '-')}`}
+            hidden={!expanded}
+          >
+            <p class="quote">«{evidence.quote}»</p>
+            <dl class="kv evidence__kv">
+              <dt>источник</dt>
+              <dd>{evidence.source_title || 'запись корпуса'}</dd>
+              {#if evidence.page != null}
+                <dt>страница</dt><dd class="num">{evidence.page}</dd>
+              {/if}
+              {#if evidence.sheet}
+                <dt>лист</dt><dd>{evidence.sheet}</dd>
+              {/if}
+              {#if evidence.cell_range}
+                <dt>ячейки</dt><dd class="num">{evidence.cell_range}</dd>
+              {/if}
+              {#if evidence.char_start != null}
+                <dt>смещение символов</dt>
+                <dd class="num">{evidence.char_start}–{evidence.char_end ?? evidence.char_start}</dd>
+              {/if}
+            </dl>
+            <p class="micro">
+              Esc — закрыть раскрытие; тот же фрагмент доступен в «Находках» и на
+              карте связей.
+            </p>
+          </div>
+        </div>
+      {/each}
+    {/if}
+  </div>
+
+  {#if canSupersede}
+    <div class="thesis__actions">
+      {#if correctionFor === finding.id}
+        <div class="correction">
+          <Field
+            label="Причина правки"
+            name={`correction-comment-${finding.id}`}
+            type="textarea"
+            rows={2}
+            placeholder="Что не так с формулировкой или числом"
+            hint="Минимум три символа — иначе правку не принять."
+            bind:value={correctionComment}
+          />
+          <Field
+            label="Исправленное утверждение"
+            name={`correction-text-${finding.id}`}
+            type="textarea"
+            rows={2}
+            hint="Минимум три символа — текст станет новой версией утверждения."
+            bind:value={correctionText}
+          />
+          <Notice tone="info" title="Правка относится к этому тезису">
+            <p>
+              Она создаёт новую версию утверждения и оставляет прежнюю в истории
+              связей — ответ целиком не меняется.
+            </p>
+          </Notice>
+          <div class="row">
+            <Button
+              variant="action"
+              size="sm"
+              busy={busy === 'correction'}
+              disabled={busy === 'correction'
+                || correctionComment.trim().length < 3
+                || correctionText.trim().length < 3}
+              onclick={() => void sendCorrection(finding)}
+            >
+              Заменить версию
+            </Button>
+            <Button variant="quiet" size="sm" onclick={() => (correctionFor = null)}>
+              Отмена
+            </Button>
+          </div>
+        </div>
+      {:else}
+        <Button
+          variant="quiet"
+          size="sm"
+          icon="plus"
+          disabled={running}
+          onclick={() => startCorrection(finding)}
+        >
+          Исправить это утверждение
+        </Button>
+      {/if}
+    </div>
+  {:else if canFeedback}
+    <p class="micro thesis__note">
+      Замена утверждения доступна при расширенном доступе. Отзыв по ответу
+      целиком — ниже.
+    </p>
+  {/if}
+
+  <!-- История версий открытого утверждения: состояние своё у
+       каждого тезиса, отказ — тоже свой. -->
+  {@const hist = historyState(finding.id)}
+  <div class="history">
+    <p class="micro history__label">история версий утверждения</p>
+    <div class="row">
+      <Button
+        variant="quiet"
+        size="sm"
+        icon="clock"
+        busy={hist.busy}
+        disabled={hist.busy}
+        onclick={() => void loadHistory(finding.id)}
+      >
+        {hist.busy ? 'Читаем…' : hist.data ? 'Обновить версии' : 'Запросить версии'}
+      </Button>
+    </div>
+    {#if hist.error}
+      <Notice tone="error" title="История версий не получена">
+        <p>{hist.error}</p>
+        <div class="row">
+          <Button
+            variant="quiet"
+            size="sm"
+            icon="refresh"
+            onclick={() => void loadHistory(finding.id)}
+          >
+            Повторить запрос
+          </Button>
+        </div>
+      </Notice>
+    {:else if hist.data}
+      {#if !hist.data.versions.length}
+        <p class="micro">других версий у этого тезиса нет.</p>
+      {:else}
+        {#each hist.data.versions as version (version.finding_id + version.version)}
+          <div class="version">
+            <p class="small">{version.statement}</p>
+            <p class="micro">
+              версия <b class="num">{version.version}</b> ·
+              <StatusPill
+                status={version.status}
+                label={STATUS_PHRASE[version.status]}
+              />
+              {#if version.review_date}
+                <time datetime={version.review_date}>{reviewDate(version.review_date)}</time>
+              {:else}
+                разбор не проводился
+              {/if}
+              {#if version.reviewer_id}
+                · правил <code class="code tech">{shortCode(version.reviewer_id)}</code>
+              {/if}
+            </p>
+            {#if version.review_reason}<p class="micro">{version.review_reason}</p>{/if}
+          </div>
+        {/each}
+      {/if}
+    {/if}
+  </div>
+{/snippet}
 
 <style>
   .ask {
@@ -2464,11 +2558,13 @@
   .paper__body {
     display: grid;
     gap: var(--s5);
-    grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+    /* Колонка шкалы относительная: на средних экранах 340px выталкивали бы
+       тезисы, min() держит её пропорциональной ширине окна. */
+    grid-template-columns: minmax(min(340px, 30vw), 380px) minmax(0, 1fr);
     align-items: start;
   }
 
-  @media (max-width: 1119px) {
+  @media (max-width: 900px) {
     .paper__body {
       grid-template-columns: minmax(0, 1fr);
     }
@@ -2492,7 +2588,7 @@
     background: var(--surface-sunk);
   }
 
-  @media (max-width: 1119px) {
+  @media (max-width: 900px) {
     .scale {
       position: static;
       max-height: none;
@@ -2622,9 +2718,17 @@
     background: var(--surface);
   }
 
-  .thesis--open {
+  .thesis--selected {
     border-color: var(--line-strong);
     box-shadow: var(--shadow-soft);
+  }
+
+  /* Шапка разбора в шторке: тот же тезис, что и на листе, но в роли заголовка
+     слоя — без карточки и без рамки. */
+  .sheet__thesis {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
   }
 
   .thesis__head {

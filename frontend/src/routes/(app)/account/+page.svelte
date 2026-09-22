@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
+  import { page } from '$app/state';
   import { tick } from 'svelte';
   import { ApiError, api } from '$lib/api';
   import { observeReveals } from '$lib/reveal';
@@ -242,7 +243,7 @@
           >
             {#snippet action()}
               <div class="row">
-                <Button href="/login" variant="action">Войти</Button>
+                <Button href={`/login?next=${encodeURIComponent(page.url.pathname)}`} variant="action">Войти</Button>
                 <Button variant="quiet" onclick={() => void session.refresh()}>Проверить вход</Button>
               </div>
             {/snippet}
@@ -367,11 +368,6 @@
             {#if pwdConfirmed}
               <Notice tone="ok" title="Пароль сохранён">
                 Этот вход продолжает работу, остальные входы аккаунта закрыты.
-              </Notice>
-            {:else}
-              <Notice tone="info" title="После смены пароля">
-                На других устройствах придётся войти заново: смена пароля закрывает прочие входы
-                аккаунта.
               </Notice>
             {/if}
 

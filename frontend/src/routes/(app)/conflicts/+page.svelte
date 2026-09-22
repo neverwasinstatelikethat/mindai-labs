@@ -292,13 +292,6 @@
     return `left: ${left}%; width: ${width}%`;
   }
 
-  /** Тон полосы совпадает с тон поля её утверждения: цвет = кто спорит. */
-  function pointSide(point: Point, group: Group): 'left' | 'right' | 'other' {
-    if (group.left && group.left.id === point.findingId) return 'left';
-    if (group.right && group.right.id === point.findingId) return 'right';
-    return 'other';
-  }
-
   /**
    * Заголовок темы. Когда словарь знает связку — она называется по-русски, а
    * служебные ключи остаются подписью. Когда не знает — заголовком становится
@@ -347,6 +340,47 @@
     return JSON.stringify([finding.subject ?? '', finding.predicate ?? '']);
   }
 
+  /** Сборка темы из бакета находок: одна и для отбора, и для полного среза. */
+  function buildGroup(key: string, list: FindingListItem[]): Group {
+    const parsed: unknown = JSON.parse(key);
+    const [subject = '', predicate = ''] = Array.isArray(parsed) ? (parsed as string[]) : [];
+    const comparisons = comparisonsFor(list);
+    const sources = new Set<string>();
+    for (const finding of list) {
+      for (const evidence of finding.evidence) sources.add(evidence.document_id);
+    }
+    const headline = comparisons[0] ?? null;
+    const { left, right } = pairFor(list, comparisons);
+    return {
+      // ключ темы, а не позиция: сортировка и отбор не переключают свёрнутые группы
+      id: key,
+      // стабильный id DOM-узла группы: позиция в списке меняется отбором
+      domId: `grp-${list[0]?.id ?? key}`,
+      topic: topicFor(subject, predicate, list),
+      findings: list,
+      comparisons,
+      divergence: divergenceOf(comparisons),
+      sourceCount: sources.size,
+      headline,
+      left,
+      right,
+      others: list.filter((f) => f.id !== left?.id && f.id !== right?.id),
+    };
+  }
+
+  // Полный срез без отбора: по нему считают пробелы, отбор фильтрует только
+  // отображаемый список тем.
+  const allGroups = $derived.by<Group[]>(() => {
+    const buckets = new Map<string, FindingListItem[]>();
+    for (const finding of items) {
+      const key = bucketKey(finding);
+      const bucket = buckets.get(key);
+      if (bucket) bucket.push(finding);
+      else buckets.set(key, [finding]);
+    }
+    return [...buckets.entries()].map(([key, list]) => buildGroup(key, list));
+  });
+
   const groups = $derived.by<Group[]>(() => {
     const q = search.trim().toLowerCase();
     const buckets = new Map<string, FindingListItem[]>();
@@ -359,33 +393,7 @@
       else buckets.set(key, [finding]);
     }
 
-    const rows: Group[] = [];
-    for (const [key, list] of buckets) {
-      const parsed: unknown = JSON.parse(key);
-      const [subject = '', predicate = ''] = Array.isArray(parsed) ? (parsed as string[]) : [];
-      const comparisons = comparisonsFor(list);
-      const sources = new Set<string>();
-      for (const finding of list) {
-        for (const evidence of finding.evidence) sources.add(evidence.document_id);
-      }
-      const headline = comparisons[0] ?? null;
-      const { left, right } = pairFor(list, comparisons);
-      rows.push({
-        // ключ темы, а не позиция: сортировка и отбор не переключают свёрнутые группы
-        id: key,
-        // стабильный id DOM-узла группы: позиция в списке меняется отбором
-        domId: `grp-${list[0]?.id ?? key}`,
-        topic: topicFor(subject, predicate, list),
-        findings: list,
-        comparisons,
-        divergence: divergenceOf(comparisons),
-        sourceCount: sources.size,
-        headline,
-        left,
-        right,
-        others: list.filter((f) => f.id !== left?.id && f.id !== right?.id),
-      });
-    }
+    const rows = [...buckets.entries()].map(([key, list]) => buildGroup(key, list));
 
     const visible = onlyNumeric ? rows.filter((g) => g.comparisons.length > 0) : rows;
     return visible.sort((a, b) => {
@@ -417,11 +425,13 @@
 
   /**
    * Пробелы: отдельного эндпоинта у сервера нет, поэтому это ровно те дыры,
-   * которые видны в текущем срезе /api/v1/conflicts, — и названы они по данным.
+   * которые видны в срезе /api/v1/conflicts, — и названы они по данным.
+   * Считаются по полному срезу (allGroups): отбор фильтрует список тем,
+   * а не пробелы.
    */
   const gaps = $derived.by<GapNote[]>(() => {
     const notes: GapNote[] = [];
-    for (const group of groups) {
+    for (const group of allGroups) {
       if (group.findings.length < 2) {
         const only = group.findings[0];
         notes.push({
@@ -796,8 +806,9 @@
                 </span>
               </button>
 
-              {#if open}
-                <div class="conf-group__body" id={group.domId}>
+              <!-- Тело живёт в DOM и получает `hidden`: aria-controls ведёт к
+                   существующему элементу в обоих состояниях раскрытия. -->
+              <div class="conf-group__body" id={group.domId} hidden={!open}>
                   {#if leftClaim}
                     <div class="pair">
                       <div class="pair__side pair__side--left">
@@ -858,7 +869,6 @@
                             </span>
                           </p>
                           {#each cmp.points as point, pi (`${point.findingId}-${pi}`)}
-                            {@const side = pointSide(point, group)}
                             {@const band = bandStyle(point, cmp)}
                             <div class="scale__line">
                               <p class="scale__src">
@@ -875,9 +885,7 @@
                               </p>
                               {#if band}
                                 <span class="bar scale__track">
-                                  <span
-                                    class="bar__fill {side === 'left' ? 'bar__fill--consensus' : ''}"
-                                    style={band}></span>
+                                  <span class="bar__fill" style={band}></span>
                                 </span>
                               {:else}
                                 <p class="micro scale__noband">
@@ -954,8 +962,7 @@
                     <Button href="/findings" variant="ghost" size="sm" iconEnd="arrowRight">Находки корпуса</Button>
                     <Button href="/graph" variant="ghost" size="sm" iconEnd="arrowRight">Узел на карте связей</Button>
                   </div>
-                </div>
-              {/if}
+              </div>
             </Panel>
           {/each}
         </div>
@@ -980,7 +987,7 @@
         </div>
       {/if}
 
-      {#if groups.length > 0}
+      {#if groups.length > 0 || gaps.length > 0}
         <section class="conf__gaps">
           <SectionHead
             level="2"
@@ -992,7 +999,7 @@
           {#if gaps.length === 0}
             <Empty
               icon="checkCircle"
-              title="Пробелов в отборе нет"
+              title="Пробелов в срезе нет"
               body="Каждая тема текущего среза содержит два утверждения с общей шкалой и локатором первоисточника."
             />
           {:else}
@@ -1285,6 +1292,12 @@
     padding: clamp(var(--s4), 2.4vw, var(--s6));
   }
 
+  /* Тело свёрнутой темы скрыто атрибутом `hidden`: без этого правила
+     display:flex авторского стиля перебивает скрытие из браузерных стилей. */
+  .conf-group__body[hidden] {
+    display: none;
+  }
+
   .pair {
     position: relative;
     display: grid;
@@ -1310,7 +1323,6 @@
   }
 
   .pair__mark {
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
@@ -1376,7 +1388,6 @@
   }
 
   .scope__title {
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
@@ -1550,7 +1561,6 @@
   }
 
   .others__title {
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
@@ -1605,7 +1615,6 @@
     display: flex;
     align-items: center;
     gap: var(--s2);
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
@@ -1626,7 +1635,7 @@
     gap: var(--s4);
   }
 
-  @media (max-width: 880px) {
+  @media (max-width: 900px) {
     .conf__tools {
       grid-template-columns: minmax(0, 1fr);
     }

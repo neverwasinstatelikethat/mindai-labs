@@ -147,6 +147,16 @@ export const RELATION_LABELS: Record<string, string> = {
   HAS_REMOVAL_EFFICIENCY: 'эффективность удаления',
   HAS_ENERGY_RATIO: 'удельный расход энергии',
   REQUIRES_MIN_TEMPERATURE: 'требует температуры не ниже',
+  CONTAINS: 'содержит',
+  REQUIRES: 'требует',
+  ASSERTS: 'утверждает о',
+  SUPPORTED_BY: 'подтверждён документом',
+  MENTIONS: 'упоминает',
+  DERIVED_FROM: 'получен из',
+  MEASURED_BY: 'измерено',
+  APPLIES_TO: 'применимо к',
+  LOCATED_IN: 'находится в',
+  RUN_BY: 'выполнено',
 };
 
 // ── Доступ к термину ──────────────────────────────────────────────────────

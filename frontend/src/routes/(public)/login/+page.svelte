@@ -63,7 +63,12 @@
       карта связей и сравнение технологий.
     </p>
 
-    <form class="panel reveal auth__form" style="--reveal-delay: 150ms" onsubmit={(event) => { event.preventDefault(); void submit(); }}>
+    <form
+      class="panel reveal auth__form"
+      style="--reveal-delay: 150ms"
+      novalidate
+      onsubmit={(event) => { event.preventDefault(); void submit(); }}
+    >
       <div class="auth__grid">
         <Field
           label="Email"
@@ -72,6 +77,7 @@
           autocomplete="email"
           inputmode="email"
           placeholder="analyst@example.org"
+          autofocus
           bind:value={email}
           error={fieldErrors.email ?? ''}
         />
@@ -104,9 +110,8 @@
 </div>
 
 <style>
+  /* Центрирование и высоту даёт page--cover; здесь только свои отступы. */
   .auth {
-    display: grid;
-    align-content: center;
     padding-block: var(--s6) var(--s8);
   }
 

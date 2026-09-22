@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import Icon from './Icon.svelte';
 
   let {
     title,
@@ -94,9 +95,7 @@
         {#if description}<p class="micro muted" id={`${id}-desc`}>{description}</p>{/if}
       </div>
       <button class="icon-btn" type="button" aria-label="Закрыть" onclick={onclose}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
-          <path d="M6 6l12 12M18 6L6 18" />
-        </svg>
+        <Icon name="close" size={18} />
       </button>
     </header>
 
