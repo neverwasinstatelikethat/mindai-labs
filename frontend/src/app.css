@@ -920,10 +920,15 @@
   background: var(--surface-raised);
 }
 
+.input:focus:not(:focus-visible),
+.textarea:focus:not(:focus-visible),
+.select:focus:not(:focus-visible) {
+  outline: none;
+}
+
 .input:focus,
 .textarea:focus,
 .select:focus {
-  outline: none;
   background: var(--surface);
   border-color: var(--action-deep);
   box-shadow: var(--shadow-focus);
