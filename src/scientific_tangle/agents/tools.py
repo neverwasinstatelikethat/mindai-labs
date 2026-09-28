@@ -37,6 +37,10 @@ MAX_CONFLICT_FACTS = 8
 # списком фактов; читается и человеком, и ``_omitted_count``.
 OMITTED_NOTE_PREFIX = "Не показано"
 
+# Идентичность действия для дедупликации пула: одно и то же обращение к knowledge
+# считается повторным, только если совпадают и инструмент, и все его аргументы.
+ActionKey = tuple[str, str, tuple[str, ...], tuple[str, ...], int]
+
 
 @dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
@@ -112,19 +116,27 @@ class ResearchToolExecutor:
             )
             for action in plan.actions
         ]
-        first_positions = {keys.index(key) for key in keys}
+        # Единственный проход вместо {keys.index(key) for key in keys}: list.index
+        # сам линеен по плану, и прежняя запись давала квадратичную стоимость на
+        # каждом действии, повторно сканируя весь список ключей. `owners[position]`
+        # — позиция первого исполнения для этого действия; дубль обязано исполнять
+        # не он, а первый вход ключа (см. test_identical_actions_execute_retrieval_once).
+        first_position: dict[ActionKey, int] = {}
+        owners: list[int] = []
+        for position, key in enumerate(keys):
+            owner = first_position.setdefault(key, position)
+            owners.append(owner)
+        first_positions = set(owners)
         unique_outcomes = await asyncio.gather(
             *(
                 self._run_action(plan.actions[position], query_plan, allowed_data_classes)
                 for position in sorted(first_positions)
             )
         )
-        outcome_by_position = dict(
-            zip(sorted(first_positions), unique_outcomes, strict=True)
-        )
+        outcome_by_position = dict(zip(sorted(first_positions), unique_outcomes, strict=True))
         outcomes: list[_ActionOutcome] = []
-        for position in range(len(plan.actions)):
-            outcome = outcome_by_position[keys.index(keys[position])]
+        for position, owner in enumerate(owners):
+            outcome = outcome_by_position[owner]
             if position not in first_positions:
                 # Дубликат получает результат первого исполнения, но наблюдение
                 # уходит с его собственным action_id.

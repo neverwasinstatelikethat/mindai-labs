@@ -17,7 +17,15 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 
-from scientific_tangle.agents.workflow import ResearchWorkflow, _numbers, _unit_conflicts
+from scientific_tangle.agents.workflow import (
+    _CONFIDENCE_PENALTY,
+    _UNTRACED_CONFIDENCE_CAP,
+    ResearchWorkflow,
+    _language_mismatch,
+    _numbers,
+    _unit_conflicts,
+    _unit_unmatched,
+)
 from scientific_tangle.config import Settings
 from scientific_tangle.domain.contracts import (
     AgentControlDecision,
@@ -29,6 +37,7 @@ from scientific_tangle.domain.contracts import (
 )
 from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import EvidenceLocator, NumericObservation
+from scientific_tangle.services.agent_metrics import AgentMetricsRegistry
 from scientific_tangle.services.governance import AccessPolicyEngine
 from scientific_tangle.services.provider import ModelUnavailableError
 from tests.fakes import ScriptedProvider
@@ -549,6 +558,71 @@ def test_unit_conflicts_flag_scale_mismatch_and_only_it() -> None:
     assert _unit_conflicts(match, [evidence_finding]) == []
 
 
+def _answer_with(summary: str) -> ReasoningResult:
+    return ReasoningResult(
+        summary=summary,
+        finding_ids=["f-units"],
+        conflicts=[],
+        knowledge_gaps=[],
+        recommendations=[],
+    )
+
+
+def test_unit_conflicts_names_unmatched_units_instead_of_ignoring_them() -> None:
+    """Единица вне словаря — не тишина, но и не штраф: пометка отдельно от шкалы.
+
+    «70 баррелей» против «70 т/м³» аналитик обязан увидеть, однако масштаб
+    неизвестной единицы ошибку шкалы не доказывает, поэтому такие пары считает
+    ``_unit_unmatched`` и не засчитывает в уверенность. Русское слово в падеже
+    («95 процентов» против «95 %») — то же написание, а не расхождение.
+    """
+    barrels = _unit_unmatched(_answer_with("Плотность 70 баррелей."), [
+        _finding_with_observation(70.0, "т/м³")
+    ])
+    assert barrels == [
+        "число 70: баррелей в ответе против т/м³ в доказательстве — единицы не сопоставлены"
+    ]
+    assert _unit_conflicts(_answer_with("Плотность 70 баррелей."), [
+        _finding_with_observation(70.0, "т/м³")
+    ]) == []
+
+    # Слово вместо символа и падежное окончание — не разные единицы.
+    for spelled in ("Задержание 95 процентов.", "Задержание 95 процентом."):
+        assert _unit_conflicts(_answer_with(spelled), [_finding_with_observation(95.0, "%")]) == []
+        assert _unit_unmatched(_answer_with(spelled), [_finding_with_observation(95.0, "%")]) == []
+
+    # Разное написание одной единицы — корпус англоязычный, ответ русскоязычный.
+    latin_spelling = _finding_with_observation(70.0, "mg/L")
+    assert _unit_conflicts(_answer_with("Доза 70 мг/л."), [latin_spelling]) == []
+    assert _unit_unmatched(_answer_with("Доза 70 мг/л."), [latin_spelling]) == []
+    assert _unit_conflicts(_answer_with("Задержание 70 percent."), [
+        _finding_with_observation(70.0, "%")
+    ]) == []
+    # Латинское написание не прячет доказуемое расхождение масштабов.
+    assert _unit_conflicts(_answer_with("Concentration 70 g/L."), [latin_spelling]) == [
+        "число 70: g/L в ответе против mg/L в доказательстве"
+    ]
+
+    # Число доказательства вовсе без единицы остаётся территорией «число без единиц».
+    plain = Finding(
+        id="f-plain",
+        statement="Порог 5.",
+        confidence=0.8,
+        evidence=[EvidenceLocator(document_id=UUID(int=1), quote="порог 5", page=1)],
+    )
+    assert _unit_conflicts(_answer_with("Порог 5 баррелей."), [plain]) == []
+    assert _unit_unmatched(_answer_with("Порог 5 баррелей."), [plain]) == []
+
+
+def test_language_check_compares_script_of_the_summary() -> None:
+    """Проверка языка детерминирована: большинство букв — алфавитом запроса."""
+    assert _language_mismatch("Reverse osmosis rejects 95% of dissolved salts.", "ru")
+    assert _language_mismatch("Обратный осмос даёт задержание растворённых солей.", "en")
+    assert not _language_mismatch("Обратный осмос даёт 95% солей.", "ru")
+    assert not _language_mismatch("Membrane rejects 95% of salts.", "en")
+    assert not _language_mismatch("95–99%", "ru"), "без букв сравнивать нечего"
+
+
 @pytest.mark.asyncio
 async def test_acl_scope_change_discards_thread_history() -> None:
     """Права доступа изменились — прошлый вывод ветки не наследуется.
@@ -577,3 +651,164 @@ async def test_acl_scope_change_discards_thread_history() -> None:
     # Подпись прав сменилась: остался только ход нового прогона.
     assert len(changed_scope_history) == 1
     assert changed_scope_history[0].summary == answer.summary
+
+
+@pytest.mark.asyncio
+async def test_unapproved_answer_is_marked_when_revisions_are_exhausted() -> None:
+    """На исчерпанном бюджете ревизий finalize получает отклонённый черновик.
+
+    Без отметки аналитик не отличил бы ответ, который Critic забраковал, от
+    одобренного: незакрытые замечания обязаны дойти до degradation_reasons, а сам
+    ответ при этом остаётся показанным.
+    """
+    provider = ScriptedProvider(
+        planning_bundle(),
+        ENOUGH,
+        reasoning("Черновик без условий применимости."),
+        rejected("Не названа граница по сухому остатку."),
+    )
+    settings = Settings(knowledge_backend="memory", agent_max_revisions=0)
+
+    answer = await ResearchWorkflow(provider=provider, settings=settings).run(
+        QueryRequest(question=QUESTION)
+    )
+
+    assert [event.agent for event in answer.trace].count("improver") == 0
+    assert answer.summary == "Черновик без условий применимости."
+    notes = [item for item in answer.degradation_reasons if "без одобрения Critic'а" in item]
+    assert len(notes) == 1
+    assert "Не названа граница по сухому остатку." in notes[0]
+    assert "даже после ревизии" not in notes[0]
+
+
+@pytest.mark.asyncio
+async def test_critic_note_separates_revised_answer_from_approved_one() -> None:
+    """Ревизия, после которой Critic всё ещё не согласен, помечена; одобрение — нет."""
+    still_rejected = await ResearchWorkflow(
+        provider=ScriptedProvider(
+            planning_bundle(),
+            ENOUGH,
+            reasoning("Первый черновик."),
+            rejected("Не хватает данных по пилоту."),
+            reasoning("Второй черновик."),
+            rejected("Данных по пилоту всё ещё не хватает."),
+        ),
+        settings=Settings(knowledge_backend="memory", agent_max_revisions=1),
+    ).run(QueryRequest(question=QUESTION))
+
+    notes = [
+        item for item in still_rejected.degradation_reasons if "без одобрения Critic'а" in item
+    ]
+    assert len(notes) == 1 and "даже после ревизии" in notes[0]
+    assert "Данных по пилоту всё ещё не хватает." in notes[0]
+    assert still_rejected.summary == "Второй черновик."
+
+    approved = await ResearchWorkflow(
+        provider=ScriptedProvider(
+            planning_bundle(),
+            ENOUGH,
+            reasoning("Черновик без нормализации условий."),
+            rejected("Условия применимости не согласованы."),
+            reasoning("Ответ после ревизии: 95–99% задержания солей."),
+            OK,
+        )
+    ).run(QueryRequest(question=QUESTION))
+
+    assert not any("без одобрения Critic'а" in item for item in approved.degradation_reasons)
+
+
+@pytest.mark.asyncio
+async def test_summary_in_the_wrong_script_is_marked_as_degradation() -> None:
+    """Язык запроса — факт входящего вопроса: summary не тем алфавитом видно аналитику."""
+    def provider() -> ScriptedProvider:
+        return ScriptedProvider(
+            planning_bundle(),
+            ENOUGH,
+            reasoning("Reverse osmosis rejects 95–99% of dissolved salts."),
+            OK,
+        )
+
+    russian = await ResearchWorkflow(provider=provider()).run(QueryRequest(question=QUESTION))
+    assert any("Язык ответа не совпадает" in item for item in russian.degradation_reasons)
+
+    english = await ResearchWorkflow(provider=provider()).run(
+        QueryRequest(question=QUESTION, language="en")
+    )
+    assert not any("Язык ответа не совпадает" in item for item in english.degradation_reasons)
+
+
+@pytest.mark.asyncio
+async def test_confidence_pays_for_guardrail_facts_instead_of_self_report() -> None:
+    """Уверенность ответа отражает проваленные guardrail-проверки finalize.
+
+    Среднее ``finding.confidence`` — самооценка модели; без штрафов за детерминированно
+    обнаруженные нестыковки и без потолка при ответе по всему пулу она не отличалась бы
+    от проверяемого вывода.
+    """
+    clean = await ResearchWorkflow(
+        provider=ScriptedProvider(
+            planning_bundle(),
+            ENOUGH,
+            reasoning("Обратный осмос даёт 95–99% задержания солей."),
+            OK,
+        )
+    ).run(QueryRequest(question=QUESTION))
+    assert clean.confidence == pytest.approx(0.81), "среднее 0,92 и 0,70 без штрафов"
+
+    no_revisions = Settings(knowledge_backend="memory", agent_max_revisions=0)
+    numbers_hit = await ResearchWorkflow(
+        provider=ScriptedProvider(
+            planning_bundle(),
+            ENOUGH,
+            reasoning("Обессоливание даёт 97.5% задержания солей."),
+            OK,
+        ),
+        settings=no_revisions,
+    ).run(QueryRequest(question=QUESTION))
+    assert any("без поддержки" in item for item in numbers_hit.degradation_reasons)
+    assert numbers_hit.confidence == pytest.approx(0.81 * _CONFIDENCE_PENALTY, abs=0.001)
+
+    wrong_citations = await ResearchWorkflow(
+        provider=ScriptedProvider(
+            planning_bundle(),
+            ENOUGH,
+            reasoning("Обратный осмос даёт 95–99% задержания солей.").model_copy(
+                update={"finding_ids": ["finding-вне-пула"]}
+            ),
+            rejected("Ответ ссылается на неизвестные finding IDs."),
+        ),
+        settings=no_revisions,
+    ).run(QueryRequest(question=QUESTION))
+    assert any("finding IDs" in item for item in wrong_citations.degradation_reasons)
+    assert any("без одобрения Critic'а" in item for item in wrong_citations.degradation_reasons)
+    assert wrong_citations.confidence <= _UNTRACED_CONFIDENCE_CAP, (
+        "ответ по всему пулу без точечной трассировки не может быть уверенным"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deadline_degradation_is_counted_with_a_bounded_reason_code() -> None:
+    """Деградация по дедлайну обязана быть видна в метриках кодом, а не только текстом.
+
+    Свободная строка ``degradation_reasons`` в счётчик не идёт: она меняется от
+    узла к узлу и разложила бы cardinality метки.
+    """
+    async def slow() -> ReasoningResult:
+        await asyncio.sleep(5)
+        return reasoning("Этот ответ достигнут не был.")
+
+    registry = AgentMetricsRegistry()
+    provider = RepeatProvider(
+        {
+            PlanningBundle: planning_bundle(),
+            AgentControlDecision: ENOUGH,
+            ReasoningResult: slow,
+        }
+    )
+    settings = Settings(knowledge_backend="memory", agent_deadline_seconds=0.4)
+    workflow = ResearchWorkflow(provider=provider, settings=settings, metrics=registry)
+
+    answer = await workflow.run(QueryRequest(question=QUESTION))
+
+    assert any("бюджет времени" in item for item in answer.degradation_reasons)
+    assert registry.snapshot().degradations_by_reason.get("timeout") == 1

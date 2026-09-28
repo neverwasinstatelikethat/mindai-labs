@@ -1,3 +1,50 @@
+"""Измерения качества Научного Клубка: ответы, retrieval и сквозной конвейер.
+
+Пороги измерений
+----------------
+
+«Стандарт качества 0.8+» не должен жить устным обещанием: ниже перечислен каждый
+порог, константа, которая его задаёт, и то, кто его сегодня реально проверяет.
+
+- ``PASS_TOLERANCE`` = 0.999 — нижняя граница ``citation_coverage`` и
+  ``numeric_support`` в ``EvaluationMetrics.passed`` (``EvaluationHarness.evaluate``).
+  Проверяется как флаг в ответе ``/api/v1/query`` и в списке ``/api/v1/evaluations``;
+  в CI не гейтится.
+- ``OVERALL_FLOOR`` = 0.8 — тот самый «0.8+»: композит ``overall`` всё в том же
+  ``passed``. Формула композита сохранена прежней, когда судьи нет (это закреплено
+  тестом ``tests/test_benchmark_metrics.py``). Автоматического CI-гейта нет: флаг
+  виден в интерфейсе оценочного контура и разбирается вручную.
+- ``ANSWER_CORRECTNESS_FLOOR`` = 0.8 — детерминированная точность ответа
+  (``grade_answer_correctness``). Измеряется только для gold-кейсов, у которых есть
+  ``expected_answer`` с подтверждённым источником; в остальных случаях метрика
+  равна ``None``, а не 0.0.
+- ``JUDGE_QUALITY_FLOOR`` = 0.8 — качество по LLM-судье (``JudgeProtocol``).
+  Гейтит ``passed`` только когда судья явно внедрён; без ключа GigaChat в CI его
+  нет, и метрика остаётся ``None``.
+- Retrieval-бенчмарк (``benchmark_retrieval.passed``): ``RECALL_AT_3_FLOOR`` = 0.6
+  и ``MRR_FLOOR`` = 0.5 плюс инварианты корректности замера. Проверяется флагом
+  ``passed`` эндпоинта ``/api/v1/benchmark/retrieval``, решение — за экспертом.
+- Сквозной конвейер (``benchmark_pipeline.passed``):
+  ``PIPELINE_SOURCE_RECALL_FLOOR`` = 0.6, ``citation_coverage >= PASS_TOLERANCE`` и
+  ``PIPELINE_P95_LATENCY_MS_FLOOR`` = 120 000 мс. Проверяется флагом ``passed``
+  эндпоинта ``/api/v1/benchmark/pipeline``; вручную, так как требует живого LLM.
+- CLI ``run_benchmark.py`` (пороги объявлены там же): ``recall@10 >= 0.90``,
+  ``p95 <= 3 c``, гибрид лучше лексического базового по MRR и падение headline-метрик
+  относительно эталона не больше ``MAX_RELATIVE_REGRESSION`` = 5 %. Это единственный
+  порог, который сегодня гейтится автоматически — job ``benchmark`` в
+  ``.gitlab-ci.yml`` (``allow_failure: false``). Раннер без корпуса получает код 2:
+  «измерение не выполнено», а не зелёный отчёт.
+- Точность ответа и судья в CLI не измеряются: ``run_benchmark.py`` — это прогон
+  retrieval, а не качества генерации. Кейсов с подтверждённым ``expected_answer``
+  сегодня ноль (корпус вне Git), поэтому метрика точности вакуумна и обязан
+  отображаться как ``None``, а не как 0.0 или 1.0.
+
+Композитная оценка больше не включает self-reported confidence модели:
+«точная» уверенность — это утверждение самой модели, а не измерение поддержки
+вывода доказательством. То же правило действует и для судьи:
+``mean_finding_confidence`` не входит в ``overall`` ни в одном из режимов.
+"""
+
 from __future__ import annotations
 
 import json
@@ -7,7 +54,9 @@ from collections import deque
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Protocol
+
+from pydantic import BaseModel, Field
 
 from scientific_tangle.domain.contracts import (
     AnswerPayload,
@@ -26,11 +75,124 @@ from scientific_tangle.domain.contracts import (
 from scientific_tangle.services.agent_metrics import AgentMetricsRegistry, agent_metrics
 from scientific_tangle.services.knowledge import KnowledgeBase
 
-# Композитная оценка больше не включает self-reported confidence модели:
-# «точная» уверенность — это утверждение самой модели, а не измерение поддержки
-# вывода доказательством.
 PASS_TOLERANCE = 0.999
+OVERALL_FLOOR = 0.8
+ANSWER_CORRECTNESS_FLOOR = 0.8
+JUDGE_QUALITY_FLOOR = 0.8
+RECALL_AT_3_FLOOR = 0.6
+MRR_FLOOR = 0.5
+PIPELINE_SOURCE_RECALL_FLOOR = 0.6
+PIPELINE_P95_LATENCY_MS_FLOOR = 120_000
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+_WORD = re.compile(r"[а-яёa-z0-9]+")
+# Служебные слова: без них точность ожидаемого ответа не разбавляется «общими»
+# токенами, которые есть в любом связном тексте.
+_STOPWORDS = frozenset(
+    {
+        "которые",
+        "который",
+        "которая",
+        "которое",
+        "какие",
+        "какой",
+        "какая",
+        "какое",
+        "этом",
+        "этого",
+        "этот",
+        "эта",
+        "это",
+        "для",
+        "как",
+        "что",
+        "чем",
+        "или",
+        "иначе",
+        "будет",
+        "были",
+        "был",
+        "быть",
+        "есть",
+        "между",
+        "among",
+        "which",
+        "their",
+        "from",
+        "into",
+        "about",
+        "with",
+        "that",
+        "this",
+        "than",
+        "were",
+        "been",
+    }
+)
+
+
+class GoldCaseWithAnswer(GoldCase):
+    """Gold-кейс с необязательным ожидаемым ответом.
+
+    ``expected_answer`` заполняется ТОЛЬКО вместе с ``expected_answer_source`` —
+    указанием файла корпуса и цитатой, откуда этот ответ взят. Без ссылки на
+    источник метрика точности не измеряется: правдоподобный, но непроверенный
+    ожидаемый ответ измерял бы не качество продукта, а фантазию автора кейса.
+    """
+
+    expected_answer: str | None = None
+    expected_answer_source: str | None = None
+
+
+class JudgeVerdict(BaseModel):
+    """Вердикт LLM-судьи: качество 0..1 и короткое обоснование по-русски."""
+
+    quality: float = Field(ge=0, le=1)
+    rationale: str = Field(min_length=1)
+
+
+class JudgeProtocol(Protocol):
+    """Соглашение внешнего судьи: (вопрос, ответ, контекст доказательств) → вердикт.
+
+    Судья синхронный — ``evaluate`` вызывается из потока пула (``asyncio.to_thread``).
+    Продуктовой реализации намеренно нет: она требует живой ключ GigaChat, а без
+    него гейтить ею нельзя.
+    """
+
+    def __call__(self, question: str, answer: str, context: list[str]) -> JudgeVerdict: ...
+
+
+class CorrectnessVerdict(BaseModel):
+    """Детерминированная точность ответа относительно ожидаемого утверждения."""
+
+    correctness: float = Field(ge=0, le=1)
+    number_support: float = Field(ge=0, le=1)
+    claim_support: float = Field(ge=0, le=1)
+    missing_numbers: list[str] = Field(default_factory=list)
+    missing_claims: list[str] = Field(default_factory=list)
+    verified_against: str
+
+
+class AnswerAssessment(BaseModel):
+    """Результат измерения ответа: базовые метрики плюс необязательные метрики.
+
+    ``answer_correctness`` и ``judge_quality`` равны ``None``, когда измерение
+    невозможно (нет проверенного ожидаемого ответа / нет судьи), и это честно
+    «не измеряли», а не ноль. ``skips`` объясняет каждую пропущенную метрику.
+    """
+
+    run: EvaluationRun
+    correctness: CorrectnessVerdict | None = None
+    judge: JudgeVerdict | None = None
+    judge_error: str | None = None
+    skips: list[str] = Field(default_factory=list)
+
+    @property
+    def answer_correctness(self) -> float | None:
+        return None if self.correctness is None else self.correctness.correctness
+
+    @property
+    def judge_quality(self) -> float | None:
+        return None if self.judge is None else self.judge.quality
 
 
 class EvaluationHarness:
@@ -44,11 +206,37 @@ class EvaluationHarness:
         self,
         metrics: AgentMetricsRegistry | None = None,
         max_runs: int = 200,
+        judge: JudgeProtocol | None = None,
     ) -> None:
         self._runs: deque[EvaluationRun] = deque(maxlen=max_runs)
         self._metrics = metrics or agent_metrics
+        # Судья внедряется извне (экспертный прогон, офлайн-оценка). По умолчанию
+        # его нет: продукт поднимается без ключа GigaChat, и метрика судьи тогда
+        # отсутствует, а не обнуляется.
+        self._judge = judge
 
-    def evaluate(self, answer: AnswerPayload) -> EvaluationRun:
+    def evaluate(
+        self,
+        answer: AnswerPayload,
+        *,
+        case: GoldCase | None = None,
+        judge: JudgeProtocol | None = None,
+    ) -> EvaluationRun:
+        """Базовый промер ответа: возвращает только ``EvaluationRun``.
+
+        Необязательные метрики (точность по ожидаемому ответу, LLM-судья) видны в
+        ``assess``; здесь они влияют на ``overall``/``passed`` ровно в том объёме,
+        в каком реально измерены.
+        """
+        return self.assess(answer, case=case, judge=judge).run
+
+    def assess(
+        self,
+        answer: AnswerPayload,
+        *,
+        case: GoldCase | None = None,
+        judge: JudgeProtocol | None = None,
+    ) -> AnswerAssessment:
         findings = answer.findings
         total = len(findings)
         cited = sum(bool(finding.evidence) for finding in findings)
@@ -63,25 +251,79 @@ class EvaluationHarness:
             else 0.0
         )
         mean_confidence = sum(finding.confidence for finding in findings) / total if total else 0.0
+
+        correctness = grade_answer_correctness(answer, case)
+        judge_verdict, judge_error = self._call_judge(answer, judge)
+        skips: list[str] = []
+        if correctness is None:
+            skips.append(correctness_skip_reason(case))
+        if judge_verdict is None:
+            skips.append(
+                f"LLM-судья не измерен: {judge_error}"
+                if judge_error
+                else "LLM-судья не внедрён — метрика судьи отсутствует (не 0.0)."
+            )
+
+        grounded_ratio = 1.0 - unsupported
+        # Композит без судьи оставлен прежним — иначе «0.8+» тихо сменил бы смысл.
+        # Когда судья есть и измерен, его оценка становится четвёртым компонентом;
+        # mean_finding_confidence не входит ни в одном из режимов.
+        components = [citation_coverage, numeric_support, grounded_ratio]
+        if judge_verdict is not None:
+            components.append(judge_verdict.quality)
+        overall = sum(components) / len(components)
         metrics = EvaluationMetrics(
             citation_coverage=round(citation_coverage, 3),
             numeric_support=round(numeric_support, 3),
             unsupported_claim_ratio=round(unsupported, 3),
             mean_finding_confidence=round(mean_confidence, 3),
-            overall=round((citation_coverage + numeric_support + (1.0 - unsupported)) / 3, 3),
+            overall=round(overall, 3),
         )
-        run = EvaluationRun(
-            query_id=answer.query_id,
-            metrics=metrics,
-            passed=(
-                metrics.citation_coverage >= PASS_TOLERANCE
-                and metrics.numeric_support >= PASS_TOLERANCE
-                and metrics.unsupported_claim_ratio <= 1 - PASS_TOLERANCE
-                and metrics.overall >= 0.8
-            ),
+        passed = (
+            metrics.citation_coverage >= PASS_TOLERANCE
+            and metrics.numeric_support >= PASS_TOLERANCE
+            and metrics.unsupported_claim_ratio <= 1 - PASS_TOLERANCE
+            and metrics.overall >= OVERALL_FLOOR
         )
+        # Дополнительные гейты включаются только когда метрика измерена: непроверенный
+        # кейс или отсутствие судьи не должны ни спасать, ни валить прогон молча.
+        if correctness is not None:
+            passed = passed and correctness.correctness >= ANSWER_CORRECTNESS_FLOOR
+        if judge_verdict is not None:
+            passed = passed and judge_verdict.quality >= JUDGE_QUALITY_FLOOR
+        run = EvaluationRun(query_id=answer.query_id, metrics=metrics, passed=passed)
         self._runs.append(run)
-        return run
+        return AnswerAssessment(
+            run=run,
+            correctness=correctness,
+            judge=judge_verdict,
+            judge_error=judge_error,
+            skips=skips,
+        )
+
+    def _call_judge(
+        self,
+        answer: AnswerPayload,
+        judge: JudgeProtocol | None,
+    ) -> tuple[JudgeVerdict | None, str | None]:
+        """Зовёт судью; его сбой — это «не измерено», а не ноль в метрике."""
+        active = judge or self._judge
+        if active is None:
+            return None, None
+        context = [
+            f"{evidence.source_title}: {evidence.quote}"
+            for finding in answer.findings
+            for evidence in finding.evidence
+        ]
+        try:
+            verdict = active(answer.question, _answer_text(answer), context)
+            if isinstance(verdict, JudgeVerdict):
+                return verdict, None
+            return JudgeVerdict.model_validate(verdict), None
+        except Exception as exc:
+            # Сбой судьи — это «метрика не измерена» с явной причиной: обнулять её
+            # значило бы наказать прогон за чужую недоступность.
+            return None, f"судья вернул ошибку {type(exc).__name__}: {exc}"
 
     def list_runs(self) -> list[EvaluationRun]:
         return list(reversed(self._runs))
@@ -89,18 +331,26 @@ class EvaluationHarness:
     @staticmethod
     @lru_cache(maxsize=1)
     def gold_cases() -> list[GoldCase]:
-        """Gold-кейсы корпуса. Манифест читается один раз за процесс."""
+        """Gold-кейсы корпуса. Манифест читается один раз за процесс.
+
+        ``expected_answer`` берётся из манифеста, только если там же лежит
+        ``expected_answer_source`` (файл корпуса и цитата). Сегодня ни один кейс
+        так не подтверждён: папка «Источники информации/» вне Git и в этом
+        checkout пуста, поэтому метрика точности для gold-кейсов не измеряется.
+        """
         path = Path(__file__).parents[1] / "preload_manifest.json"
         cases: list[GoldCase] = []
         for index, item in enumerate(json.loads(path.read_text("utf-8")), start=1):
             source_path = str(item["path"])
             cases.append(
-                GoldCase(
+                GoldCaseWithAnswer(
                     id=f"real-corpus-{index:02d}",
                     language=item.get("language", "ru"),
                     question=item["gold_question"],
                     source_path=source_path,
                     expected_source_titles=[Path(source_path).stem],
+                    expected_answer=item.get("expected_answer"),
+                    expected_answer_source=item.get("expected_answer_source"),
                 )
             )
         return cases
@@ -170,7 +420,9 @@ class EvaluationHarness:
             cases=case_results,
             validity_checks=validity_checks,
             passed=(
-                all(validity_checks.values()) and hybrid.recall_at_3 >= 0.6 and hybrid.mrr >= 0.5
+                all(validity_checks.values())
+                and hybrid.recall_at_3 >= RECALL_AT_3_FLOOR
+                and hybrid.mrr >= MRR_FLOOR
             ),
         )
 
@@ -196,9 +448,9 @@ class EvaluationHarness:
             lexical_baseline=lexical,
             results=results,
             passed=(
-                metrics.source_recall >= 0.6
+                metrics.source_recall >= PIPELINE_SOURCE_RECALL_FLOOR
                 and metrics.citation_coverage >= PASS_TOLERANCE
-                and metrics.p95_latency_ms <= 120_000
+                and metrics.p95_latency_ms <= PIPELINE_P95_LATENCY_MS_FLOOR
             ),
         )
 
@@ -387,3 +639,94 @@ def _numbers_grounded(finding: Finding) -> bool:
             if value is not None
         }
     return _canonical_numbers(finding.statement) <= supported
+
+
+def _answer_text(answer: AnswerPayload) -> str:
+    """Текст ответа для сверки и для судьи: сводка, тезисы и цитаты доказательств."""
+    parts = [answer.summary]
+    parts.extend(finding.statement for finding in answer.findings)
+    parts.extend(evidence.quote for finding in answer.findings for evidence in finding.evidence)
+    return " ".join(part for part in parts if part)
+
+
+def _term_prefixes(text: str) -> set[str]:
+    """Значимые слова в виде префиксов по пять символов.
+
+    Формы одного слова («шлак», «шлаками», «шлаковый») сходятся к одному префиксу,
+    поэтому сверка формулировки не требует словаря словоформ и остаётся
+    детерминированной на обычном stdlib.
+    """
+    prefixes: set[str] = set()
+    for token in _WORD.findall(text.lower()):
+        if len(token) < 4 or token in _STOPWORDS:
+            continue
+        prefixes.add(token[:5])
+    return prefixes
+
+
+def _expected_pair(case: GoldCase | None) -> tuple[str | None, str | None]:
+    """(ожидаемый ответ, источник, им подтверждённый) либо пустая пара."""
+    if not isinstance(case, GoldCaseWithAnswer):
+        return None, None
+    return case.expected_answer, case.expected_answer_source
+
+
+def grade_answer_correctness(
+    answer: AnswerPayload,
+    case: GoldCase | None,
+) -> CorrectnessVerdict | None:
+    """Точность ответа к ожидаемому утверждению: числа + формулировка.
+
+    Работает только для кейсов, у которых ``expected_answer`` подтверждён
+    ``expected_answer_source``: правдоподобный, но непроверенный ожидаемый ответ
+    измерял бы фантазию автора кейса, а не продукт. Остальные кейсы возвращают
+    ``None`` — метрика для них вакуумна, и это честно отличается от нуля.
+
+    Числа сверяются по значению через ``_canonical_numbers`` (тот же подход, что у
+    ``_numbers_grounded``: «70» подтверждается записью «70,0», «10 000» = «10000»).
+    """
+    expected, source = _expected_pair(case)
+    if not expected or not source:
+        return None
+    text = _answer_text(answer)
+    needed_numbers = _canonical_numbers(expected)
+    found_numbers = _canonical_numbers(text)
+    needed_terms = _term_prefixes(expected)
+    found_terms = _term_prefixes(text)
+    if not needed_numbers and not needed_terms:
+        return None
+    number_support = (
+        1.0
+        if not needed_numbers
+        else len(needed_numbers & found_numbers) / len(needed_numbers)
+    )
+    claim_support = (
+        1.0 if not needed_terms else len(needed_terms & found_terms) / len(needed_terms)
+    )
+    return CorrectnessVerdict(
+        correctness=round((number_support + claim_support) / 2, 3),
+        number_support=round(number_support, 3),
+        claim_support=round(claim_support, 3),
+        missing_numbers=sorted(needed_numbers - found_numbers),
+        missing_claims=sorted(needed_terms - found_terms),
+        verified_against=source,
+    )
+
+
+def correctness_skip_reason(case: GoldCase | None) -> str:
+    """Почему точность не измерена — пропуск обязан называть причину."""
+    if case is None:
+        return "Точность ответа не измерена: gold-кейс не передан."
+    expected, source = _expected_pair(case)
+    if not expected:
+        return (
+            f"Точность ответа не измерена: у кейса {case.id} нет expected_answer — "
+            "метрика вакуумна, а не нулевая."
+        )
+    if not source:
+        return (
+            f"Точность ответа не измерена: expected_answer кейса {case.id} не подтверждён "
+            "файлом корпуса и цитатой (expected_answer_source) — проверять нечем."
+        )
+    return f"Точность ответа кейса {case.id} не измерена: ожидаемое утверждение пусто."
+

@@ -26,6 +26,27 @@ services:
       ACCOUNTS_BACKEND: ${ACCOUNTS_BACKEND:-postgres}
       SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-14}
       TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-http://localhost:43119,http://127.0.0.1:43119,http://localhost:5173,http://localhost:46617,http://127.0.0.1:46617}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:43119}
+      # LLM-контур и бюджет агентного запроса объявлены здесь явно. До этого они
+      # приходили только через env_file (required: false), и запуск без .env поднимал
+      # сервис с дефолтами config.py — «модель нет, бюджет другой», и видно это
+      # было только по фактическим ответам. Значения совпадают с config.py.
+      GIGACHAT_API_KEY: ${GIGACHAT_API_KEY:-}
+      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-GigaChat}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_TRUSTED_ROOTS: ${GIGACHAT_TRUSTED_ROOTS:-certs/russian-trusted-root-ca.crt}
+      GIGACHAT_MAX_CONCURRENT: ${GIGACHAT_MAX_CONCURRENT:-1}
+      GIGACHAT_QUEUE_WAIT_SECONDS: ${GIGACHAT_QUEUE_WAIT_SECONDS:-60}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      AGENT_DEADLINE_SECONDS: ${AGENT_DEADLINE_SECONDS:-300}
+      AGENT_MAX_TOOL_ROUNDS: ${AGENT_MAX_TOOL_ROUNDS:-2}
+      AGENT_MAX_REVISIONS: ${AGENT_MAX_REVISIONS:-1}
+      CONTEXT_TOKEN_BUDGET: ${CONTEXT_TOKEN_BUDGET:-5120}
+      AGENT_MAX_CONCURRENT_RUNS: ${AGENT_MAX_CONCURRENT_RUNS:-4}
+      LLM_CACHE_TTL_SECONDS: ${LLM_CACHE_TTL_SECONDS:-900}
+      # Пусто = /metrics открыт (локальный контур); задано — Prometheus обязан
+      # присылать Bearer, потому что метрики называют содержимое корпуса.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     volumes:
       - ./Источники информации:/data/sources:ro
     ports: ["${BACKEND_PORT:-46617}:8000"]
@@ -37,7 +58,11 @@ services:
       elasticsearch: { condition: service_healthy }
       postgres: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      # Liveness, а не readiness: без GIGACHAT_API_KEY /health/ready честно
+      # отвечает 503, и на этом проверки контейнер считался бы нездоровым, а
+      # frontend и prometheus (depends_on: service_healthy) не поднимались бы
+      # вовсе. Готовность контура — дело человека и мониторинга, не healthcheck.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')"]
       interval: 20s
       timeout: 5s
       retries: 8
@@ -170,6 +195,10 @@ services:
   prometheus:
     <<: *service-defaults
     image: prom/prometheus:v3.4.1
+    environment:
+      # Тот же токен, что у бэкенда: Prometheus подставляет его в
+      # authorization.credentials своего конфига (ops/prometheus/prometheus.yml).
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
     ports: ["127.0.0.1:${PROMETHEUS_PORT:-46307}:9090"]
     volumes:
@@ -194,6 +223,9 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Дашборды лежат на диске и провижонятся файлом: панель, собранная руками в
+      # UI, не переживает пересоздание контейнера и не попадает в репозиторий.
+      - ./ops/grafana/dashboards:/etc/grafana/dashboards:ro
     depends_on:
       prometheus: { condition: service_healthy }
 

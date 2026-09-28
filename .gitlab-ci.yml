@@ -1,5 +1,6 @@
 stages:
   - quality
+  - benchmark
   - security
 
 default:
@@ -39,6 +40,59 @@ compose:
     - docker:29-dind
   script:
     - docker compose config --quiet
+
+# Единственный автоматический гейт качества измерений: retrieval-бенчмарк с
+# порогами приёмки (recall@10 >= 0.90, p95 <= 3 c, гибрид сильнее лексического
+# базового по MRR) и регрессионным контролем по эталону.
+#
+# Корпус «Источники информации/» вне Git, поэтому обычный раннер его не видит и
+# получает код 2 — «ИЗМЕРЕНИЕ НЕ ВЫПОЛНЕНО». Этот путь намеренно не роняет пайплайн
+# и не печатает отчёт о метриках: пропуск назван пропуском, а не успехом. Раннер с
+# смонтированным корпусом проходит тот же код полностью: код 1 валит пайплайн.
+benchmark:
+  stage: benchmark
+  before_script:
+    - python -m pip install --cache-dir .cache/pip -e ".[dev]"
+  variables:
+    # Путь к JSON эталонного прогона (артефакт раннера с корпусом). Пусто — значит
+    # регрессионный контроль не выполняется, и в отчёте это сказано явно.
+    BENCHMARK_BASELINE: ""
+    BENCHMARK_JSON: "reports/benchmark.json"
+  script:
+    - |
+      set +e
+      if [ -n "${BENCHMARK_BASELINE}" ]; then
+        python -m scientific_tangle.evaluation.run_benchmark \
+          --json-out "${BENCHMARK_JSON}" \
+          --baseline "${BENCHMARK_BASELINE}"
+      else
+        python -m scientific_tangle.evaluation.run_benchmark --json-out "${BENCHMARK_JSON}"
+      fi
+      code=$?
+      set -e
+      case "${code}" in
+        0)
+          echo "Бенчмарк: измерение выполнено, критерии приёмки подтверждены."
+          ;;
+        1)
+          echo "Бенчмарк: измерение выполнено, критерии приёмки или эталон НЕ пройдены."
+          exit 1
+          ;;
+        2)
+          echo "Бенчмарк: ИЗМЕРЕНИЕ НЕ ВЫПОЛНЕНО — этот раннер без корпуса."
+          echo "Прогон пропущен явно; метрики качества не подтверждались."
+          ;;
+        *)
+          echo "Бенчмарк: неожиданный код выхода ${code}."
+          exit "${code}"
+          ;;
+      esac
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - reports/benchmark.json
+  allow_failure: false
 
 sast:
   stage: security

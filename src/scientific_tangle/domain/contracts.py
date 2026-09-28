@@ -92,6 +92,9 @@ class AgentMetricSnapshot(BaseModel):
     average_duration_ms: float = Field(ge=0)
     p50_duration_ms: float = Field(ge=0)
     p95_duration_ms: float = Field(ge=0)
+    # Хвост распределения — то, что видит пользователь длинного исследования:
+    # p95 у маскирует узел, стабильно упирающийся в дедлайн.
+    p99_duration_ms: float = Field(default=0, ge=0)
 
 
 class LlmMetricSnapshot(BaseModel):
@@ -100,8 +103,14 @@ class LlmMetricSnapshot(BaseModel):
     failures: int = Field(ge=0)
     # Schema-repair попытки: повтор был у обращения к модели, а не у агента.
     retries: int = Field(default=0, ge=0)
+    # Отмена клиента и таймаут провайдера — не отказы валидации: у каждого своя
+    # причина и своя починка, поэтому они считаются отдельно от ``failures``.
+    cancelled: int = Field(default=0, ge=0)
+    timeouts: int = Field(default=0, ge=0)
     average_duration_ms: float = Field(ge=0)
+    p50_duration_ms: float = Field(default=0, ge=0)
     p95_duration_ms: float = Field(ge=0)
+    p99_duration_ms: float = Field(default=0, ge=0)
 
 
 class AgentMetricsResponse(BaseModel):
@@ -118,6 +127,26 @@ class AgentMetricsResponse(BaseModel):
     llm_calls_in_flight: int = Field(default=0, ge=0)
     llm_calls_waiting: int = Field(default=0, ge=0)
     llm_slots: int = Field(default=0, ge=0)
+    # Повторы structured output — самый диагностичный признак того, что GigaChat
+    # портит валидацию: без него деградация ответа выглядит как «модель тормозит».
+    llm_retries_total: int = Field(default=0, ge=0)
+    llm_retries_by_schema: dict[str, int] = Field(default_factory=dict)
+    llm_cancelled_total: int = Field(default=0, ge=0)
+    llm_cancelled_by_schema: dict[str, int] = Field(default_factory=dict)
+    llm_timeouts_total: int = Field(default=0, ge=0)
+    llm_timeouts_by_schema: dict[str, int] = Field(default_factory=dict)
+    # Кэш structured output: попадание — сбережённый вызов модели и снятый с
+    # очереди слот провайдера.
+    llm_cache_hits: int = Field(default=0, ge=0)
+    llm_cache_misses: int = Field(default=0, ge=0)
+    llm_cache_hit_rate: float = Field(default=0, ge=0, le=1)
+    # Ожидание слота внутри агентного дедлайна — будущая молчаливая деградация.
+    llm_queue_waits: int = Field(default=0, ge=0)
+    retrieval_failures_by_component: dict[str, int] = Field(default_factory=dict)
+    # Короткие коды причин деградации (``TimeoutError``, ``no_answer``), а не
+    # пользовательский текст ``degradation_reasons``: он разным бывает в каждом
+    # ответе и в счётчиках не сводится.
+    degradations_by_reason: dict[str, int] = Field(default_factory=dict)
 
 
 ModelMode = Literal["gigachat", "scripted", "unavailable"]
@@ -754,6 +783,20 @@ class ActivityEntry(BaseModel):
     object_id: str
     outcome: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class LlmUsageSummary(BaseModel):
+    """Расход модели собственным аккаунтом за окно: «сколько стоили мои вопросы».
+
+    Денег здесь нет намеренно: тарифной сетки GigaChat в конфигурации нет, и
+    перевод токенов в рубли был бы выдуманной цифрой в продукте.
+    """
+
+    window_days: int = Field(ge=1)
+    runs: int = Field(ge=0, description="Число записанных прогонов, а не обращений модели.")
+    failed_runs: int = Field(ge=0)
+    prompt_tokens: int = Field(ge=0)
+    completion_tokens: int = Field(ge=0)
 
 
 class DashboardResponse(BaseModel):

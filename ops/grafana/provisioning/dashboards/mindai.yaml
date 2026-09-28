@@ -1,0 +1,24 @@
+# Провижининг дашбордов из репозитория.
+#
+# Каталог JSON'ов — ops/grafana/dashboards (в контейнере /etc/grafana/dashboards);
+# сервис grafana монтирует и provisioning, и dashboards (compose.yaml, volumes).
+# Если дашбордов нет в списке, первым делом проверяй именно это монтирование:
+# Grafana при отсутствии каталога пишет ошибку чтения в лог, а дашборды не
+# «пропадают» — они просто не примонтированы.
+
+apiVersion: 1
+
+providers:
+  - name: "Научный Клубок"
+    orgId: 1
+    folder: "Научный Клубок"
+    folderUid: mindai
+    type: file
+    # Файл в репозитории — источник истины: правка в UI не должна молча
+    # расходиться с тем, что лежит в Git.
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

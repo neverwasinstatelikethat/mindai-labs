@@ -17,17 +17,26 @@ import base64
 import json
 import logging
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
 import fitz
+import httpx
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from neo4j.exceptions import ServiceUnavailable
 
 from scientific_tangle.agents.workflow import ResearchWorkflow
-from scientific_tangle.api.app import DEMO_QUESTION, AppDependencies, app
+from scientific_tangle.api.app import (
+    CANCELLED_RUN_AGENT,
+    CANCELLED_STREAM_AGENT,
+    DEMO_QUESTION,
+    AppDependencies,
+    app,
+)
 from scientific_tangle.config import Settings
 from scientific_tangle.domain.contracts import (
     AgentControlDecision,
@@ -35,12 +44,15 @@ from scientific_tangle.domain.contracts import (
     CritiqueResult,
     DocumentReceipt,
     DocumentRequest,
+    EntityMergeProposal,
     EntityResolutionProposal,
     EvaluationMetrics,
     EvaluationRun,
     EvolutionDraft,
     EvolutionExperiment,
+    EvolutionProposal,
     ExpertDecision,
+    Finding,
     GraphSnapshot,
     Notification,
     PipelineVariantMetrics,
@@ -552,15 +564,52 @@ def test_admission_refusals_are_observable(
 def test_health_ready_reports_state_backend_and_capacity(
     client: TestClient, deps: AppDependencies
 ) -> None:
-    """Честный контракт деградации: память = история не переживает перезапуск."""
+    """Честный контракт деградации: память = история не переживает перезапуск.
+
+    Код — 503: провайдер в этом контуре scripted, а готовым считается только
+    GigaChat-контур. Тело остаётся полным SystemStatus, чтобы причину можно было
+    прочитать, а не только поймать статусом.
+    """
     deps.state = InMemoryDurableState()
 
-    ready = client.get("/health/ready").json()
+    ready = client.get("/health/ready")
 
-    assert ready["state_backend"] == "in-memory"
-    assert ready["services"]["server_state"] == "fallback"
-    assert ready["agent_runs_limit"] >= 1
-    assert ready["agent_runs_active"] == 0
+    assert ready.status_code == 503
+    body = ready.json()
+    assert body["status"] == "degraded"
+    assert body["state_backend"] == "in-memory"
+    assert body["services"]["server_state"] == "fallback"
+    assert body["agent_runs_limit"] >= 1
+    assert body["agent_runs_active"] == 0
+
+
+def test_health_ready_is_200_only_for_the_gigachat_contour(
+    client: TestClient, deps: AppDependencies
+) -> None:
+    """Единственное условие readiness — настроенная модель (``model_mode``).
+
+    Проверяется без живого GigaChat: маршруту важен режим, зафиксированный
+    провайдером. Без этого pins 503 въедался бы в любой контур, где модель есть.
+    """
+    deps.provider = _ConfiguredModeProvider()
+
+    ready = client.get("/health/ready")
+
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["status"] == "ready"
+    assert body["model_mode"] == "gigachat"
+    assert body["services"]["model_provider"] == "configured"
+    assert body["degradation_reasons"] == []
+
+
+class _ConfiguredModeProvider:
+    """Провайдер «как будто GigaChat»: для readiness важен только режим."""
+
+    mode = "gigachat"
+
+    async def complete_model(self, system: str, user: str, schema: type) -> object:
+        raise AssertionError("в этом тесте модель не вызывается")
 
 
 # ── correlation_id ────────────────────────────────────────────────────────
@@ -1538,3 +1587,553 @@ def test_demo_records_one_evaluation_and_flags_narrower_cache(
     reasons_second = second.json()["answer"]["degradation_reasons"]
     assert not any("контуре доступа" in item for item in reasons_first)
     assert any("контуре доступа" in item for item in reasons_second)
+
+
+# ── Отмена прогона: закрытая вкладка оставляет след ────────────────────────
+
+
+class _CancelledWorkflow:
+    """Рабочий процесс, снятый с очереди на середине прогона.
+
+    Так выглядит отмена: uvicorn снимает задачу ответа ``CancelledError``, и
+    ``finally`` с ``_finalize_answer`` за циклом событий не выполняется. Точка
+    выброса здесь — ``run`` и середина ``stream``; механизм тот же самый.
+    """
+
+    async def run(self, query: object, *, allowed_data_classes: object) -> AnswerPayload:
+        raise asyncio.CancelledError
+
+    async def stream(
+        self, query: object, allowed: object
+    ) -> AsyncIterator[tuple[str, dict[str, object]]]:
+        yield "planner", {"trace": []}
+        raise asyncio.CancelledError
+
+
+@pytest.fixture
+def quiet_client(deps: AppDependencies) -> Iterator[TestClient]:
+    """Клиент, который не превращает отмену в падение теста.
+
+    ``CancelledError`` обязан уйти в ASGI-слой (так и есть), и с
+    ``raise_server_exceptions=False`` TestClient отдаёт заготовленный 500 вместо
+    выброса: в продакшене клиента уже нет, и важен не статус, а след прогона.
+    """
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        test_client.app.state.dependencies = deps
+        yield test_client
+
+
+def _agent_failures(deps: AppDependencies, agent: str) -> int:
+    """Число провалов конкретного прогона в агентных метриках (реестр общий)."""
+    return next(
+        (item.failures for item in deps.metrics.snapshot().agents if item.agent == agent),
+        0,
+    )
+
+
+def test_cancelled_json_run_leaves_audit_and_metric_trace(
+    quiet_client: TestClient, deps: AppDependencies
+) -> None:
+    """Отменённый JSON-прогон: акт с ``correlation_id``, провал в метриках, слот свободен.
+
+    Раньше такой прогон исчезал молча: ни акта, ни единицы в
+    ``mindai_agent_runs_total``, и ``success_rate`` считался только по долетевшим.
+    Серверную копию ответа при этом заводить нельзя — половины ответа в продукте
+    нет, поэтому проверяется и отсутствие ``query.run``/оценок.
+    """
+    deps.workflow = _CancelledWorkflow()  # type: ignore[assignment]
+    trace = "corr-cancel-json"
+    headers = {
+        **cookie_header(signup(quiet_client, "http-cancel-json@mindai.tech")),
+        "X-Correlation-Id": trace,
+    }
+    before = _agent_failures(deps, CANCELLED_RUN_AGENT)
+
+    quiet_client.post("/api/v1/query", json={"question": QUESTION}, headers=headers)
+
+    events = asyncio.run(deps.state.recent_audit(limit=50))
+    actions = {event.action for event in events}
+    cancelled = [event for event in events if event.action == "query.cancelled"]
+    assert [(event.outcome, event.correlation_id) for event in cancelled] == [
+        ("failure", trace)
+    ]
+    # Финала не было: ни ``query.run``, ни оценки, ни серверной копии.
+    assert "query.run" not in actions
+    assert asyncio.run(deps.state.recent_evaluations(limit=10)) == []
+    assert _agent_failures(deps, CANCELLED_RUN_AGENT) == before + 1
+    assert deps.admission.active == 0
+
+
+def test_cancelled_stream_leaves_trace_without_a_partial_answer(
+    quiet_client: TestClient, deps: AppDependencies
+) -> None:
+    """Обрыв SSE на середине: событие ``start`` дошло, ответа нет — след обязан быть."""
+    deps.workflow = _CancelledWorkflow()  # type: ignore[assignment]
+    trace = "corr-cancel-stream"
+    headers = {
+        **cookie_header(signup(quiet_client, "http-cancel-stream@mindai.tech")),
+        "X-Correlation-Id": trace,
+    }
+    before = _agent_failures(deps, CANCELLED_STREAM_AGENT)
+    events: list[dict[str, Any]] = []
+
+    with quiet_client.stream(
+        "POST", "/api/v1/query/stream", json={"question": QUESTION}, headers=headers
+    ) as stream:
+        assert stream.status_code == 200
+        for line in stream.iter_lines():
+            if line.startswith("data:"):
+                events.append(json.loads(line.removeprefix("data:").strip()))
+
+    assert [event["type"] for event in events] == ["start"]
+    stored = asyncio.run(deps.state.recent_audit(limit=50))
+    cancelled = [event for event in stored if event.action == "query.stream.cancelled"]
+    assert [(event.outcome, event.correlation_id) for event in cancelled] == [
+        ("failure", trace)
+    ]
+    assert "query.stream" not in {event.action for event in stored}
+    assert asyncio.run(deps.state.recent_evaluations(limit=10)) == []
+    assert _agent_failures(deps, CANCELLED_STREAM_AGENT) == before + 1
+    # Слот освобождён и в finally генератора, и в background-задаче: отмена не
+    # должна оставляать занятый приём на весь дедлайн.
+    assert deps.admission.active == 0
+
+
+# ── Недоступная модель: отказ до открытия потока ───────────────────────────
+
+
+def test_stream_fails_fast_with_503_when_the_model_is_unavailable(
+    client: TestClient, deps: AppDependencies, base: dict[str, str]
+) -> None:
+    """Режим модели известен до ``stream`` → настоящий 503, а не 200 с ``error``.
+
+    Форма отказа — та же, что у JSON-пути (обработчик ``ModelUnavailableError``),
+    и слот приёма не остаётся занятым: ``/query`` и ``/query/stream`` не должны
+    различаться тем, что один честно отказывает, а второй притворяется стримом.
+    """
+    deps.provider = UnavailableProvider()
+    deps.workflow = ResearchWorkflow(
+        knowledge=deps.knowledge,
+        provider=deps.provider,
+        metrics=deps.metrics,
+        settings=deps.settings,
+    )
+
+    refused = client.post("/api/v1/query/stream", json={"question": QUESTION}, headers=base)
+
+    assert refused.status_code == 503
+    assert refused.headers["content-type"].startswith("application/json")
+    assert "event-stream" not in refused.headers["content-type"]
+    assert refused.json()["detail"]
+    assert deps.admission.active == 0
+
+
+def test_json_and_stream_refusals_have_the_same_shape(
+    client: TestClient, deps: AppDependencies, base: dict[str, str]
+) -> None:
+    """Один и тот же отказ на обоих путях: ``{"detail": ...}`` + 503.
+
+    Разные формы отказа означают, что клиенту нужны две ветки обработки; здесь
+    они намеренно совпадают, поэтому сверяются напрямую.
+    """
+    deps.provider = UnavailableProvider()
+    deps.workflow = ResearchWorkflow(
+        knowledge=deps.knowledge,
+        provider=deps.provider,
+        metrics=deps.metrics,
+        settings=deps.settings,
+    )
+
+    json_route = client.post("/api/v1/query", json={"question": QUESTION}, headers=base)
+    stream_route = client.post("/api/v1/query/stream", json={"question": QUESTION}, headers=base)
+
+    assert json_route.status_code == stream_route.status_code == 503
+    assert set(json_route.json()) == set(stream_route.json()) == {"detail"}
+
+
+def test_stream_keeps_the_in_stream_error_event_for_midrun_failures(
+    client: TestClient, deps: AppDependencies, base: dict[str, str]
+) -> None:
+    """Событие ``error`` остаётся для сбоев посреди прогона: отказ заранее
+    неизвестный не может быть отдан статусом."""
+
+    class _MidrunFailure:
+        async def run(self, query: object, *, allowed_data_classes: object) -> AnswerPayload:
+            raise RuntimeError("здесь нечего ловить")
+
+        async def stream(
+            self, query: object, allowed: object
+        ) -> AsyncIterator[tuple[str, dict[str, object]]]:
+            yield "reasoner", {"trace": []}
+            raise RuntimeError("узел развалился после start")
+
+    deps.workflow = _MidrunFailure()  # type: ignore[assignment]
+    events: list[dict[str, Any]] = []
+    with client.stream(
+        "POST", "/api/v1/query/stream", json={"question": QUESTION}, headers=base
+    ) as stream:
+        assert stream.status_code == 200
+        for line in stream.iter_lines():
+            if line.startswith("data:"):
+                events.append(json.loads(line.removeprefix("data:").strip()))
+
+    kinds = [event["type"] for event in events]
+    assert kinds == ["start", "error"]
+    assert events[-1]["code"] == "workflow_failed"
+
+
+# ── Сбой хранилища: 503 вместо 500 ─────────────────────────────────────────
+
+
+def _break_graph_reads(monkeypatch: pytest.MonkeyPatch, deps: AppDependencies) -> None:
+    """Все чтения графа и очередей падают так, как падает недоступное хранилище."""
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise ServiceUnavailable("Не удалось установить соединение с neo4j:7687")
+
+    for name in ("full_graph", "all_findings", "corpus_stats", "claim_history"):
+        monkeypatch.setattr(deps.knowledge, name, unavailable)
+    monkeypatch.setattr(deps.resolution, "list_proposals", unavailable)
+
+    async def unavailable_state(*args: object, **kwargs: object) -> object:
+        raise psycopg.OperationalError("сервер закрыл соединение")
+
+    monkeypatch.setattr(deps.state, "recent_proposals", unavailable_state)
+
+
+def test_storage_outage_is_service_unavailable_not_an_application_crash(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    expert: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Маршруты чтения графа обязаны различать «базы нет» и «приложение упало».
+
+    Без отображения недоступный Neo4j/Elasticsearch/Postgres давал 500 с пустым
+    объяснением: мониторинг звал разработчика, а аналитик видел красный экран
+    вместо «хранилище не отвечает».
+    """
+    _break_graph_reads(monkeypatch, deps)
+    routes = (
+        ("/api/v1/graph", base),
+        ("/api/v1/findings", base),
+        ("/api/v1/conflicts", base),
+        ("/api/v1/corpus/stats", base),
+        ("/api/v1/claims/finding-ro/history", base),
+        ("/api/v1/dashboard", base),
+        ("/api/v1/proposals", expert),
+        ("/api/v1/entity-resolution/proposals", expert),
+    )
+
+    for path, headers in routes:
+        response = client.get(path, headers=headers)
+        assert response.status_code == 503, f"{path}: {response.text}"
+        assert "Хранилище знаний недоступно" in response.json()["detail"], path
+        assert response.headers["X-Correlation-Id"], path
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        ServiceUnavailable("нет bolt-соединения"),
+        httpx.ConnectError("connection refused"),
+        psycopg.OperationalError("пул закрыт"),
+    ),
+    ids=("neo4j", "http", "postgres"),
+)
+def test_every_storage_transport_family_maps_to_503(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    """Driver Neo4j, HTTP-транспорт и psycopg — одна и та же судьба: 503.
+
+    Список классов ошибок собран по реальным импортам ``services/infrastructure``
+    (neo4j, elasticsearch) и транспорта эмбеддингов/состояния (httpx, psycopg),
+    а не по догадкам: ложный класс в списке означал бы, что часть сбоев
+    по-прежнему уходит как 500.
+    """
+
+    def unavailable() -> object:
+        raise error
+
+    monkeypatch.setattr(deps.knowledge, "corpus_stats", unavailable)
+
+    response = client.get("/api/v1/corpus/stats", headers=base)
+
+    assert response.status_code == 503
+    assert "Хранилище знаний недоступно" in response.json()["detail"]
+
+
+def test_application_bug_is_not_disguised_as_a_storage_outage(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ValueError`` из чтения остаётся ошибкой кода, а не «хранилище не отвечает».
+
+    Широкий ``except Exception`` превратил бы каждый баг в 503 и выключил бы
+    тревогу там, где она нужнее всего.
+    """
+
+    def broken(*args: object, **kwargs: object) -> object:
+        raise ValueError("граф вернул структуру вне схемы")
+
+    monkeypatch.setattr(deps.knowledge, "all_findings", broken)
+
+    with pytest.raises(ValueError):
+        client.get("/api/v1/findings", headers=base)
+
+
+# ── Пагинация списков: тело остаётся массивом ──────────────────────────────
+
+
+def _finding_window(count: int, disputed: int = 0) -> list[Finding]:
+    return [
+        Finding(
+            id=f"finding-{index}",
+            subject="Обессоливание",
+            statement=f"Тезис {index} для проверки окна выдачи.",
+            confidence=0.7,
+            evidence=[],
+            status="disputed" if index < disputed else "consensus",
+        )
+        for index in range(count)
+    ]
+
+
+def test_findings_and_conflicts_are_paginated_with_a_total_header(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``limit``/``offset`` при открытом потоке находок, ``X-Total-Count`` — потолок.
+
+    Тело остаётся массивом: фронтенд (``frontend/src/lib/api.ts``) читает эти
+    маршруты как список, и превращать ответ в объект ради одного числа нельзя.
+    Считается полное число подходящих записей, а не длина окна.
+    """
+    monkeypatch.setattr(deps.knowledge, "all_findings", lambda allowed=None: _finding_window(5, 2))
+
+    window = client.get("/api/v1/findings", headers=base, params={"limit": 2, "offset": 1})
+    default = client.get("/api/v1/findings", headers=base)
+    conflicts = client.get("/api/v1/conflicts", headers=base, params={"limit": 1})
+    beyond = client.get("/api/v1/findings", headers=base, params={"offset": 9})
+
+    assert window.status_code == 200
+    assert isinstance(window.json(), list)
+    assert [item["id"] for item in window.json()] == ["finding-1", "finding-2"]
+    assert window.headers["X-Total-Count"] == "5"
+    assert len(default.json()) == 5
+    # В конфликтах считается только disputed — экран «N расхождений» сходится с
+    # выгрузкой, а не с размером всего корпуса.
+    assert conflicts.headers["X-Total-Count"] == "2"
+    assert [item["status"] for item in conflicts.json()] == ["disputed"]
+    assert beyond.json() == []
+    assert beyond.headers["X-Total-Count"] == "5"
+
+
+def test_pagination_bounds_are_validated(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Неотрицательный смещение и потолок лимита — как у ``/audit``."""
+    monkeypatch.setattr(deps.knowledge, "all_findings", lambda allowed=None: _finding_window(3))
+
+    assert client.get("/api/v1/findings", headers=base, params={"limit": 0}).status_code == 422
+    assert client.get("/api/v1/findings", headers=base, params={"limit": 5000}).status_code == 422
+    assert client.get("/api/v1/findings", headers=base, params={"offset": -1}).status_code == 422
+
+
+def test_proposal_lists_are_paginated(
+    client: TestClient,
+    deps: AppDependencies,
+    expert: dict[str, str],
+) -> None:
+    """``/proposals`` и ``/entity-resolution/proposals`` — окно плюс полный счётчик."""
+    for index in range(3):
+        asyncio.run(
+            deps.state.record_proposal(
+                EvolutionProposal(
+                    source_query_id=UUID(int=index + 1),
+                    kind="gold_case",
+                    title=f"Кейс {index}",
+                    change="Зафиксировать исправленный вывод как ожидаемый ответ.",
+                    impact=["critic"],
+                )
+            )
+        )
+    deps.resolution.register(
+        [
+            EntityResolutionProposal(
+                mention="Обратный осмос",
+                canonical_name="Мембранное обессоливание",
+                action="link",
+                confidence=0.9,
+                rationale="Синонимичные технологии в обзоре и в отчёте.",
+            ),
+            EntityResolutionProposal(
+                mention="Электродиализ",
+                canonical_name="Мембранное обессоливание",
+                action="link",
+                confidence=0.8,
+                rationale="Соседняя схема в том же обзоре.",
+            ),
+        ]
+    )
+
+    proposals = client.get("/api/v1/proposals", headers=expert, params={"limit": 2, "offset": 1})
+    merges = client.get(
+        "/api/v1/entity-resolution/proposals", headers=expert, params={"limit": 1}
+    )
+
+    assert isinstance(proposals.json(), list)
+    assert [item["title"] for item in proposals.json()] == ["Кейс 1", "Кейс 0"]
+    assert proposals.headers["X-Total-Count"] == "3"
+    assert len(merges.json()) == 1
+    # Элемент окна по-прежнему читается объявленной моделью: тело не изменилось.
+    assert EntityMergeProposal.model_validate(merges.json()[0]).status == "proposed"
+    assert merges.headers["X-Total-Count"] == "2"
+
+
+# ── Порог чтения /metrics ──────────────────────────────────────────────────
+
+
+def test_metrics_are_public_only_while_no_token_is_configured(
+    client: TestClient, deps: AppDependencies, base: dict[str, str]
+) -> None:
+    """Без ``METRICS_TOKEN`` эндпоинт открыт (локальный контур), с токеном — Bearer.
+
+    Проверка живёт в ``access_middleware``, а не в зависимости маршрута:
+    ``/metrics`` отдаёт сторонний Instrumentator. Сессия браузера метрики не
+    открывает — иначе вход превращался бы в право читать поведение корпуса.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(deps.settings, "metrics_token", None)
+        assert client.get("/metrics").status_code == 200
+
+        monkeypatch.setattr(deps.settings, "metrics_token", "tok-metrics-2026")
+        assert client.get("/metrics").status_code == 401
+        assert "Authorization: Bearer" in client.get("/metrics").json()["detail"]
+        assert client.get("/metrics", headers=base).status_code == 401
+        assert (
+            client.get("/metrics", headers={"Authorization": "Bearer nope"}).status_code == 401
+        )
+        allowed = client.get("/metrics", headers={"Authorization": "Bearer tok-metrics-2026"})
+        assert allowed.status_code == 200
+        assert "mindai_agent_run_slots" in allowed.text
+    finally:
+        monkeypatch.undo()
+
+
+# ── Кэш витрины переживает только собственную сборку ───────────────────────
+
+
+class _CountingWorkflow:
+    """Рабочий процесс, который считает прогоны: попадание в кэш видно по числу."""
+
+    def __init__(self) -> None:
+        self.runs = 0
+
+    async def run(self, query: Any, *, allowed_data_classes: object) -> AnswerPayload:
+        self.runs += 1
+        return _tiny_answer(f"{query.question} — прогон {self.runs}")
+
+
+def test_demo_cache_is_reset_when_the_corpus_changes(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Импорт документа сбрасывает витрину: старый ответ нового корпуса не даёт.
+
+    ``demo_answer`` кэшируется на процесс, и без сброса витрина продолжала
+    отвечать по корпусу до импорта — обещание «ответ настоящий, из того же
+    корпуса» переставало выполняться ровно в момент импорта.
+    """
+    workflow = _CountingWorkflow()
+    deps.workflow = workflow  # type: ignore[assignment]
+
+    async def fake_ingest(document: DocumentRequest) -> DocumentReceipt:
+        return DocumentReceipt(
+            document_id=UUID(int=9), checksum="sum", status="created", extracted_claims=1
+        )
+
+    monkeypatch.setattr(deps.ingestion, "ingest", fake_ingest)
+
+    first = client.get("/api/v1/demo", headers=base)
+    second = client.get("/api/v1/demo", headers=base)
+    assert first.status_code == 200
+    assert workflow.runs == 1
+    assert first.json()["answer"]["query_id"] == second.json()["answer"]["query_id"]
+
+    imported = client.post(
+        "/api/v1/documents",
+        json={"title": "Отчёт по пилоту", "text": "шахта " * 12},
+        headers=base,
+    )
+    assert imported.status_code == 200
+    third = client.get("/api/v1/demo", headers=base)
+
+    assert third.status_code == 200
+    assert workflow.runs == 2
+    assert third.json()["answer"]["query_id"] != first.json()["answer"]["query_id"]
+
+
+def test_upload_and_supersede_reset_the_demo_cache(
+    client: TestClient,
+    deps: AppDependencies,
+    expert: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Загрузка файла и замена утверждения — те же пути, что меняют корпус."""
+    workflow = _CountingWorkflow()
+    deps.workflow = workflow  # type: ignore[assignment]
+
+    async def fake_ingest(document: DocumentRequest) -> DocumentReceipt:
+        return DocumentReceipt(
+            document_id=UUID(int=10), checksum="sum", status="created", extracted_claims=1
+        )
+
+    def fake_parse(filename: str, content: bytes, **kwargs: object) -> DocumentRequest:
+        return DocumentRequest(title="Отчёт", text="шахта " * 12)
+
+    monkeypatch.setattr(deps.ingestion, "ingest", fake_ingest)
+    monkeypatch.setattr("scientific_tangle.api.app.parse_document", fake_parse)
+
+    assert client.get("/api/v1/demo", headers=expert).status_code == 200
+    assert workflow.runs == 1
+    uploaded = client.post(
+        "/api/v1/documents/upload",
+        files={"file": ("otchet.txt", b"shutdown text " * 10)},
+        data={"data_class": "public"},
+        headers=expert,
+    )
+    assert uploaded.status_code == 200
+    assert client.get("/api/v1/demo", headers=expert).status_code == 200
+    assert workflow.runs == 2
+
+    finding_id = _restricted_finding_id(deps)
+    corrected = client.post(
+        "/api/v1/feedback",
+        json={
+            "query_id": "8f5f34d0-eac1-4a14-853f-4f3a12ae0eef",
+            "finding_id": finding_id,
+            "verdict": "correct",
+            "comment": "Уточнить область применимости",
+            "correction": "Вывод применим только после предварительной очистки.",
+        },
+        headers=expert,
+    )
+    assert corrected.status_code == 200
+    assert client.get("/api/v1/demo", headers=expert).status_code == 200
+    assert workflow.runs == 3

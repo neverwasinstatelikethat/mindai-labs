@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
+from collections import OrderedDict
 from typing import Protocol
 
 import httpx
@@ -17,6 +19,11 @@ logger = logging.getLogger(__name__)
 # а слишком большой батч отбивает весь retry-бюджет preload на одном 4xx.
 _MAX_BATCH = 8
 _MAX_CHARS = 8000
+# Число сетевых попыток при транзиентном отказе; бюджет ``_embed`` делится между
+# ними, поэтому константа участвует и в расчёте таймаута одной попытки.
+_MAX_ATTEMPTS = 4
+# Потолок TTL-мемоизации: 1024-мерный float-вектор ~8 КБ, 512 записей ~4 МБ.
+_MEMO_MAX_ENTRIES = 512
 
 
 class EmbeddingError(RuntimeError):
@@ -53,12 +60,68 @@ class EmbeddingClient(Protocol):
     def documents(self, texts: list[str]) -> list[list[float]]: ...
 
 
+class _EmbeddingCache:
+    """TTL-мемоизация входа /embeddings с LRU-потолком (потокобезопасно).
+
+    ``infrastructure._semantic_ids`` пересчитывал эмбеддинг одного и того же
+    вопроса на каждом retrieval-действии каждого раунда, а переиндексация
+    неизменного документа заново оплачивала те же векторы. Ключ — (модель,
+    текст): при той же модели эмбеддинг детерминирован, поэтому инвалидация по
+    мутациям корпуса ему не нужна, а TTL и потолок ограничивают память и
+    последствия смены размерности на стороне провайдера.
+
+    Выдаёт и хранит только копии списков: вызывающий вправе мутировать свой
+    вектор (knn-запрос), не портя кэш остальным. Нулевой или отрицательный TTL
+    выключает мемоизацию полностью.
+    """
+
+    def __init__(self, *, ttl_seconds: float, max_entries: int) -> None:
+        self._ttl = ttl_seconds
+        self._max_entries = max(max_entries, 1)
+        self._entries: OrderedDict[str, tuple[list[float], float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> list[float] | None:
+        if self._ttl <= 0:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            vector, expires_at = entry
+            if expires_at <= now:
+                del self._entries[key]
+                return None
+            self._entries.move_to_end(key)
+            return list(vector)
+
+    def put(self, key: str, vector: list[float]) -> None:
+        if self._ttl <= 0:
+            return
+        with self._lock:
+            self._entries[key] = (list(vector), time.monotonic() + self._ttl)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
 class GigaChatEmbeddingClient:
     """Клиент GigaChat /embeddings с переиспользуемым токеном и батчингом.
 
     Прежний Yandex-клиент создавал HTTP-соединение и делал по одному запросу на
     каждый finding; здесь соединение и токен живут в одном клиенте, а индексация
     корпуса идёт батчами.
+
+    Два ограничения держат общий ``threading.Lock`` в разумных границах:
+    TTL-мемоизация входа (повторный текст не идёт в сеть вообще) и бюджет
+    ``gigachat_timeout_seconds`` на всю последовательность попыток — раньше четыре
+    сетевые попытки с полным таймаутом и backoff 2+4+8 могли приковать замок на
+    минуты, заблокировав и вопрос аналитика, и индексацию.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -66,15 +129,26 @@ class GigaChatEmbeddingClient:
             raise ValueError("GIGACHAT_API_KEY обязателен для эмбеддингов")
         self._model = settings.gigachat_embeddings_model
         self._dimensions = settings.embedding_dimensions
+        # Бюджет всех сетевых попыток одного ``_embed``: сумма таймаутов и пауз
+        # backoff не вылезает за ``gigachat_timeout_seconds`` — иначе зависший
+        # эндпоинт держит замок далеко за пределами пер-колл таймаута.
+        self._retry_budget_seconds = float(settings.gigachat_timeout_seconds)
         self._client = GigaChat(
             credentials=settings.gigachat_api_key,
             base_url=settings.gigachat_base_url,
             verify_ssl_certs=settings.gigachat_verify_ssl_certs,
             ssl_context=settings.gigachat_ssl_context,
             scope=settings.gigachat_scope,
-            timeout=settings.gigachat_timeout_seconds,
+            # Одна транспортная попытка получает долю бюджета: при зависшем
+            # эндпоинте замок освобождается в границах общего бюджета, а не после
+            # четырёх полных таймаутов подряд.
+            timeout=self._retry_budget_seconds / _MAX_ATTEMPTS,
             max_retries=settings.gigachat_max_retries,
             retry_backoff_factor=0.5,
+        )
+        self._cache = _EmbeddingCache(
+            ttl_seconds=settings.embedding_cache_ttl_seconds,
+            max_entries=_MEMO_MAX_ENTRIES,
         )
         self._lock = threading.Lock()
 
@@ -96,13 +170,46 @@ class GigaChatEmbeddingClient:
             vectors.extend(self._embed(texts[start : start + _MAX_BATCH]))
         return vectors
 
+    def _cache_key(self, text: str) -> str:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return f"{self._model}\x1f{digest}"
+
     def _embed(self, texts: list[str]) -> list[list[float]]:
         payload = [(text or "")[:_MAX_CHARS] for text in texts]
         if not payload:
             return []
+        # Мемоизация до замка: полное попадание не трогает ни блокировку, ни сеть —
+        # повторный вопрос в каждом раунде retrieval перестал быть переплатой.
+        vectors: list[list[float] | None] = [None] * len(payload)
+        missing: list[int] = []
+        for index, text in enumerate(payload):
+            cached = self._cache.get(self._cache_key(text))
+            if cached is None:
+                missing.append(index)
+            else:
+                vectors[index] = cached
+        if missing:
+            fetched = self._embed_uncached([payload[index] for index in missing])
+            for offset, index in enumerate(missing):
+                vector = fetched[offset]
+                self._cache.put(self._cache_key(payload[index]), vector)
+                vectors[index] = vector
+        complete = [vector for vector in vectors if vector is not None]
+        if len(complete) != len(payload):
+            raise EmbeddingError("Внутренняя ошибка кэша эмбеддингов: векторы собраны не все")
+        return complete
+
+    def _embed_uncached(self, payload: list[str]) -> list[list[float]]:
+        call_slice = self._retry_budget_seconds / _MAX_ATTEMPTS
+        deadline = time.monotonic() + self._retry_budget_seconds
+        last_error: Exception | None = None
         with self._lock:
-            last_error: Exception | None = None
-            for attempt in range(4):
+            for attempt in range(_MAX_ATTEMPTS):
+                remaining = deadline - time.monotonic()
+                if attempt and remaining < call_slice:
+                    # Бюджета на полноценную попытку не осталось: честнее
+                    # деградировать сейчас, чем держать замок ещё один таймаут.
+                    break
                 try:
                     response = self._client.embeddings(payload, model=self._model)
                     ordered = sorted(response.data, key=lambda item: item.index)
@@ -120,17 +227,23 @@ class GigaChatEmbeddingClient:
                 ) as error:
                     # Граница сети: наружу уходит только EmbeddingError, чтобы
                     # отказ эмбеддингов деградировал векторную ветку, а не валил
-                    # индексацию целиком.
+                    # индексацию целиком. Ошибка в мемо не попадает никогда.
                     last_error = error
-                    if _refused_for_good(error) or attempt == 3:
+                    if _refused_for_good(error) or attempt == _MAX_ATTEMPTS - 1:
                         break
-                    time.sleep(min(2.0 ** (attempt + 1), 8.0))
+                    pause = min(2.0 ** (attempt + 1), 8.0)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    # Пауза отрезается остатком бюджета: сумма sleep + attempts
+                    # остаётся внутри gigachat_timeout_seconds.
+                    time.sleep(min(pause, remaining))
             raise EmbeddingError(f"Эмбеддинги недоступны: {last_error}") from last_error
 
     def _reconcile_dimensions(self, actual: int) -> None:
         """Фиксирует фактическую размерность: маппинг ES создаётся по ней.
 
-        Вызывается только из ``_embed``, где замок уже удерживается;
+        Вызывается только из ``_embed_uncached``, где замок уже удерживается;
         ``threading.Lock`` не реентерабелен, повторный захват остановил бы
         индексацию навсегда.
         """

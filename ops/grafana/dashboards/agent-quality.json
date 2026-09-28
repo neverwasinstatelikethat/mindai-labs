@@ -1,0 +1,1042 @@
+{
+  "uid": "mindai-agent-quality",
+  "title": "Научный Клубок — агентный контур, GigaChat и приём запросов",
+  "description": "Наблюдаемость рабочего контура проверяемых R&D-знаний: обращения к модели, schema-repair повторы, кэш structured output, отмены и таймауты, приём агентных прогонов (429), ёмкость слотов, retrieval-отказы и HTTP-контур. Все панели берутся из /metrics backend'а (job mindai-backend, scrape_interval 15s в ops/prometheus/prometheus.yml) и из prometheus-fastapi-instrumentator. Данных здесь нет и не появляется синтетически: панель без живого трафика GigaChat остаётся пустой — это честный ответ «не измерялось», а не «значение равно нулю». Что здесь НЕ измеряется: стоимость запросов в деньгах (тарифной сетки в конфигурации нет), расход токенов по учётным записям (он живёт в таблице nk_llm_usage серверного состояния, а не в Prometheus: аккаунт как метка дал бы неограниченную cardinality), причины деградации ответов (mindai_agent_degradations_total экспортируется реестром, но ни один вызывающий модуль его пока не заполняет — панели для него нет) и таймауты модели как отдельный класс отказа (mindai_llm_timeouts_total ждёт разметки со стороны провайдера).",
+  "tags": [
+    "mindai",
+    "научный-клубок",
+    "agents",
+    "llm"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "style": "dark",
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Источник метрик",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Как читать этот дашборд",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Что здесь считается нормой, а что — признаком порчи ответа.**\n\n* `mindai_llm_retries_total` — schema-repair повторы: GigaChat не прошёл валидацию structured output со второй и третьей попытки. Рост доли повторов при неизменном числе отказов — первый признак порчи JSON у провайдера, а не медленной модели.\n* `mindai_llm_cancelled_total` и `mindai_llm_timeouts_total` — не отказы модели. Отмена приходит от оборванного SSE или агентного дедлайна, таймаут чинится `GIGACHAT_TIMEOUT_SECONDS`, а не repair-промптом.\n* `mindai_agent_run_refusals_total` — честный 429 приёма: слотов нет, ожидания внутри чужого дедлайна нет. Растёт вместе с `mindai_agent_run_slots{state=\"active\"}` упирающимся в `limit`.\n* `mindai_llm_queue_waits_total` — очередь внутри провайдера: ровно то место, где дедлайн тратится молча.\n\nПанели наполняются только живым трафиком: на `KNOWLEDGE_BACKEND=memory` без `GIGACHAT_API_KEY` сервис поднимается в `degraded`, LLM-зависимые ответы отдают 503, и обращения к модели здесь просто не появляются. Пустой график — это «не измерялось», а не «ноль»."
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "Обращения к модели (GigaChat)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Скорость обращений к модели",
+      "description": "mindai_llm_calls_total{schema,status} — исход последней попытки обращения по схеме structured output.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (schema, status) (rate(mindai_llm_calls_total[$__rate_interval]))",
+          "legendFormat": "{{schema}} · {{status}}",
+          "interval": ""
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Длительность обращения: p50 / p95 / p99",
+      "description": "mindai_llm_duration_seconds — полный complete_model: ожидание слота плюс транспортные и repair-попытки. Бакеты кончаются на 180 с: выше этого значения перцентиль не поднимется, и p99 у потолка означает, что вызовы упираются в таймаут.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mindai_llm_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mindai_llm_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mindai_llm_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Отмены и таймауты обращений",
+      "description": "mindai_llm_cancelled_total — отмена клиента (обрыв SSE) или агентный дедлайн; в отказы модели такие вызовы не входят намеренно. mindai_llm_timeouts_total — вызов не уложился в таймаут провайдера: счётчик заполняется, только когда провайдер помечает его явно, поэтому пустая линия «таймаут» значит «не размечено», а не «таймаутов не было».",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (schema) (rate(mindai_llm_cancelled_total[$__rate_interval]))",
+          "legendFormat": "отмена · {{schema}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (schema) (rate(mindai_llm_timeouts_total[$__rate_interval]))",
+          "legendFormat": "таймаут · {{schema}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Доля schema-repair повторов",
+      "description": "mindai_llm_retries_total к числу обращений: сколько ответов GigaChat пришлось переделывать из-за непрошедшей валидации. Пустой график при живых запросах означает, что репетитор-патч провайдера не срабатывал ни разу.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0,
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_llm_retries_total[$__rate_interval])) / sum(rate(mindai_llm_calls_total[$__rate_interval]))",
+          "legendFormat": "повторы / обращения"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (schema) (rate(mindai_llm_retries_total[$__rate_interval])) / sum by (schema) (rate(mindai_llm_calls_total[$__rate_interval]))",
+          "legendFormat": "{{schema}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Кэш: доля попаданий (structured output и граф)",
+      "description": "mindai_llm_cache_total — кэш ответов structured output провайдера (LLM_CACHE_TTL_SECONDS); mindai_graph_cache_total — кэш полного графа знаний. Промах по кэшу модели равен одному оплаченному вызову GigaChat.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0,
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_llm_cache_total{result=\"hit\"}[$__rate_interval])) / sum(rate(mindai_llm_cache_total[$__rate_interval]))",
+          "legendFormat": "кэш structured output"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_graph_cache_total{result=\"hit\"}[$__rate_interval])) / sum(rate(mindai_graph_cache_total[$__rate_interval]))",
+          "legendFormat": "кэш графа"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Токены модели",
+      "description": "mindai_llm_tokens_total{kind} — сумма по всем попыткам одного обращения, включая repair: usage последнего ответа занижал бы расход. Расход по учётным записям смотрят не здесь, а в nk_llm_usage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (kind) (rate(mindai_llm_tokens_total[$__rate_interval]))",
+          "legendFormat": "{{kind}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(mindai_llm_tokens_total[$__range]))",
+          "legendFormat": "всего за окно"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Приём запросов, ёмкость и очередь",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Отказы приёма агентного запроса (429)",
+      "description": "mindai_agent_run_refusals_total — серверный счётчик слотов приёма; рядом — те же отказы глазами HTTP-слоя (http_requests_total по ручкам исследования). Расхождение значит, что 429 приходит не из приёма (троттлинг входа тоже отдаёт 429).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_agent_run_refusals_total[$__rate_interval]))",
+          "legendFormat": "отказ приёма"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (handler) (rate(http_requests_total{handler=~\"/api/v1/(query|demo).*\", status=\"429\"}[$__rate_interval]))",
+          "legendFormat": "HTTP 429 · {{handler}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Ёмкость: слоты приёма и LLM-семафор",
+      "description": "mindai_agent_run_slots{state} и mindai_llm_slots{state} абсолютными значениями: active у limit — это порог, за которым начинаются 429, waiting у модели — очередь внутри чужого дедлайна.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mindai_agent_run_slots{state=~\"active|limit\"}",
+          "legendFormat": "агент {{state}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mindai_llm_slots{state=~\"in_flight|waiting|limit\"}",
+          "legendFormat": "модель {{state}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Ожидание слота модели",
+      "description": "mindai_llm_queue_waits_total — один инкремент на одно обращение, которому пришлось ждать освобождения семафора провайдера.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_llm_queue_waits_total[$__rate_interval]))",
+          "legendFormat": "обращений ждали слот"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Агентный граф и качество прогонов",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Доля успешных прогонов узлов графа",
+      "description": "mindai_agent_runs_total{status} — исход узла после всех его repair-попыток. Модель недоступна (503) сюда попадает как failure узла, поэтому панель читают вместе с долей отказов обращений к модели.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0,
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (agent) (rate(mindai_agent_runs_total{status=\"success\"}[$__rate_interval])) / sum by (agent) (rate(mindai_agent_runs_total[$__rate_interval]))",
+          "legendFormat": "{{agent}}"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Длительность узлов графа: p50 / p95 / p99",
+      "description": "mindai_agent_duration_seconds по каждому узлу. p99 у узла reasoner/critic ближе всего к AGENT_DEADLINE_SECONDS: именно там ответ начинает деградировать.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (agent, le) (rate(mindai_agent_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 · {{agent}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (agent, le) (rate(mindai_agent_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 · {{agent}}"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (agent, le) (rate(mindai_agent_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 · {{agent}}"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Причины деградации ответов",
+      "description": "mindai_agent_degradations_total{reason} — по каким причинам рабочий процесс уложился в лимит: timeout (дедлайн прогона), recursion_limit (потолок tool-раундов), node:<имя> (сбой узла графа), no_answer (рабочий процесс не вернул ответа). Каждый случай отдаёт аналитику неполный ответ с degradation_reasons, а не молчаливую обрезку: рост одной причины — это сигнал правки бюджета, а не «модель хуже пишет».",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason) (rate(mindai_agent_degradations_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "row",
+      "title": "Retrieval и HTTP-контур",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Отказы retrieval-контура",
+      "description": "mindai_retrieval_failures_total{component} — деградации эмбеддингов, rerank и community detection. На живом контуре Neo4j/Elasticsearch рост означает лексический fallback вместо векторного поиска.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 49
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (component) (rate(mindai_retrieval_failures_total[$__rate_interval]))",
+          "legendFormat": "{{component}}"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Ошибочные ответы API (4xx/5xx)",
+      "description": "http_requests_total от prometheus-fastapi-instrumentator по ручке и статусу. Отдельно видны 401/403 (доступ), 422 (схема запроса) и 5xx рабочего процесса.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 49
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (status, handler) (rate(http_requests_total{handler=~\"/api/v1/.*\", status=~\"[45]..\"}[$__rate_interval]))",
+          "legendFormat": "{{status}} · {{handler}}"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Возраст кэша полного графа",
+      "description": "mindai_full_graph_cache_age_seconds — сколько времени сообщества и обход считаются по снимку графа. После записи в корпус кэш инвалидируется явно, поэтому большой возраст сам по себе не ошибка.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 57
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mindai_full_graph_cache_age_seconds",
+          "legendFormat": "возраст кэша"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Длительность HTTP-запросов: p95 и p99",
+      "description": "http_request_duration_highr_seconds — бакеты повышенной точности без меток. Для SSE-ручек время ответа включает весь поток, поэтому p99 /api/v1/query/stream сопоставляют с дедлайном исследования, а не с временем открытия вкладки.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 57
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_highr_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 API"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_highr_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 API"
+        }
+      ]
+    }
+  ]
+}

@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections import deque
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+import threading
+import time
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid5
 
@@ -31,8 +33,11 @@ from scientific_tangle.domain.models import (
 )
 from scientific_tangle.services.communities import (
     DEFAULT_PROFILE_LIMIT,
-    community_briefs,
+    MAX_PROFILE_CLAIMS,
+    CommunityProfile,
+    build_community_profiles,
     detect_communities,
+    rank_community_profiles,
 )
 from scientific_tangle.services.governance import AccessPolicyEngine
 from scientific_tangle.services.reranking import query_tokens, rerank_findings
@@ -72,26 +77,230 @@ CHUNK_QUOTE_LIMIT = 1200
 CHUNK_STATEMENT_LIMIT = 4000
 CHUNK_MIN_CHARS = 40
 
+# Сколько живут производные от графа сводки сообществ и сколько ключей держится в
+# кэше. Значения совпадают с TTL полного графа в production-ветке
+# (``GRAPH_CACHE_TTL_SECONDS`` в services/infrastructure.py): производный кэш не
+# имеет права переживать граф, из которого собран.
+BRIEF_CACHE_TTL_SECONDS = 30.0
+BRIEF_CACHE_MAX_ENTRIES = 8
+
+# Ключ кэша сводок: (поколение графа, срез доступа, набор сообществ). Поколение
+# меняет любой вызов ``_invalidate()``/``_invalidate_graph_cache()``, то есть
+# любая запись в корпус, поэтому ключ сам по себе исключает устаревший профиль.
+GraphStamp = tuple[object, ...]
+BriefKey = tuple[GraphStamp, frozenset[str] | None, tuple[str, ...]]
+
 
 def stable_uuid(value: str) -> UUID:
     return uuid5(NAMESPACE, value)
 
 
 __all__ = [
+    "BRIEF_CACHE_TTL_SECONDS",
     "CHUNK_STRIDE",
     "CHUNK_WINDOW",
+    "BriefKey",
     "ChunkPiece",
+    "CommunityBriefCache",
+    "CommunityViews",
+    "GraphStamp",
     "InMemoryKnowledgeBase",
     "KnowledgeBase",
     "RetrievalContext",
+    "brief_key",
+    "cached_community_briefs",
     "chunk_document",
     "chunk_finding",
     "document_scope",
     "finalize_retrieval",
     "finding_communities",
+    "graph_element_ids",
     "quote_offsets",
     "stable_uuid",
 ]
+
+
+def brief_key(
+    stamp: GraphStamp,
+    allowed_data_classes: set[DataClass] | None,
+    communities: Sequence[str],
+) -> BriefKey:
+    """Ключ производного от графа кэша: поколение, срез доступа, набор сообществ.
+
+    Срез доступа входит в ключ обязательно: профиль, собранный по одному набору
+    разрешённых классов данных, не имеет права доставаться другому — иначе
+    restricted-метки уедут в промпт модели в обход политик.
+    """
+    allowed = (
+        None
+        if allowed_data_classes is None
+        else frozenset(item.value for item in allowed_data_classes)
+    )
+    return (stamp, allowed, tuple(communities))
+
+
+def cached_community_briefs(
+    cache: CommunityBriefCache,
+    key: BriefKey,
+    snapshot: Callable[[], GraphSnapshot],
+    findings: Iterable[Finding],
+    tokens: Iterable[str],
+    limit: int = DEFAULT_PROFILE_LIMIT,
+) -> list[str]:
+    """Сводки сообществ через кэш профилей — общий путь для обоих бэкендов.
+
+    ``snapshot`` вызывается только на промахе: на попадании профили зависят
+    исключительно от графовой части, а ACL-срез входит в ключ.
+    """
+    views = cache.views(key)
+    if views is None:
+        built = snapshot()
+        views = cache.store(key, built.nodes, built.edges)
+    return cache.briefs(views, findings, tokens, limit)
+
+
+@dataclass(frozen=True, slots=True)
+class CommunityViews:
+    """Графовая часть сводок: профили сообществ и принадлежность узлов.
+
+    Профиль сообщества — чистая функция от узлов и рёбер (метки, состав по типам,
+    источники, датировка, территория). Находки плана влияют только на поле
+    ``claims``, поэтому в кэш идёт именно эта независимая от запроса часть, а
+    утверждения кандидатов подмешиваются на каждый вызов.
+    """
+
+    key: BriefKey
+    profiles: tuple[CommunityProfile, ...]
+    membership: Mapping[str, str]
+
+
+class CommunityBriefCache:
+    """Кэш профилей сообществ, общий для memory- и neo4j-контура.
+
+    ``community_briefs`` пересобирает профили по всему ACL-графу на каждое
+    действие: исследовательский запрос делает это до 24 раз подряд на одном и том
+    же графе (`AGENT_MAX_TOOL_ROUNDS` ≤ 4 × не более 6 действий в плане). Кэш
+    короткоживущий и инвалидируется по поколению графа — в тех же точках записи,
+    что и кэш полного графа.
+
+    Замок обязателен: действия одного запроса исполняются параллельно в
+    worker-потоках (``asyncio.to_thread`` в agents/tools.py), а ``OrderedDict`` с
+    LRU-перестановкой при чтении не атомарен. Значение собирается целиком до
+    записи, так что гонка потоков дала бы только повторный пересчёт, но не
+    частичный профиль.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = BRIEF_CACHE_TTL_SECONDS,
+        max_entries: int = BRIEF_CACHE_MAX_ENTRIES,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._max_entries = max(1, max_entries)
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[BriefKey, tuple[float, CommunityViews]] = OrderedDict()
+
+    def invalidate(self) -> None:
+        """Сбрасывает всё: любое изменение корпуса делает профили неверными."""
+        with self._lock:
+            self._entries.clear()
+
+    def views(self, key: BriefKey) -> CommunityViews | None:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            stored_at, views = entry
+            if time.monotonic() - stored_at >= self._ttl:
+                self._entries.pop(key, None)
+                return None
+            self._entries.move_to_end(key)
+            return views
+
+    def store(
+        self, key: BriefKey, nodes: Sequence[GraphNode], edges: Sequence[GraphEdge]
+    ) -> CommunityViews:
+        # Профили без находок: ``claims`` такого профиля — метки узлов-утверждений,
+        # то есть ровно та часть поля, которую даёт один граф; утверждения
+        # кандидатов подмешиваются сверх неё (см. ``_with_finding_claims``).
+        profiles = build_community_profiles(nodes, edges)
+        membership = {
+            node.id: str(node.metadata["community"])
+            for node in nodes
+            if isinstance(node.metadata.get("community"), str)
+        }
+        views = CommunityViews(key=key, profiles=tuple(profiles), membership=membership)
+        with self._lock:
+            self._entries[key] = (time.monotonic(), views)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+        return views
+
+    def briefs(
+        self,
+        views: CommunityViews,
+        findings: Iterable[Finding],
+        tokens: Iterable[str],
+        limit: int,
+    ) -> list[str]:
+        """Сводки поверх кэшированных профилей — то же, что возвращает ``community_briefs``."""
+        profiles = _with_finding_claims(views, findings)
+        if not profiles:
+            return []
+        return [profile.summary() for profile in rank_community_profiles(profiles, tokens, limit)]
+
+
+def _with_finding_claims(
+    views: CommunityViews, findings: Iterable[Finding]
+) -> list[CommunityProfile]:
+    """Подмешивает утверждения кандидатов в профили — дословно как communities.py.
+
+    ``build_community_profiles`` собирает ``claims`` как
+    ``dict.fromkeys([*метки_узлов_утверждений, *утверждения_находок])[:MAX_PROFILE_CLAIMS]``.
+    Кэш держит первую половину этого слияния, уже обрезанную по потолку: если в
+    кэшированном профиле набрался полный потолок, утверждениям находок места не
+    достаётся и профиль уходит как есть, а иначе слияние повторяется здесь.
+    Порядок и потолок обязаны совпадать — расхождение тест сравнивает напрямую
+    (``test_cached_briefs_match_community_briefs`` и
+    ``test_cached_briefs_match_community_briefs_on_merged_claims``).
+    """
+    statements: dict[str, list[str]] = {}
+    for finding in findings:
+        community = views.membership.get(finding.id.removeprefix("finding-"))
+        if community is None:
+            continue
+        bucket = statements.setdefault(community, [])
+        if len(bucket) < MAX_PROFILE_CLAIMS:
+            bucket.append(finding.statement[:160].strip())
+    if not statements:
+        return list(views.profiles)
+    merged: list[CommunityProfile] = []
+    for profile in views.profiles:
+        extra = statements.get(profile.name)
+        if not extra or len(profile.claims) >= MAX_PROFILE_CLAIMS:
+            merged.append(profile)
+            continue
+        merged.append(
+            replace(
+                profile,
+                claims=tuple(dict.fromkeys([*profile.claims, *extra]))[:MAX_PROFILE_CLAIMS],
+            )
+        )
+    return merged
+
+
+def graph_element_ids(
+    nodes: Iterable[GraphNode], edges: Iterable[GraphEdge]
+) -> tuple[set[str], set[str]]:
+    """Множества id узлов и рёбер снимка — единственное, что нужно диффу импорта.
+
+    Состояние «до записи» раньше сравнивали через ``full_graph()``: он строит глубокую
+    копию всего графа и поднимает пересчёт сообществ, то есть на загрузке корпуса из
+    сотен документов стоимость росла квадратично при том, что из снимка «до» читают
+    только ``id`` — сами элементы для диффа берёт снимок «после».
+    """
+    return ({node.id for node in nodes}, {edge.id for edge in edges})
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,11 +652,20 @@ class InMemoryKnowledgeBase:
         self._graph = self._seed_graph()
         self._version_chains: dict[str, list[str]] = {}
         self._communities: list[str] | None = None
+        # Поколение графа: растёт на каждую запись и входит в ключ кэша сводок,
+        # поэтому устаревший профиль не может пережить изменившийся корпус.
+        self._graph_epoch = 0
+        self._brief_cache = CommunityBriefCache()
 
     # ── Инварианты версии графа ─────────────────────────────────────────────
 
     def _invalidate(self) -> None:
+        # Единая точка сброса производных кэшей: сюда приводят все записи каталога
+        # (ingest, index_document, supersede_finding, register_findings, откат),
+        # поэтому ни сводки сообществ, ни список кластеров не переживают мутацию.
         self._communities = None
+        self._graph_epoch += 1
+        self._brief_cache.invalidate()
 
     def _ensure_communities(self) -> list[str]:
         if self._communities is None:
@@ -725,7 +943,10 @@ class InMemoryKnowledgeBase:
             )
         graph, graph_notes = self._neighbourhood(retrieval_plan, allowed_data_classes)
         notes.extend(graph_notes)
-        candidates = self.rank_findings(
+        # Копия находок здесь не нужна: `finalize_retrieval` копирует ровно то, что
+        # ушло в выдачу, — двойное глубокое копирование кандидатов на каждое
+        # действие только удваивало цену ранжирования.
+        candidates = self._rank_view(
             retrieval_plan.lexical_query,
             candidate_window(plan, RETRIEVAL_TOP_K),
             "hybrid",
@@ -734,15 +955,10 @@ class InMemoryKnowledgeBase:
         wants_global = retrieval_plan.use_community_context or retrieval_plan.use_global_context
         briefs: list[str] = []
         if wants_global:
-            # Сводки — часть ответа: граф под них срезается по ACL до построения,
-            # иначе restricted-метка узла уходит в промпт модели в обход политик.
-            snapshot = self.full_graph(allowed_data_classes)
-            briefs = community_briefs(
-                snapshot.nodes,
-                snapshot.edges,
+            briefs = self._community_briefs(
+                allowed_data_classes,
                 candidates,
                 query_tokens(retrieval_plan.lexical_query),
-                DEFAULT_PROFILE_LIMIT,
             )
             notes.extend(global_context_notes(retrieval_plan.use_global_context, briefs))
         return finalize_retrieval(
@@ -752,6 +968,32 @@ class InMemoryKnowledgeBase:
             community_summaries=briefs,
             vectors_used=False,
             notes=notes,
+        )
+
+    def _community_briefs(
+        self,
+        allowed_data_classes: set[DataClass] | None,
+        findings: Sequence[Finding],
+        tokens: Iterable[str],
+    ) -> list[str]:
+        """Сводки сообществ с кэшем профилей по поколению графа и срезу доступа.
+
+        Сводки — часть ответа: граф под них срезается по ACL до построения, иначе
+        restricted-метка узла уходит в промпт модели в обход политик. Срез входит в
+        ключ кэша, поэтому профиль, собранный для одного набора классов данных, не
+        может быть выдан другому.
+        """
+        # Сообщества считаются один раз на поколение графа, и здесь они только
+        # читаются: ключ обязан описывать граф, а не строку запроса.
+        communities = tuple(self._ensure_communities())
+        key = brief_key((self._graph_epoch,), allowed_data_classes, communities)
+        return cached_community_briefs(
+            self._brief_cache,
+            key,
+            lambda: self.full_graph(allowed_data_classes),
+            findings,
+            tokens,
+            DEFAULT_PROFILE_LIMIT,
         )
 
     def _neighbourhood(
@@ -832,7 +1074,30 @@ class InMemoryKnowledgeBase:
         allowed_data_classes: set[DataClass] | None = None,
         semantic_query: str | None = None,
     ) -> list[Finding]:
+        """Публичная выдача каталога: наружу уходят копии, а не объекты хранилища.
+
+        Вызывающий вне каталога (оценка качества, обработчик API) вправе менять
+        результат, не трогая корпус. ``retrieve`` берёт ``_rank_view`` и копированием
+        на границе занимается ``finalize_retrieval`` — один раз на итоговую выдачу,
+        а не дважды на окно кандидатов.
+        """
+        return [
+            finding.model_copy(deep=True)
+            for finding in self._rank_view(query, top_k, mode, allowed_data_classes, semantic_query)
+        ]
+
+    def _rank_view(
+        self,
+        query: str,
+        top_k: int = RETRIEVAL_TOP_K,
+        mode: str = "hybrid",
+        allowed_data_classes: set[DataClass] | None = None,
+        semantic_query: str | None = None,
+    ) -> list[Finding]:
         """Ранжирует findings и один раз прогоняет их через общий re-rank.
+
+        Возвращает общие с каталогом модели — только для внутреннего контура, где
+        находки читают (``finalize_retrieval``, сводки сообществ).
 
         * ``lexical``  — совпадение токенов в statement (baseline).
         * ``hybrid``   — лексика + evidence-контекст + источник + subject.
@@ -871,7 +1136,7 @@ class InMemoryKnowledgeBase:
         )
         if reranked.degraded:
             logger.warning("Re-rank не содержательных сигналов: выдача могла остаться случайной.")
-        return [finding.model_copy(deep=True) for finding in reranked.findings]
+        return list(reranked.findings)
 
     @staticmethod
     def _score(
@@ -962,27 +1227,69 @@ class InMemoryKnowledgeBase:
         )
 
     def full_graph(self, allowed_data_classes: set[DataClass] | None = None) -> GraphSnapshot:
-        # Сообщества проставляются в metadata узлов до копирования: иначе
+        """Снимок графа для чтения: новые списки-контейнеры, общие модели элементов.
+
+        Прежняя политика копировала вглубь каждый узел и каждое ребро — на
+        синтетическом графе 5 000 узлов / 15 000 рёбер это ~115 мс из ~169 мс одного
+        retrieval-действия с глобальным контекстом (замер локального контура,
+        memory-бэкенд), при том что снимок только читают (профили сообществ, обход,
+        каталог находок). Правка возвращённого списка по-прежнему не достаёт до
+        каталога: список всегда новый, а ``AccessPolicyEngine.filter_graph``
+        собирает собственные списки из входа.
+
+        Кто реально пишет в модели графа — ``detect_communities``, проставляющий
+        ``node.metadata["community"]``. В memory-контуре он вызывается исключительно
+        по собственному списку узлов (``_ensure_communities``), то есть до построения
+        снимка, поэтому общий с каталогом узел неотличим от копии по метке
+        сообщества: на этом стоит тест ``test_memory_backend_returns_computed_communities``.
+        """
+        # Сообщества проставляются в metadata узлов до построения снимка: иначе
         # копия уходит без community, а кэш-объект — с ним.
         communities = list(self._ensure_communities())
-        snapshot = GraphSnapshot(
-            nodes=[node.model_copy(deep=True) for node in self._graph.nodes],
-            edges=[edge.model_copy(deep=True) for edge in self._graph.edges],
-            communities=communities,
-        )
         if allowed_data_classes is None:
-            return snapshot
+            return GraphSnapshot(
+                nodes=list(self._graph.nodes),
+                edges=list(self._graph.edges),
+                communities=communities,
+            )
         # Один движок политик на весь контур: он срезает и рёбра, у которых
         # конец попал под ограничение, иначе граф остаётся с висячими ссылками.
-        return AccessPolicyEngine().filter_graph(snapshot, allowed_data_classes)
+        return AccessPolicyEngine().filter_graph(
+            GraphSnapshot(
+                nodes=self._graph.nodes,
+                edges=self._graph.edges,
+                communities=communities,
+            ),
+            allowed_data_classes,
+        )
 
     def all_findings(self, allowed_data_classes: set[DataClass] | None = None) -> list[Finding]:
+        """Каталог находок для внешних потребителей — копия на границе.
+
+        Список отдают API и оценка качества, и они вправе менять результат:
+        правка ``statement`` в выданной модели не должна переписывать корпус.
+        Внутренним путям (сверка диффа при импорте) копии не нужны — там читают
+        только ``id`` и ``superseded_by``.
+        """
         return [
             finding.model_copy(deep=True)
             for finding in self._findings.values()
             if finding.superseded_by is None
             and (allowed_data_classes is None or finding.data_class in allowed_data_classes)
         ]
+
+    def finding_catalog(self) -> Mapping[str, Finding]:
+        """Каталог актуальных находок без копирования — для внутреннего диффа.
+
+        Только для чтения: словарь отдаёт объекты хранилища, чтобы сверку «какие
+        id появились после записи» не оплачивали глубоким копированием всего
+        каталога на каждый документ загрузки.
+        """
+        return {
+            key: value
+            for key, value in self._findings.items()
+            if value.superseded_by is None
+        }
 
     def supersede_finding(
         self,

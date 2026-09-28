@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -28,6 +30,7 @@ from scientific_tangle.domain.contracts import (
     Finding,
     GraphEdge,
     GraphNode,
+    GraphSnapshot,
     NodeType,
     RetrievalPlan,
     ToolAction,
@@ -40,9 +43,13 @@ from scientific_tangle.domain.intelligence import (
     ScopeDimension,
 )
 from scientific_tangle.domain.models import NumericObservation, QueryPlan
+from scientific_tangle.services import knowledge as knowledge_module
 from scientific_tangle.services.communities import (
+    DEFAULT_PROFILE_LIMIT,
     FALLBACK_COMMUNITY,
+    MAX_PROFILE_CLAIMS,
     MIN_COMMUNITY_SIZE,
+    community_briefs,
     detect_communities,
 )
 from scientific_tangle.services.context_budget import (
@@ -57,7 +64,13 @@ from scientific_tangle.services.infrastructure import (
     EXPAND_CYPHER,
     reciprocal_rank_fusion,
 )
-from scientific_tangle.services.knowledge import InMemoryKnowledgeBase
+from scientific_tangle.services.knowledge import (
+    CommunityBriefCache,
+    InMemoryKnowledgeBase,
+    brief_key,
+    cached_community_briefs,
+)
+from scientific_tangle.services.reranking import query_tokens
 from scientific_tangle.services.research_intelligence import (
     DEFAULT_GAP_LIMIT,
     ResearchIntelligenceService,
@@ -199,6 +212,395 @@ def test_memory_backend_returns_computed_communities() -> None:
 
     assert graph.communities
     assert all(node.metadata.get("community") for node in graph.nodes)
+
+
+def test_full_graph_is_a_fresh_container_over_shared_models() -> None:
+    """Снимок графа — новый контейнер над общими моделями, а не глубокая копия.
+
+    Глубокое копирование всего графа на каждое действие retrieval стоило дороже
+    самого обхода; контракт при этом остаётся: правка возвращённого списка не
+    достает до каталога, а ACL-срез обязано видно в тех же объектах, что и кэш.
+    """
+    knowledge = InMemoryKnowledgeBase()
+    nodes_before = len(knowledge._graph.nodes)
+    edges_before = len(knowledge._graph.edges)
+
+    snapshot = knowledge.full_graph()
+    scoped = knowledge.full_graph({DataClass.PUBLIC})
+
+    assert snapshot.nodes is not knowledge._graph.nodes
+    assert snapshot.edges is not knowledge._graph.edges
+    assert snapshot.nodes[0] is knowledge._graph.nodes[0]
+    assert scoped.nodes[0] is knowledge._graph.nodes[0]
+    snapshot.nodes.clear()
+    snapshot.edges.clear()
+    assert len(knowledge._graph.nodes) == nodes_before
+    assert len(knowledge._graph.edges) == edges_before
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    [None, {DataClass.PUBLIC}, PUBLIC_SCOPE, {*PUBLIC_SCOPE, DataClass.RESTRICTED}],
+)
+@pytest.mark.parametrize("candidates", [0, 1, 5])
+def test_cached_briefs_match_community_briefs(
+    allowed: set[DataClass] | None, candidates: int
+) -> None:
+    """Кэш сводок отдаёт ровно то, что посчитал бы `community_briefs`.
+
+    Подмешивание утверждений кандидатов в графовую часть профиля — единственное
+    место, где кэш повторяет логику services/communities.py: расхождение
+    проявилось бы в тексте глобального контекста, а не ошибкой, поэтому сверяется
+    напрямую и на промахе, и на попадании.
+
+    Разложение по поколениям графа, по срезам доступа и по насыщению потолка
+    утверждений (`MAX_PROFILE_CLAIMS`) добирается в соседних проверках этого же
+    блока: ``test_cached_briefs_match_community_briefs_on_merged_claims``,
+    ``test_brief_cache_is_keyed_by_acl_slice`` и
+    ``test_brief_cache_entry_dies_with_the_graph_epoch``.
+    """
+    knowledge = InMemoryKnowledgeBase()
+    findings = knowledge.all_findings()[:candidates]
+    tokens = query_tokens("обратный осмос задержание солей")
+    snapshot = knowledge.full_graph(allowed)
+    expected = community_briefs(
+        snapshot.nodes, snapshot.edges, findings, tokens, DEFAULT_PROFILE_LIMIT
+    )
+
+    missed = knowledge._community_briefs(allowed, findings, tokens)
+    hit = knowledge._community_briefs(allowed, findings, tokens)
+
+    assert expected
+    assert missed == expected
+    assert hit == missed
+    # Попадание, а не молчаливый пересчёт: на оба вызова — одна запись кэша.
+    assert len(knowledge._brief_cache._entries) == 1
+
+
+def profiled_nodes(name: str, claim_labels: list[str]) -> list[GraphNode]:
+    """Узлы одного сообщества с уже проставленной меткой ``community``.
+
+    Профили собираются по ``metadata.community``, а не по результату кластеризации:
+    синтетический граф обязан давать предсказуемое число утверждений — ровно то,
+    что сравнивается с потоком через кэш. Материалный узел не влияет на ``claims``.
+    """
+    nodes = [
+        GraphNode(
+            id=f"claim-{name}-{index}",
+            label=label,
+            type=NodeType.CLAIM,
+            metadata={"community": name},
+        )
+        for index, label in enumerate(claim_labels)
+    ]
+    nodes.append(
+        GraphNode(
+            id=f"entity-{name}",
+            label=f"Узел {name}",
+            type=NodeType.MATERIAL,
+            metadata={"community": name},
+        )
+    )
+    return nodes
+
+
+def bound_finding(node_id: str, statement: str) -> Finding:
+    """Находка, привязанная к узлу графа: ``finding-<id узла>``, как в корпусе.
+
+    Связь утверждения с сообществом идёт только через id узла (``subject`` у
+    структурных находок пуст), поэтому seed-находки memory-контура в слиянии
+    участвуют лишь после того, как их id совпадут с id узлов.
+    """
+    return make_finding(f"finding-{node_id}", statement, [])
+
+
+def claims_of(brief: str) -> list[str]:
+    """Поле ``claims`` сводки: секция «утверждения: …» до следующей части профиля.
+
+    Сверять весь текст нельзя: метки участников попадают в секцию «сущности» и
+    пересекаются с утверждениями, а проверяется именно состав и порядок ``claims``
+    — единственное поле, которое кэш дополняет по находкам запроса.
+    """
+    head, separator, rest = brief.partition("утверждения: ")
+    assert separator, f"в сводке нет секции утверждений: {brief}"
+    assert "утверждения: " not in head, f"секция утверждений не одна: {brief}"
+    return rest.split(" · ")[0].split("; ")
+
+
+def test_cached_briefs_match_community_briefs_on_merged_claims() -> None:
+    """Слияние утверждений находок с кэшированными профилями не расходится нигде.
+
+    Покрывает (a) и (b) проверки кэша: насыщенный профиль, где утверждениям находок
+    места не достаёт и они не дописываются; разреженный, где они дописываются по
+    порядку, с дедупом и под потолком ``MAX_PROFILE_CLAIMS``; и профиль без
+    графовых утверждений, куда приходят только находки, включая тезис длиннее 160
+    символов — он обрезается одинаково в обеих ветках. Сверяется напрямую с
+    ``community_briefs`` на тех же входах, поэтому расхождение порядка, потолка или
+    дедупа было бы видно в тексте сводки, а не как ошибка.
+    """
+    saturated = "Насыщенное"
+    sparse = "Разреженное"
+    empty = "Пустое"
+    long_statement = "Длинный тезис про выпаривание, " + "обрезка по 160 символом " * 20
+
+    nodes = [
+        *profiled_nodes(saturated, [f"насыщение {index}" for index in range(1, 7)]),
+        *profiled_nodes(sparse, ["разрежение 1", "разрежение 2"]),
+        *profiled_nodes(empty, []),
+    ]
+    # Рёбра — только между материалными узлами: степени claim-узлов нулевые, и
+    # порядок утверждений в профиле остаётся порядком меток, который сверяется явно.
+    edges = [
+        GraphEdge(
+            id="link-first",
+            source=f"entity-{saturated}",
+            target=f"entity-{sparse}",
+            relation="CONTAINS",
+        ),
+        GraphEdge(
+            id="link-empty",
+            source=f"entity-{sparse}",
+            target=f"entity-{empty}",
+            relation="CONTAINS",
+        ),
+    ]
+    findings = [
+        bound_finding(f"claim-{saturated}-0", "тезис находки насыщения"),
+        bound_finding(f"claim-{saturated}-1", "второй тезис находки насыщения"),
+        bound_finding(f"claim-{sparse}-0", "тезис находки А"),
+        bound_finding(f"claim-{sparse}-0", "тезис находки А"),
+        bound_finding(f"claim-{sparse}-1", "тезис находки Б"),
+        bound_finding(f"entity-{sparse}", "тезис находки В"),
+        bound_finding(f"claim-{sparse}-1", "ещё один тезис находки Г"),
+        bound_finding(f"entity-{empty}", long_statement),
+        bound_finding("claim-net-uzla", "тезис без узла в графе"),
+    ]
+    tokens = query_tokens("разрежение тезис находки")
+    cache = CommunityBriefCache()
+    key = brief_key((0,), None, sorted({saturated, sparse, empty}))
+    builds: list[int] = []
+
+    def source() -> GraphSnapshot:
+        builds.append(len(nodes))
+        return GraphSnapshot(
+            nodes=list(nodes), edges=list(edges), communities=sorted({saturated, sparse, empty})
+        )
+
+    expected = community_briefs(nodes, edges, findings, tokens, DEFAULT_PROFILE_LIMIT)
+    missed = cached_community_briefs(cache, key, source, findings, tokens, DEFAULT_PROFILE_LIMIT)
+    hit = cached_community_briefs(cache, key, source, findings, tokens, DEFAULT_PROFILE_LIMIT)
+
+    assert expected
+    assert missed == expected
+    assert hit == expected
+    assert builds == [len(nodes)]
+
+    def brief_of(name: str) -> str:
+        matches = [brief for brief in missed if brief.startswith(f"«{name}»")]
+        assert len(matches) == 1, f"сводка сообщества {name} не найдена в {missed}"
+        return matches[0]
+
+    # (a) Насыщенный профиль: графовые утверждения заполнили потолок, и тезисы
+    # находок не дописаны ни в каком виде — иначе кэш переписал бы поле claims.
+    assert claims_of(brief_of(saturated)) == [
+        f"насыщение {index}" for index in range(1, MAX_PROFILE_CLAIMS + 1)
+    ]
+
+    # (b) Разреженный профиль: после графовых меток идут утверждения находок в
+    # порядке встречи, дедуплицированные и обрезанные по потолку — «тезис находки
+    # А» повторяется, «В» и «Г» за потолок не помещаются.
+    assert claims_of(brief_of(sparse)) == [
+        "разрежение 1",
+        "разрежение 2",
+        "тезис находки А",
+        "тезис находки Б",
+    ]
+
+    # Профиль без графовых утверждений: они приходят только из находок, причём
+    # длинный тезис обрезан так же, как в services/communities.py.
+    assert claims_of(brief_of(empty)) == [long_statement[:160]]
+    assert long_statement[160:] not in brief_of(empty)
+    # Находка без узла в графе не попала ни в один профиль.
+    assert all("тезис без узла в графе" not in brief for brief in missed)
+
+    # Что именно лежит в кэше: графовая часть полей ``claims``. У насыщенного
+    # профиля потолок занят метками узлов — сводка отдаёт кэшированный кортеж без
+    # изменений; у разреженного и пустого кэш хранит меньше, чем уходит в выдачу.
+    cached = cache.views(key)
+    assert cached is not None
+    stored = {profile.name: profile.claims for profile in cached.profiles}
+    assert stored[saturated] == tuple(claims_of(brief_of(saturated)))
+    assert stored[sparse] == ("разрежение 1", "разрежение 2")
+    assert stored[empty] == ()
+
+
+def test_brief_cache_entry_dies_with_the_graph_epoch() -> None:
+    """Запись в корпус меняет поколение графа, и старый ключ кэша больше не читается.
+
+    Проверка идёт по самому ключу: попадание после мутации дало бы аналитику
+    устаревшую сводку без единой ошибки, поэтому сверяется и ``views`` под
+    прежним ключом, и текст новой выдачи с ``community_briefs`` на свежем снимке.
+    """
+    knowledge = InMemoryKnowledgeBase()
+    findings = knowledge.all_findings()
+    tokens = query_tokens("обратный осмос")
+
+    stale_key = brief_key((knowledge._graph_epoch,), None, tuple(knowledge._ensure_communities()))
+    before = knowledge._community_briefs(None, findings, tokens)
+    stale = knowledge._brief_cache.views(stale_key)
+    assert stale is not None
+    assert all("Заменённый тезис" not in brief for brief in before)
+
+    knowledge.supersede_finding("finding-ro", "Заменённый тезис про обратный осмос.", 0.9)
+    assert knowledge._graph_epoch == 1
+    assert knowledge._brief_cache.views(stale_key) is None
+
+    fresh_findings = knowledge.all_findings()
+    after = knowledge._community_briefs(None, fresh_findings, tokens)
+    snapshot = knowledge.full_graph(None)
+
+    assert after != before
+    assert any("Заменённый тезис" in brief for brief in after)
+    # Состав утверждений в кэшированных профилях «до» и «после» различается: если бы
+    # старая запись обслуживалась и дальше, правка эксперта просто не появилась бы в
+    # глобальном контексте — ошибки бы не было.
+    fresh = knowledge._brief_cache.views(
+        brief_key((knowledge._graph_epoch,), None, tuple(knowledge._ensure_communities()))
+    )
+    assert fresh is not None
+    assert {profile.claims for profile in stale.profiles} != {
+        profile.claims for profile in fresh.profiles
+    }
+    assert (
+        after
+        == community_briefs(
+            snapshot.nodes, snapshot.edges, fresh_findings, tokens, DEFAULT_PROFILE_LIMIT
+        )
+    )
+
+
+def test_brief_cache_is_keyed_by_acl_slice() -> None:
+    """Профиль, собранный для одного среза доступа, не достается другому.
+
+    Иначе restricted-метка уезжала бы в промпт модели под видом уже отфильтрованной
+    сводки — кэш здесь повторяет границу ``AccessPolicyEngine``, а не обходит её.
+    Сверяется и содержимое выдачи, и сами ключи: два разных набора классов данных
+    обязаны занять две записи, а равный по составу набор, записанный в другом
+    порядке, — одну (ключ держит ``frozenset``, а не список).
+    """
+    knowledge = InMemoryKnowledgeBase()
+    findings = knowledge.all_findings()
+    tokens = query_tokens("выпаривание энергия")
+
+    base = knowledge._community_briefs(PUBLIC_SCOPE, findings, tokens)
+    expert = knowledge._community_briefs({*PUBLIC_SCOPE, DataClass.RESTRICTED}, findings, tokens)
+
+    assert not any("Энергия в 3–5 раз" in brief for brief in base)
+    assert any("Энергия в 3–5 раз" in brief for brief in expert)
+    # Тот же запрос ещё раз: попадание в кэш не должно менять выдачу.
+    assert knowledge._community_briefs(PUBLIC_SCOPE, findings, tokens) == base
+
+    entries = knowledge._brief_cache._entries
+    scopes = [scope for (_, scope, _) in entries]
+    assert len(entries) == 2, f"срезы доступа поделили одну запись кэша: {scopes}"
+    assert len(set(scopes)) == 2
+
+    # Равный по составу набор в другом порядке — та же запись, а не новая.
+    reordered = {DataClass.RESTRICTED, DataClass.INTERNAL, DataClass.PUBLIC}
+    assert knowledge._community_briefs(reordered, findings, tokens) == expert
+    assert len(knowledge._brief_cache._entries) == 2
+
+
+def test_brief_cache_entry_expires_by_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Запись кэша профилей живёт ровно ``ttl_seconds`` и после этого пересобирается.
+
+    Поколение графа ловит только явную запись в корпус. Тухлый TTL означал бы, что
+    профиль, собранный по графу другого процесса (или после сбоя кластеризации),
+    обслуживает запросы бесконечно — без единой ошибки. Часы подменяются, чтобы
+    проверка не спала тридцать секунд.
+    """
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    cache = CommunityBriefCache(ttl_seconds=30.0)
+    key = brief_key((0,), None, ("А",))
+    nodes = profiled_nodes("А", ["утверждение А"])
+    cache.store(key, nodes, [])
+
+    assert cache.views(key) is not None
+    clock["now"] += 29.0
+    assert cache.views(key) is not None, "запись выброшена раньше TTL"
+    clock["now"] += 2.0
+    assert cache.views(key) is None
+    # Просроченная запись именно удалена, а не спрятана: иначе кэш разрастался бы
+    # числом ключей, которое никто не чистит.
+    assert key not in cache._entries
+
+
+def test_brief_cache_evicts_least_recently_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Сверх потолка хранится свежайшее по чтению, а не по записи.
+
+    Ключей больше, чем записей: порядок вставки зависит от того, какие планы
+    запросов пришли первыми, и вытеснение по вставке вышвырнуло бы профиль, по
+    которому аналитик работает прямо сейчас, — оставив в кэше брошенный.
+    """
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    cache = CommunityBriefCache(ttl_seconds=300.0, max_entries=2)
+
+    def key_of(letter: str) -> Any:
+        return brief_key((0,), None, (letter,))
+
+    for letter in ("А", "Б"):
+        cache.store(key_of(letter), profiled_nodes(letter, [f"утверждение {letter}"]), [])
+
+    # Чтение «А» делает его свежайшим: следующим уйдёт «Б», хотя вставлена позже.
+    assert cache.views(key_of("А")) is not None
+    cache.store(key_of("В"), profiled_nodes("В", ["утверждение В"]), [])
+
+    assert set(cache._entries) == {key_of("А"), key_of("В")}
+    assert cache.views(key_of("Б")) is None
+
+
+def test_graph_write_drops_cached_briefs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Профили сообществ считаются один раз на граф и сбрасываются любой записью.
+
+    Счётчик собирает пересчёты ``build_community_profiles``: до фикса он работал на
+    каждом действии retrieval (до 24 раз за запрос на неизменившемся графе).
+    Нулевой прирост на повторном retrieval доказывает кэш, единица после замены
+    тезиса — что кэш не пережил мутацию корпуса. Проверка идёт и по тексту выдачи:
+    устаревшая сводка была бы видна аналитику, а не упала бы ошибкой.
+    """
+    knowledge = InMemoryKnowledgeBase()
+    builds: list[int] = []
+    original = knowledge_module.build_community_profiles
+
+    def counting(nodes: Any, edges: Any, findings: Any = ()) -> Any:
+        builds.append(len(nodes))
+        return original(nodes, edges, findings)
+
+    monkeypatch.setattr(knowledge_module, "build_community_profiles", counting)
+    question = QueryPlan(question="обратный осмос", language="ru", mode="global")
+    retrieval = plan("обратный осмос", use_global_context=True)
+
+    first = knowledge.retrieve(question, retrieval)
+    assert first.community_summaries
+    assert not any("Заменённый тезис" in brief for brief in first.community_summaries)
+    assert builds == [len(knowledge._graph.nodes)]
+
+    second = knowledge.retrieve(question, retrieval)
+    assert second.community_summaries == first.community_summaries
+    assert builds == [len(knowledge._graph.nodes)]
+
+    knowledge.supersede_finding("finding-ro", "Заменённый тезис про обратный осмос.", 0.9)
+    after = knowledge.retrieve(question, retrieval).community_summaries
+
+    assert len(builds) == 2
+    assert any("Заменённый тезис" in brief for brief in after)
+    # Старая версия больше не кандидат: её текст обязан уйти из сводки вместе с
+    # находкой, а не остаться в профиле из-за кэша.
+    assert not any("обеспечивает удаление 95–99%" in brief for brief in after)
 
 
 # ── Retrieval и отсутствие доказательств (G-3) ─────────────────────────────

@@ -89,14 +89,29 @@ class Settings(BaseSettings):
     # лишь перекладывает ожидание семафора внутрь `agent_deadline_seconds`.
     agent_max_concurrent_runs: int = Field(default=4, ge=1, le=16)
 
+    # Кэш structured output: planning/controller-вызовы детерминированы при
+    # temperature=0.1 и попадают на одни и те же секции контекста в повторных
+    # вопросах. Нулевой TTL выключает кэш полностью — провайдер тогда ходит в
+    # модель на каждый вызов. Инвалидируется явно при записи в корпус.
+    llm_cache_ttl_seconds: float = Field(default=900.0, ge=0)
+    llm_cache_max_entries: int = Field(default=256, ge=8)
+    # Потолок ожидания свободной модели внутри одного вызова: без него ожидание
+    # семафора съедает дедлайн молча, и деградация выглядит как медленная модель.
+    gigachat_queue_wait_seconds: float = Field(default=60.0, gt=0, le=600)
+    # Токен для /metrics. Не задан — эндпопункт открыт (локальный контур), задан
+    # — Prometheus обязан присылать Bearer: метрики называют корпуса и режимы,
+    # и в публичном контуре они не должны читаться кем угодно.
+    metrics_token: str | None = Field(default=None, repr=False)
+    embedding_cache_ttl_seconds: float = Field(default=3600.0, ge=0)
     knowledge_backend: Literal["memory", "neo4j"] = "memory"
     neo4j_uri: str = "bolt://neo4j:7687"
     neo4j_username: str = "neo4j"
     neo4j_password: str = Field(default="change-me-now", repr=False)
     elasticsearch_url: str = "http://elasticsearch:9200"
-    # Очередей задач и кэша в контуре нет: redis поднят в compose, но значение
-    # не читается ни одним модулем — оставлено, чтобы не ломать локальные .env.
-    redis_url: str = "redis://redis:6379/0"
+    # Redis в контуре = зарезервированное место под очереди задач: приложения,
+    # читающего это значение, в кодовой базе нет, а кэш structured output живёт
+    # в процессе (settings.llm_cache_ttl_seconds). Настройка отсюда убрана,
+    # extra="ignore" ниже по-прежнему принимает старый REDIS_URL в локальных .env.
     database_url: str = Field(
         default="postgresql://mindai:change-me-now@postgres:5432/mindai",
         repr=False,
@@ -157,6 +172,29 @@ class Settings(BaseSettings):
                 self.context_token_budget,
                 self.gigachat_model,
                 window,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def warn_silent_memory_fallback(self) -> "Settings":
+        """production + memory-бэкенд — это молчаливая потеря данных, а не режим.
+
+        Опечатка в ``KNOWLEDGE_BACKEND`` или недоступный Postgres на старте дают
+        контур, который выглядит рабочим, но теряет корпус, сессии и серверные
+        копии ответов при перезапуске. Аналитик этого не заметит до первого
+        «пропал ответ», поэтому конфигурация предупреждает сама.
+        """
+        if self.app_env != "production":
+            return self
+        if self.knowledge_backend == "memory":
+            logger.warning(
+                "KNOWLEDGE_BACKEND=memory в production: корпус живёт в процессе и "
+                "обнуляется перезапуском; для рабочего контура аналитиков нужен neo4j."
+            )
+        if self.accounts_backend == "memory":
+            logger.warning(
+                "ACCOUNTS_BACKEND=memory в production: аккаунты и сессии не "
+                "переживают перезапуск; нужен postgres."
             )
         return self
 

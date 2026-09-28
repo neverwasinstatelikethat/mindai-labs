@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
@@ -30,6 +32,7 @@ from scientific_tangle.domain.contracts import (
 )
 from scientific_tangle.domain.models import QueryPlan
 from scientific_tangle.services import infrastructure
+from scientific_tangle.services import knowledge as knowledge_module
 from scientific_tangle.services.infrastructure import (
     CHUNK_INDEX,
     FINDING_INDEX,
@@ -513,6 +516,157 @@ def test_neo4j_supersede_accepts_chunk_id_missing_from_catalog(
     # Заменённая копия больше не попадает в выдачу чанк-ветки.
     harness.es.hits = {CHUNK_INDEX: [as_hit(payload)]}
     assert harness.knowledge.rank_findings("обратный осмос", 5, "lexical") == []
+
+
+# ── Копии на границе выдачи и кэши production-контура ───────────────────────
+
+
+def test_retrieval_findings_are_copies_at_the_boundary() -> None:
+    """Выдача retrieval — копии: правка тезиса в ответе не переписывает каталог.
+
+    Прежний порядок копировал находки дважды — на ранжировании и на границе
+    выдачи. Копия остаётся ровно одна (в ``finalize_retrieval``), поэтому и
+    публичный ``rank_findings`` обязан отдавать отдельные объекты: вызывающий вне
+    каталога вправе менять результат.
+    """
+    knowledge = InMemoryKnowledgeBase()
+    context = knowledge.retrieve(
+        QueryPlan(question="обратный осмос", language="ru", mode="hybrid"),
+        retrieval_plan("обратный осмос"),
+    )
+    assert context.findings
+
+    emitted = context.findings[0]
+    assert emitted is not knowledge._findings[emitted.id]
+    emitted.statement = "переписанный в ответе тезис"
+    assert knowledge._findings[emitted.id].statement != "переписанный в ответе тезис"
+
+    ranked = knowledge.rank_findings("обратный осмос", 3, "hybrid")
+    assert ranked
+    assert ranked[0] is not knowledge._findings[ranked[0].id]
+
+
+def test_neo4j_semantic_ingest_does_not_walk_the_whole_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Импорт документа не строит полный снимок графа ни разу.
+
+    Дифф «что добавилось после записи» брался из ``full_graph()`` трижды на
+    документ: снимок строит глубокую копию всего графа и поднимает кластеризацию,
+    то есть на предзагрузке корпуса стоимость росла квадратично. Теперь достаточно
+    одного снимка состояния каталога — сами новые элементы берёт снимок «после».
+    """
+    harness = build_backend(monkeypatch)
+    calls: list[object] = []
+    original = InMemoryKnowledgeBase.full_graph
+
+    def counting(self: InMemoryKnowledgeBase, allowed: object = None) -> object:
+        calls.append(allowed)
+        return original(self, allowed)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(InMemoryKnowledgeBase, "full_graph", counting)
+
+    receipt = harness.knowledge.ingest(
+        structural_document("Текст семантического импорта."), extraction()
+    )
+
+    assert receipt.status == "created"
+    assert calls == []
+    # Дедуп и содержимое каталога не изменились: снимок состояния — не замена записи.
+    assert harness.driver.issued_containing("MERGE (n:Entity {id: row.id})")
+    indexed = {action["_id"] for action in harness.helpers.actions(FINDING_INDEX)}
+    assert indexed and all(identifier.startswith("finding-claim-") for identifier in indexed)
+
+
+def test_neo4j_brief_cache_is_reused_and_dropped_by_a_graph_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Профили сообществ считаются один раз на неизменившийся граф и сбрасываются при записи.
+
+    Счётчик собирает именно пересчёты `build_community_profiles`: он и был
+    квадратичной ценой исследовательского запроса (до 24 действий на одном графе).
+    Молчание счётчика на повторном retrieval доказывает кэш, а единица после
+    записи — что кэш не пережил мутацию корпуса.
+    """
+    harness = build_backend(
+        monkeypatch,
+        graph_nodes=[neo_node("n-1", "Обратный осмос"), neo_node("n-2", "Шахтная вода")],
+        graph_edges=[
+            {
+                "id": "e-1",
+                "source": "n-1",
+                "target": "n-2",
+                "relation": "TREATED_BY",
+                "confidence": 0.9,
+                "data_class": "public",
+            }
+        ],
+    )
+    builds: list[int] = []
+    original = knowledge_module.build_community_profiles
+
+    def counting(nodes: Any, edges: Any, findings: Any = ()) -> list[Any]:
+        builds.append(len(nodes))
+        return original(nodes, edges, findings)
+
+    monkeypatch.setattr(knowledge_module, "build_community_profiles", counting)
+    question = query_plan()
+    global_plan = retrieval_plan("обратный осмос", use_global_context=True)
+
+    first = harness.knowledge.retrieve(question, global_plan).community_summaries
+    assert first and all("сущностей" in brief for brief in first)
+    assert builds == [2]
+
+    second = harness.knowledge.retrieve(question, global_plan)
+    assert second.community_summaries == first
+    assert builds == [2]
+
+    harness.driver.graph_nodes.append(neo_node("n-3", "Хибинетт файнштейн"))
+    harness.driver.graph_edges.append(
+        {
+            "id": "e-2",
+            "source": "n-3",
+            "target": "n-1",
+            "relation": "CONTAINS",
+            "confidence": 0.9,
+            "data_class": "public",
+        }
+    )
+    harness.knowledge.index_document(structural_document(), "/data/sources/pilot.docx")
+
+    after = harness.knowledge.retrieve(question, global_plan).community_summaries
+
+    assert "Хибинетт" in "".join(after)
+    assert len(builds) == 2
+
+
+def test_graph_write_drops_the_llm_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Мутация корпуса обязана снимать и кэш structured output, а не только граф.
+
+    Промпты модели собираются из текста корпуса (секции FINDINGS/COMMUNITIES
+    рабочего процесса), поэтому закэшированный ответ устаревает вместе со
+    снимком графа — иначе правка источника не отразилась бы в ответе ровно с
+    тем же промптом. Проверка идёт настоящим `invalidate_llm_cache`: словарь
+    кэша подменён целиком, поэтому чужие записи тест не затирает.
+    """
+    from scientific_tangle.services import provider
+
+    harness = build_backend(monkeypatch)
+    spy: list[int] = []
+    original = provider.invalidate_llm_cache
+
+    def counted() -> None:
+        spy.append(1)
+        original()
+
+    monkeypatch.setattr(provider, "invalidate_llm_cache", counted)
+    monkeypatch.setattr(
+        provider, "_llm_cache", OrderedDict({"тест-ключ": ('{"ok": true}', time.monotonic() + 600)})
+    )
+
+    harness.knowledge.index_document(structural_document(), "/data/sources/pilot.docx")
+
+    assert spy and len(provider._llm_cache) == 0  # noqa: SLF001 - подменённый кэш самого модуля
 
 
 # ── 2. Каждый кандидат читается один раз ────────────────────────────────────

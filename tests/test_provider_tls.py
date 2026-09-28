@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from time import perf_counter
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -172,6 +174,57 @@ def test_repair_hint_is_capped_and_still_carries_paths() -> None:
         "claims/1/predicate: Field required",
         "claims/2/predicate: Field required",
     ]
+
+
+@pytest.mark.asyncio
+async def test_busy_provider_fails_fast_instead_of_eating_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ожидание слота ограничено ``gigachat_queue_wait_seconds``.
+
+    При ``gigachat_max_concurrent=1`` очередь без потолка съедала бы весь
+    ``agent_deadline_seconds``: аналитик видел бы медленный таймаут там, где
+    честный ответ — «сервис занят» (503 от вызывающего слоя). Отказ по таймауту
+    ожидания не должен оставлять фантом в счётчиках очереди и не должен
+    сжигать слот: после освобождения следующий запрос проходит.
+    """
+    provider = GigaChatProvider(
+        _settings(
+            gigachat_api_key="test-key",
+            gigachat_max_concurrent=1,
+            gigachat_queue_wait_seconds=0.05,
+        ),
+        AgentMetricsRegistry(),
+    )
+    sentinel = SimpleNamespace(ok=True)
+
+    class _StubClient:
+        async def achat(self, request: object) -> SimpleNamespace:
+            return sentinel
+
+    async def _fake_get_client() -> object:
+        return _StubClient()
+
+    monkeypatch.setattr(provider, "_get_client", _fake_get_client)
+    await provider._semaphore.acquire()  # единственный слот занят «чужим» запросом
+
+    started = perf_counter()
+    with pytest.raises(ModelUnavailableError, match="сервис занят"):
+        await provider._request([])
+    assert perf_counter() - started < 5.0
+
+    snapshot = provider._metrics.snapshot()
+    assert snapshot.llm_calls_waiting == 0
+    assert snapshot.llm_calls_in_flight == 0
+    # Слот не освобождён чужими руками: его по-прежнему держим мы.
+    assert provider._semaphore.locked()
+
+    provider._semaphore.release()
+    assert await provider._request([]) is sentinel
+    assert not provider._semaphore.locked()
+    after = provider._metrics.snapshot()
+    assert after.llm_calls_in_flight == 0
+    assert after.llm_calls_waiting == 0
 
 
 @pytest.mark.asyncio

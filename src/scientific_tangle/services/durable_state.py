@@ -13,6 +13,9 @@
 * ``nk_experiments`` / ``nk_evaluation_runs`` / ``nk_notifications`` — A/B-прогоны,
   оценки и лента уведомлений. Раньше все три жили в deque процесса и обнулялись
   перезапуском, хотя продукт показывал их как историю решений.
+* ``nk_llm_usage`` — расход модели по учётным записям. Глобальный счётчик токенов
+  процесса не отвечает на вопрос «сколько стоили исследования этого аналитика»,
+  а тарифная сетка в контуре не задана, поэтому расход выражается токенами.
 
 Контур выбора хранилища повторяет ``services/accounts.py``: Postgres — рабочая
 ветка, память — тесты и запуск без базы, при недоступной базе — деградация в
@@ -25,11 +28,11 @@ import asyncio
 import json
 import logging
 from collections import deque
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
@@ -67,10 +70,15 @@ MAX_EXPERIMENTS = 500
 # из принятых предложений и обязана переживать рестарт.
 MAX_PROPOSALS = 500
 MAX_EVALUATION_RUNS = 200
+# Запись закрывает один прогон (реже — одно обращение к модели): потолок держит
+# недельную историю расходов, но не превращает таблицу в бесконечный журнал.
+MAX_LLM_USAGE_RECORDS = 20000
 
 __all__ = [
     "DurableState",
     "InMemoryDurableState",
+    "LlmAccountUsage",
+    "LlmUsageRecord",
     "PostgresDurableState",
     "StoredAnswer",
     "build_durable_state",
@@ -99,6 +107,46 @@ class StoredAnswer:
             data_classes=sorted(value.value for value in self.data_classes),
             findings=len(self.answer.findings),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LlmUsageRecord:
+    """Расход модели, привязанный к учётной записи: «сколько стоил вопрос».
+
+    Цена здесь именно токены: тарифной сетки GigaChat в конфигурации нет, и
+    перевод в деньги был бы выдумкой. ``schema_name`` — назначение вызова
+    (PlanningBundle, ReasonerOutput…), если вызывающая сторона его знает.
+    """
+
+    account_id: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    latency_ms: float
+    success: bool
+    query_id: str | None = None
+    schema_name: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    id: str = field(default_factory=lambda: str(uuid4()))
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(frozen=True, slots=True)
+class LlmAccountUsage:
+    """Сводка расхода одной учётной записи за окно."""
+
+    account_id: str
+    calls: int
+    failed_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
 
 
 class DurableState(Protocol):
@@ -154,6 +202,21 @@ class DurableState(Protocol):
 
     async def recent_proposals(self, *, limit: int = 100) -> list[EvolutionProposal]: ...
 
+    async def record_llm_usage(
+        self,
+        *,
+        account_id: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        latency_ms: float,
+        success: bool,
+        query_id: str | None = None,
+        schema_name: str | None = None,
+    ) -> LlmUsageRecord: ...
+
+    async def usage_by_account(self, *, since: datetime) -> list[LlmAccountUsage]: ...
+
 
 def _new_answer(answer: AnswerPayload, owner_id: str, now: datetime) -> StoredAnswer:
     return StoredAnswer(
@@ -165,13 +228,70 @@ def _new_answer(answer: AnswerPayload, owner_id: str, now: datetime) -> StoredAn
     )
 
 
+def _summarize_usage(records: Iterable[LlmUsageRecord]) -> list[LlmAccountUsage]:
+    """Сводка расхода по учётным записям.
+
+    Формула совпадает с SQL-агрегатом ``usage_by_account`` рабочей ветки:
+    «сколько стоили вопросы аналитика» обязано читаться одинаково на памяти и на
+    Postgres, иначе тесты на in-memory контуре ничего не проверяют.
+    """
+    totals: dict[str, list[int]] = {}
+    for record in records:
+        acc = totals.setdefault(record.account_id, [0, 0, 0, 0])
+        acc[0] += 1
+        acc[1] += 0 if record.success else 1
+        acc[2] += record.prompt_tokens
+        acc[3] += record.completion_tokens
+    return sorted(
+        (
+            LlmAccountUsage(
+                account_id=account_id,
+                calls=acc[0],
+                failed_calls=acc[1],
+                prompt_tokens=acc[2],
+                completion_tokens=acc[3],
+            )
+            for account_id, acc in totals.items()
+        ),
+        key=lambda item: (-item.total_tokens, item.account_id),
+    )
+
+
+def _new_usage(
+    *,
+    account_id: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    latency_ms: float,
+    success: bool,
+    query_id: str | None,
+    schema_name: str | None,
+) -> LlmUsageRecord:
+    """Один конструктор записи для обеих веток.
+
+    Отрицательные значения отсекаются: usage провайдера меньше нуля не бывает, а
+    кривая оценка не должна уменьшать суммарный расход аккаунта.
+    """
+    return LlmUsageRecord(
+        account_id=account_id,
+        model=model,
+        prompt_tokens=max(prompt_tokens, 0),
+        completion_tokens=max(completion_tokens, 0),
+        latency_ms=max(latency_ms, 0.0),
+        success=success,
+        query_id=query_id,
+        schema_name=schema_name,
+    )
+
+
 class InMemoryDurableState:
     """Адаптер для тестов и запуска без базы: состояние живёт до выхода процесса.
 
-    Здесь же — честная граница обещаний: на этом бэкенде лента уведомлений и
-    журнал аудита НЕ переживают перезапуск, и ``/health/ready`` обязана это
-    показывать (``state_backend: "in-memory"``), чтобы интерфейс не выдавал
-    сохранённое за то, чем оно не является.
+    Здесь же — честная граница обещаний: на этом бэкенде лента уведомлений, журнал
+    аудита и журнал расхода модели НЕ переживают перезапуск, и ``/health/ready``
+    обязана это показывать (``state_backend: "in-memory"``), чтобы интерфейс не
+    выдавал сохранённое за то, чем оно не является.
     """
 
     def __init__(self) -> None:
@@ -184,6 +304,7 @@ class InMemoryDurableState:
         self._experiments: deque[EvolutionExperiment] = deque(maxlen=MAX_EXPERIMENTS)
         self._proposals: dict[UUID, EvolutionProposal] = {}
         self._evaluations: deque[EvaluationRun] = deque(maxlen=MAX_EVALUATION_RUNS)
+        self._llm_usage: deque[LlmUsageRecord] = deque(maxlen=MAX_LLM_USAGE_RECORDS)
 
     @property
     def kind(self) -> StoreBackend:
@@ -290,6 +411,37 @@ class InMemoryDurableState:
             items = list(self._evaluations)[-max(limit, 1) :]
         return [item.model_copy(deep=True) for item in reversed(items)]
 
+    async def record_llm_usage(
+        self,
+        *,
+        account_id: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        latency_ms: float,
+        success: bool,
+        query_id: str | None = None,
+        schema_name: str | None = None,
+    ) -> LlmUsageRecord:
+        record = _new_usage(
+            account_id=account_id,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=latency_ms,
+            success=success,
+            query_id=query_id,
+            schema_name=schema_name,
+        )
+        async with self._lock:
+            self._llm_usage.append(record)
+        return record
+
+    async def usage_by_account(self, *, since: datetime) -> list[LlmAccountUsage]:
+        async with self._lock:
+            records = [record for record in self._llm_usage if record.created_at >= since]
+        return _summarize_usage(records)
+
     def _prune(self, now: datetime) -> None:
         for key in [key for key, item in self._answers.items() if item.expires_at <= now]:
             self._answers.pop(key, None)
@@ -382,6 +534,28 @@ CREATE TABLE IF NOT EXISTS nk_evolution_proposals (
 )
 """
 
+# Расход модели — не jsonb payload: его читают агрегатом по аккаунту и окну, и
+# колонки (а не пересборка JSON) дают и группировку, и индекс по диапазону дат.
+_LLM_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS nk_llm_usage (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    query_id text,
+    model text NOT NULL,
+    schema_name text,
+    prompt_tokens integer NOT NULL,
+    completion_tokens integer NOT NULL,
+    latency_ms double precision NOT NULL,
+    success boolean NOT NULL,
+    created_at timestamptz NOT NULL
+)
+"""
+
+_LLM_USAGE_ACCOUNT_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS nk_llm_usage_account_idx "
+    "ON nk_llm_usage (account_id, created_at DESC)"
+)
+
 
 def _answer_from_row(row: dict[str, Any]) -> StoredAnswer:
     payload = AnswerPayload.model_validate_json(str(row["answer_json"]))
@@ -469,6 +643,8 @@ class PostgresDurableState:
                     _EXPERIMENTS_DDL,
                     _EVALUATIONS_DDL,
                     _PROPOSALS_DDL,
+                    _LLM_USAGE_DDL,
+                    _LLM_USAGE_ACCOUNT_INDEX_DDL,
                 ):
                     await conn.execute(ddl)
         except Exception:
@@ -709,6 +885,80 @@ class PostgresDurableState:
             (max(limit, 1),),
         )
         return [EvaluationRun.model_validate(row["payload"]) for row in rows]
+
+    async def record_llm_usage(
+        self,
+        *,
+        account_id: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        latency_ms: float,
+        success: bool,
+        query_id: str | None = None,
+        schema_name: str | None = None,
+    ) -> LlmUsageRecord:
+        record = _new_usage(
+            account_id=account_id,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=latency_ms,
+            success=success,
+            query_id=query_id,
+            schema_name=schema_name,
+        )
+        await self._execute(
+            """
+            INSERT INTO nk_llm_usage (id, account_id, query_id, model, schema_name,
+                                      prompt_tokens, completion_tokens, latency_ms, success,
+                                      created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                record.id,
+                record.account_id,
+                record.query_id,
+                record.model,
+                record.schema_name,
+                record.prompt_tokens,
+                record.completion_tokens,
+                record.latency_ms,
+                record.success,
+                record.created_at,
+            ),
+        )
+        await self._trim_table("nk_llm_usage", "id", MAX_LLM_USAGE_RECORDS)
+        return record
+
+    async def usage_by_account(self, *, since: datetime) -> list[LlmAccountUsage]:
+        # Агрегат считается базой: «расход за месяц» по сотням тысяч строк в
+        # payload-чтении означал бы вытащить весь журнал в процесс.
+        rows = await self._fetchall(
+            """
+            SELECT account_id,
+                   count(*) AS calls,
+                   count(*) FILTER (WHERE NOT success) AS failed_calls,
+                   sum(prompt_tokens) AS prompt_tokens,
+                   sum(completion_tokens) AS completion_tokens
+            FROM nk_llm_usage
+            WHERE created_at >= %s
+            GROUP BY account_id
+            ORDER BY sum(prompt_tokens + completion_tokens) DESC, account_id
+            """,
+            (since,),
+        )
+        return [
+            LlmAccountUsage(
+                account_id=str(row["account_id"]),
+                calls=int(row["calls"]),
+                failed_calls=int(row["failed_calls"]),
+                prompt_tokens=int(row["prompt_tokens"] or 0),
+                completion_tokens=int(row["completion_tokens"] or 0),
+            )
+            for row in rows
+        ]
 
 
 def build_durable_state(settings: Settings) -> DurableState:

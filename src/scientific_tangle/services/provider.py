@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import threading
+from collections import OrderedDict
 from collections.abc import Sequence
 from functools import lru_cache
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, Protocol, TypeVar
 
 import httpx
@@ -38,6 +41,119 @@ _SCHEMA_REPAIR_ATTEMPTS = 3
 
 class ModelUnavailableError(RuntimeError):
     """LLM недоступен или вернул не-экземпляр схемы после всех попыток."""
+
+
+# ── Кэш structured output (в пределах процесса) ─────────────────────────────────
+#
+# Один исследовательский запрос делает ~6-10 обращений к модели, а повторные
+# вопросы и ветки JSON и demo нередко просят ровно то же самое: без кэша каждый
+# такой повтор заново оплачивается у провайдера. Кэш явный, небольшой и
+# ограничен по числу записей (LRU) и по времени жизни (TTL).
+#
+# Почему совместный кэш безопасен на мультипользовательском контуре:
+# 1. Ключ — sha256 от (id модели, имя схемы, полный системный промпт, полный
+#    пользовательский промпт). Права пользователя (ACL) и история ветки попадают
+#    в ТЕКСТ промпта на его сборке (см. ``agents/workflow.py``: секции
+#    ``ИСТОРИЯ ВЕТКИ`` и ``FINDINGS`` формируются из уже отфильтрованного по
+#    ``allowed_data_classes`` retrieval-слоя). Значит, у пользователей с разным
+#    видимым содержанием ключи различаются, и попасть на чужую запись можно
+#    только с идентичным промптом — т. е. с тем же самым доказательством.
+# 2. Значение — сериализованный JSON валидированной модели; на попадании
+#    ``schema.model_validate`` собирает НОВЫЙ экземпляр, Pydantic-объект
+#    никогда не разделяется между вызывающими.
+# 3. Ошибки, недоступная модель и промежуточные schema-repair ответы не
+#    кэшируются: запись происходит только после валидного результата.
+# 4. ``llm_cache_ttl_seconds`` <= 0 выключает кэш полностью — путь выполнения
+#    тогда идентичен до-кэшному, включая метрики (ни попаданий, ни промахов).
+#
+# Замок ``threading.Lock``, а не ``asyncio.Lock``: event loop здесь один, но
+# модуль живёт и в потоковых путях (индексация, ``InMemoryKnowledgeBase``), и
+# словарь OrderedDict переиспользуется между провайдерами процесса.
+
+_LlmCacheEntry = tuple[str, float]  # JSON ответа модели и момент истечения (monotonic)
+
+_llm_cache: OrderedDict[str, _LlmCacheEntry] = OrderedDict()
+_llm_cache_lock = threading.Lock()
+
+
+def invalidate_llm_cache() -> None:
+    """Сбрасывает все кэшированные ответы structured output.
+
+    Вызывается из путей мутации корпуса и записи в граф (собирает другой
+    агент): после изменения источников закэшированный ответ устаревает, даже
+    если промпт буквально тот же.
+    """
+    with _llm_cache_lock:
+        _llm_cache.clear()
+
+
+def _report_llm_cache(metrics: object, *, hit: bool) -> None:
+    """Отчёт попадания/промаха кэша — защитно, через getattr.
+
+    Метод добавляет другой агент в ``AgentMetricsRegistry``; порядок выкладки
+    не должен ронять провайдер, поэтому при отсутствии метода молча пропускаем.
+    """
+    hook = getattr(metrics, "observe_llm_cache", None)
+    if callable(hook):
+        hook(hit)
+
+
+def _report_llm_cancelled(metrics: object, schema_name: str) -> None:
+    """Отчёт об отмене обращения к модели — тем же защитным способом."""
+    hook = getattr(metrics, "observe_llm_cancelled", None)
+    if callable(hook):
+        hook(schema_name)
+
+
+def _report_llm_timeout(metrics: object, schema_name: str) -> None:
+    """Таймаут транспорта отдельной метрикой: он чинится таймаутом, а не repair-промптом."""
+    hook = getattr(metrics, "observe_llm_timeout", None)
+    if callable(hook):
+        hook(schema_name)
+
+
+def _llm_cache_key(model: str, schema: type[BaseModel], system: str, user: str) -> str:
+    """Ключ, чувствительный ко всему, что меняет ответ.
+
+    Разделитель ``\\x1f`` исключает склейку-амбивигуитет: пары строк, которые
+    без разделителя дали бы один и тот же материал (переносы внутри промпта),
+    не должны давать один sha256.
+    """
+    material = "\x1f".join((model, schema.__name__, system, user))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _llm_cache_take[S: BaseModel](key: str, schema: type[S]) -> S | None:
+    """Возвращает НОВЫЙ валидированный экземпляр при живом попадании.
+
+    Протухшую или перевалидируемую только что изменённой схемой запись считаем
+    промахом: неверный ответ из кэша хуже двойного обращения к модели.
+    """
+    now = monotonic()
+    with _llm_cache_lock:
+        entry = _llm_cache.get(key)
+        if entry is None:
+            return None
+        payload, expires_at = entry
+        if expires_at <= now:
+            del _llm_cache[key]
+            return None
+        _llm_cache.move_to_end(key)
+    try:
+        return schema.model_validate(json.loads(payload))
+    except (ValidationError, json.JSONDecodeError):
+        with _llm_cache_lock:
+            _llm_cache.pop(key, None)
+        return None
+
+
+def _llm_cache_put(key: str, payload: str, *, ttl_seconds: float, max_entries: int) -> None:
+    """Записывает ответ и удерживает LRU-потолок: переполнение сбрасывает давнее."""
+    with _llm_cache_lock:
+        _llm_cache[key] = (payload, monotonic() + ttl_seconds)
+        _llm_cache.move_to_end(key)
+        while len(_llm_cache) > max_entries:
+            _llm_cache.popitem(last=False)
 
 
 def _clean_json(content: str) -> str:
@@ -188,12 +304,15 @@ class GigaChatProvider:
 
     Клиент и токен переиспользуются между запросами; за задержку обращения к модели
     отвечает одна retry-политика SDK плюс ровно одна schema-repair попытка.
+    Повторный identical structured-output обслуживается кэшем
+    ``complete_model`` (см. ``_llm_cache`` выше), а не новым обращением к модели.
 
     Семафор на ``gigachat_max_concurrent`` — в пределах процесса: один воркер
     uvicorn = один счётчик, несколько воркеров перемножают фактическую нагрузку
     на тариф. Поэтому приём запросов ограничен отдельным слоем
-    (``services/admission.py``), а ожидание слота здесь наблюдаемо: очередь
-    внутри чужого агентного дедлайна — это будущая молчаливая деградация ответа.
+    (``services/admission.py``), а ожидание слота здесь наблюдаемо и ограничено
+    ``gigachat_queue_wait_seconds``: очередь внутри чужого агентного дедлайна —
+    это будущая молчаливая деградация ответа вместо честного «сервис занят».
     """
 
     mode: ModelMode = "gigachat"
@@ -208,6 +327,13 @@ class GigaChatProvider:
         self._settings = settings
         self._metrics = metrics or agent_metrics
         self._slots = max(settings.gigachat_max_concurrent, 1)
+        # Потолок ожидания слота: без него запрос с ``gigachat_max_concurrent=1``
+        # молча съедал бы весь ``agent_deadline_seconds`` в очереди семафора.
+        self._queue_wait_seconds = float(settings.gigachat_queue_wait_seconds)
+        # Кэш ответов: <= 0 полностью выключает путь кэша (поведение как до его
+        # появления), потолок записей держится LRU-вытеснением.
+        self._cache_ttl_seconds = float(settings.llm_cache_ttl_seconds)
+        self._cache_max_entries = max(int(settings.llm_cache_max_entries), 1)
         # Контекст TLS строится здесь, а не на первом обращении: отсутствующий файл
         # доверенного корня должен остановить запуск, а не всплыть 500 в середине
         # первого агентного запроса.
@@ -263,6 +389,49 @@ class GigaChatProvider:
         user: str,
         schema: type[StructuredOutput],
     ) -> StructuredOutput:
+        """Один structured-output вызов с TTL-кэшем в пределах процесса.
+
+        Ключевые свойства (см. комментарий у ``_llm_cache``): попадание
+        собирается из полного промпта, поэтому ACL-различия пользователей и
+        история ветки, уже вплетённые в текст промпта на сборке
+        (``agents/workflow.py``), не могут скормить одному пользователю ответ
+        другого; на попадании возвращается НОВЫЙ валидированный экземпляр.
+        Промах и отключённый кэш идут в модель через ``_complete_model_uncached``,
+        где учёт токенов выполняется ровно один раз — включая отмену.
+        Ошибки и schema-repair промежуточные ответы в кэш не попадают.
+        """
+        if self._cache_ttl_seconds <= 0:
+            # Кэш выключен: путь выполнения идентичен до-кэшному, метрики
+            # попаданий/промахов не вызываются вообще.
+            return await self._complete_model_uncached(system, user, schema)
+        key = _llm_cache_key(self._settings.gigachat_model, schema, system, user)
+        cached = _llm_cache_take(key, schema)
+        _report_llm_cache(self._metrics, hit=cached is not None)
+        if cached is not None:
+            return cached
+        result = await self._complete_model_uncached(system, user, schema)
+        self._cache_result(key, result)
+        return result
+
+    def _cache_result(self, key: str, result: BaseModel) -> None:
+        """Сериализует валидный ответ для кэша; несериализуемое — не кэшируется."""
+        try:
+            payload = result.model_dump_json()
+        except (TypeError, ValueError):
+            return
+        _llm_cache_put(
+            key,
+            payload,
+            ttl_seconds=self._cache_ttl_seconds,
+            max_entries=self._cache_max_entries,
+        )
+
+    async def _complete_model_uncached(
+        self,
+        system: str,
+        user: str,
+        schema: type[StructuredOutput],
+    ) -> StructuredOutput:
         instruction = build_instance_instruction(system, schema)
         messages: list[Messages] = [
             Messages(role=MessagesRole.SYSTEM, content=instruction),
@@ -275,108 +444,100 @@ class GigaChatProvider:
         # расход ровно на столько, сколько стоили schema-repair повторы.
         prompt_tokens = 0
         completion_tokens = 0
-        for attempt in range(_SCHEMA_REPAIR_ATTEMPTS):
-            try:
-                response = await self._request(messages)
-            except GigaChatException as exc:
-                self._metrics.observe_llm(
-                    schema.__name__,
-                    self._elapsed(started),
-                    success=False,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                )
-                raise self._wrap(exc) from exc
-            content = self._extract_content(response)
-            usage = getattr(response, "usage", None)
-            prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
-            completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
-            # Ответ мог упереться в бюджет вывода: тогда JSON обрывается не из-за
-            # качества модели, и чинится это не repair-промптом, а max_tokens.
-            truncated = getattr(response.choices[0], "finish_reason", None) == "length"
-            try:
-                parsed = json.loads(_clean_json(content))
-            except json.JSONDecodeError as exc:
-                parsed = None
-                last_defect = (
-                    f"вывод обрезан на лимите max_tokens="
-                    f"{self._settings.gigachat_max_output_tokens}"
-                    if truncated
-                    else f"ответ не является JSON ({exc.msg} на позиции {exc.pos})"
-                )
-            if isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 2:
-                self._metrics.observe_llm(
-                    schema.__name__,
-                    self._elapsed(started),
-                    success=False,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                )
-                raise ModelUnavailableError(f"GigaChat вернул ошибку: {parsed.get('error')}")
-            if isinstance(parsed, dict):
+        success = False
+        try:
+            for attempt in range(_SCHEMA_REPAIR_ATTEMPTS):
                 try:
-                    result = schema.model_validate(parsed)
-                except ValidationError as exc:
-                    defects = _defect_summary(exc.errors())
-                    last_defect = defects
-                    if attempt == _SCHEMA_REPAIR_ATTEMPTS - 1:
-                        self._metrics.observe_llm(
-                            schema.__name__,
-                            self._elapsed(started),
-                            success=False,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                        )
-                        raise ModelUnavailableError(
-                            f"GigaChat: ответ не соответствует {schema.__name__}: "
-                            f"{defects}"[:400]
-                        ) from exc
-                    logger.warning(
-                        "GigaChat: %s не пройден (%s, попытка %d)",
-                        schema.__name__,
-                        defects,
-                        attempt + 1,
+                    response = await self._request(messages)
+                except (GigaChatException, httpx.TransportError) as exc:
+                    # Транспортная ошибка и таймаут обязаны попасть в отдельный
+                    # счётчик: иначе «модель не ответила за 90 с» неотличима от
+                    # «модель вернула мусор», а чинятся они разными настройками.
+                    if isinstance(exc, httpx.TimeoutException):
+                        _report_llm_timeout(self._metrics, schema.__name__)
+                    raise self._wrap(exc) from exc
+                content = self._extract_content(response)
+                usage = getattr(response, "usage", None)
+                prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+                completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+                # Ответ мог упереться в бюджет вывода: тогда JSON обрывается не из-за
+                # качества модели, и чинится это не repair-промптом, а max_tokens.
+                truncated = getattr(response.choices[0], "finish_reason", None) == "length"
+                try:
+                    parsed = json.loads(_clean_json(content))
+                except json.JSONDecodeError as exc:
+                    parsed = None
+                    last_defect = (
+                        f"вывод обрезан на лимите max_tokens="
+                        f"{self._settings.gigachat_max_output_tokens}"
+                        if truncated
+                        else f"ответ не является JSON ({exc.msg} на позиции {exc.pos})"
                     )
-                    messages = self._repair_messages(instruction, user, content, defects)
-                    self._metrics.observe_llm_retry(schema.__name__)
-                    continue
-                self._metrics.observe_llm(
-                    schema.__name__,
-                    self._elapsed(started),
-                    success=True,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                )
-                return result
-            if not isinstance(parsed, dict):
-                last_defect = (
-                    "ответ не является JSON-объектом"
-                    if parsed is not None
-                    else last_defect
-                )
-                # Без этого отказ был «retry исчерпан» и nothing more: причину
-                # срыва structured output приходилось воспроизводить вручную.
-                logger.warning(
-                    "GigaChat: %s (%s, попытка %d); начало ответа: %r",
-                    last_defect,
-                    schema.__name__,
-                    attempt + 1,
-                    content[:240],
-                )
-            if attempt == _SCHEMA_REPAIR_ATTEMPTS - 1:
-                break
-            messages = self._repair_messages(instruction, user, content, None)
-            self._metrics.observe_llm_retry(schema.__name__)
-        self._metrics.observe_llm(
-            schema.__name__,
-            self._elapsed(started),
-            success=False,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
-        raise ModelUnavailableError(
-            f"GigaChat: structured output retry исчерпан ({schema.__name__}): {last_defect}"
-        )
+                if isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 2:
+                    raise ModelUnavailableError(f"GigaChat вернул ошибку: {parsed.get('error')}")
+                if isinstance(parsed, dict):
+                    try:
+                        result = schema.model_validate(parsed)
+                    except ValidationError as exc:
+                        defects = _defect_summary(exc.errors())
+                        last_defect = defects
+                        if attempt == _SCHEMA_REPAIR_ATTEMPTS - 1:
+                            raise ModelUnavailableError(
+                                f"GigaChat: ответ не соответствует {schema.__name__}: "
+                                f"{defects}"[:400]
+                            ) from exc
+                        logger.warning(
+                            "GigaChat: %s не пройден (%s, попытка %d)",
+                            schema.__name__,
+                            defects,
+                            attempt + 1,
+                        )
+                        messages = self._repair_messages(instruction, user, content, defects)
+                        self._metrics.observe_llm_retry(schema.__name__)
+                        continue
+                    # Успех засчитывается только на валидированном результате;
+                    # учёт расходования (duration, токены) закроет ``finally``.
+                    success = True
+                    return result
+                if not isinstance(parsed, dict):
+                    last_defect = (
+                        "ответ не является JSON-объектом"
+                        if parsed is not None
+                        else last_defect
+                    )
+                    # Без этого отказ был «retry исчерпан» и nothing more: причину
+                    # срыва structured output приходилось воспроизводить вручную.
+                    logger.warning(
+                        "GigaChat: %s (%s, попытка %d); начало ответа: %r",
+                        last_defect,
+                        schema.__name__,
+                        attempt + 1,
+                        content[:240],
+                    )
+                if attempt == _SCHEMA_REPAIR_ATTEMPTS - 1:
+                    break
+                messages = self._repair_messages(instruction, user, content, None)
+                self._metrics.observe_llm_retry(schema.__name__)
+            raise ModelUnavailableError(
+                f"GigaChat: structured output retry исчерпан ({schema.__name__}): {last_defect}"
+            )
+        except asyncio.CancelledError:
+            # Отмена (клиент закрыл вкладку) — не ошибка модели: её видит
+            # отдельный наблюдатель, а ``finally`` ниже честно закрывает учёт
+            # уже потраченных токенов. Never swallow, never convert.
+            _report_llm_cancelled(self._metrics, schema.__name__)
+            raise
+        finally:
+            # Ровно один учёт на вызов: раньше каждая ветка отказа звала
+            # observe_llm сама, и отмена посреди обращения оставляла потраченные
+            # провайдером токены неучтёнными.
+            self._metrics.observe_llm(
+                schema.__name__,
+                self._elapsed(started),
+                success=success,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
     async def _request(self, messages: Sequence[Messages]) -> ChatCompletion:
         client = await self._get_client()
@@ -392,7 +553,9 @@ class GigaChatProvider:
         will_wait = self._semaphore.locked()
         if will_wait:
             logger.warning(
-                "GigaChat: все %d слотов заняты, запрос ждёт освобождения", self._slots
+                "GigaChat: все %d слотов заняты, запрос ждёт освобождения (макс. %g с)",
+                self._slots,
+                self._queue_wait_seconds,
             )
         # Обновления счётков идут без await: в одном event loop они атомарны,
         # а lock здесь только добавил бы точку переключения.
@@ -400,22 +563,37 @@ class GigaChatProvider:
         self._report_queue()
         entered = False
         try:
-            async with self._semaphore:
-                if will_wait:
-                    self._metrics.observe_llm_queue_wait()
-                entered = True
-                self._waiting -= 1
-                self._in_flight += 1
+            # Ожидание ограничено ``gigachat_queue_wait_seconds``: без потолка
+            # очередь при ``gigachat_max_concurrent=1`` съедала бы
+            # ``agent_deadline_seconds`` молча, и аналитик видел бы медленный
+            # таймаут там, где честный ответ — «сервис занят» (503).
+            try:
+                await asyncio.wait_for(
+                    self._semaphore.acquire(), self._queue_wait_seconds
+                )
+            except TimeoutError:
+                raise ModelUnavailableError(
+                    "GigaChat: сервис занят — все слоты модели заняты, ожидание "
+                    f"свободного слота превысило {self._queue_wait_seconds:g} с; "
+                    "повторите запрос позже"
+                ) from None
+            entered = True
+            if will_wait:
+                self._metrics.observe_llm_queue_wait()
+            self._waiting -= 1
+            self._in_flight += 1
+            self._report_queue()
+            try:
+                return await client.achat(request)
+            finally:
+                self._in_flight -= 1
                 self._report_queue()
-                try:
-                    return await client.achat(request)
-                finally:
-                    self._in_flight -= 1
-                    self._report_queue()
         finally:
             # Отмена клиента до получения слота не должна оставлять фантом в
-            # метрике ожидания.
-            if not entered:
+            # метрике ожидания; освобождается только фактически взятый слот.
+            if entered:
+                self._semaphore.release()
+            else:
                 self._waiting -= 1
                 self._report_queue()
 

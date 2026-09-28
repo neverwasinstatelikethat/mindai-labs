@@ -31,7 +31,6 @@ from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import NumericObservation, QueryPlan
 from scientific_tangle.services.communities import (
     DEFAULT_PROFILE_LIMIT,
-    community_briefs,
     detect_communities,
 )
 from scientific_tangle.services.embeddings import EmbeddingClient, GigaChatEmbeddingClient
@@ -39,14 +38,18 @@ from scientific_tangle.services.governance import AccessPolicyEngine
 from scientific_tangle.services.knowledge import (
     MAX_ANCHORS,
     ChunkPiece,
+    CommunityBriefCache,
     InMemoryKnowledgeBase,
     KnowledgeBase,
     KnowledgeState,
     RetrievalContext,
+    brief_key,
+    cached_community_briefs,
     chunk_document,
     chunk_finding,
     finalize_retrieval,
     finding_communities,
+    graph_element_ids,
     stable_uuid,
     supersede_node_id,
 )
@@ -165,6 +168,10 @@ class Neo4jElasticsearchKnowledgeBase:
         self._lock = threading.Lock()
         self._graph_cache: GraphSnapshot | None = None
         self._graph_cached_at = 0.0
+        # Поколение графа: растёт в той же точке, где сбрасывается кэш полного
+        # графа, и входит в ключ кэша сводок сообществ.
+        self._graph_epoch = 0
+        self._brief_cache = CommunityBriefCache()
         self._vectors_indexed = 0
         self._vectors_missing = 0
         # Потолок выборки графа — не скрытая потеря данных: (показано, всего).
@@ -411,9 +418,14 @@ class Neo4jElasticsearchKnowledgeBase:
                 extracted_claims=0,
             )
 
-        before_nodes = {node.id for node in self._seed.full_graph().nodes}
-        before_edges = {edge.id for edge in self._seed.full_graph().edges}
+        # Один снимок каталога до записи вместо трёх проходов по графу:
+        # ``full_graph()`` здесь использовался только ради множеств id, но он строит
+        # копию всего графа и поднимает кластеризацию — на предзагрузке корпуса из
+        # сотен документов это квадратичная стоимость. Метка ``community`` в
+        # metadata узла при этом не теряется: её пересчитывает
+        # ``_load_graph_from_neo4j`` на каждом чтении графа, а не импорт.
         state = self._seed.snapshot_state()
+        before_nodes, before_edges = graph_element_ids(state.nodes, state.edges)
         before_findings = set(state.findings)
         new_ids: list[str] = []
         tx_id = f"ingest-{stable_uuid(f'{checksum}:semantic')}"
@@ -427,11 +439,11 @@ class Neo4jElasticsearchKnowledgeBase:
             # известны заранее, поэтому компенсация удаляет ровно записанное
             # (delete по id). Для графа точный список созданных элементов даёт только
             # метка ``created_by`` — она и снимается в ``_roll_back_ingest``.
-            current = {finding.id: finding for finding in self._seed.all_findings()}
+            current = dict(self._seed.finding_catalog())
             new_ids = [key for key in current if key not in before_findings]
             self._index_findings([current[key] for key in new_ids])
             self._search.indices.refresh(index=FINDING_INDEX)
-            after = self._seed.full_graph()
+            after = self._seed.snapshot_state()
             self._write_graph(
                 _GraphDiff(
                     nodes=[node for node in after.nodes if node.id not in before_nodes],
@@ -716,11 +728,24 @@ class Neo4jElasticsearchKnowledgeBase:
 
         Граф под сводки берётся уже срезанным по ACL: профили собираются из меток
         узлов, и без среза restricted-текст ушёл бы в промпт модели напрямую.
+
+        Профили кэшируются тем же коротким сроком, что и полный граф, и по тому же
+        поколению записи: ``community_briefs`` пересобирает их по всему графу на
+        каждое действие, а действие в исследовательском запросе до 24 штук подряд на
+        неизменившемся графе. Ключ содержит срез доступа и момент загрузки
+        закэшированного графа, поэтому сводки не переживают ни смену прав, ни
+        обновление снимка по TTL.
         """
-        snapshot = self.full_graph(allowed_data_classes)
-        return community_briefs(
-            snapshot.nodes,
-            snapshot.edges,
+        cached = self._cached_graph()
+        key = brief_key(
+            (self._graph_epoch, self._graph_cached_at),
+            allowed_data_classes,
+            cached.communities,
+        )
+        return cached_community_briefs(
+            self._brief_cache,
+            key,
+            lambda: self.full_graph(allowed_data_classes),
             findings,
             query_tokens(retrieval_plan.lexical_query),
             DEFAULT_PROFILE_LIMIT,
@@ -1142,7 +1167,14 @@ class Neo4jElasticsearchKnowledgeBase:
         self._ensure_ready()
         cached = self._cached_graph()
         if allowed_data_classes is None:
-            return cached.model_copy(deep=True)
+            # Новый список-контейнер вместо глубокой копии: узлы и рёбра снимка
+            # только читают (профили сообществ, каталог, обход), а правка
+            # возвращённого списка не должна доходить до кэша полного графа.
+            return GraphSnapshot(
+                nodes=list(cached.nodes),
+                edges=list(cached.edges),
+                communities=list(cached.communities),
+            )
         return AccessPolicyEngine().filter_graph(cached, allowed_data_classes)
 
     def _cached_graph(self) -> GraphSnapshot:
@@ -1222,8 +1254,28 @@ class Neo4jElasticsearchKnowledgeBase:
         ]
 
     def _invalidate_graph_cache(self) -> None:
+        """Сбрасывает всё производное от графа: снимок, сводки и кэш структурированных ответов.
+
+        LLM-кэш снимается здесь, а не в пяти местах вызова, по той же причине, по
+        какой сбрасывается кэш полного графа: промпты structured output собираются
+        из текста корпуса (секции FINDINGS и COMMUNITIES в agents/workflow.py),
+        поэтому мутация источников устаревляет и закэшированный ответ модели — даже
+        когда промпт буквально совпадает. Импорт модуля и поиск функции сделаны
+        защитно: кэш провайдера принадлежит другому контуру, и его отсутствие или
+        сбой не имеют права валить запись в корпус.
+        """
         self._graph_cache = None
         self._graph_cached_at = 0.0
+        self._graph_epoch += 1
+        self._brief_cache.invalidate()
+        try:
+            from scientific_tangle.services import provider
+
+            invalidate = getattr(provider, "invalidate_llm_cache", None)
+            if callable(invalidate):
+                invalidate()
+        except Exception as error:  # noqa: BLE001 - инвалидация чужого кэша не блокирует запись
+            logger.warning("Кэш LLM не сброшен после изменения графа: %s", error)
 
     def _note_cache(self, hit: bool) -> None:
         try:

@@ -4,5 +4,13 @@ global:
 scrape_configs:
   - job_name: mindai-backend
     metrics_path: /metrics
+    # Бэкенд закрывает /metrics по Bearer-токен, когда в контуре задан
+    # METRICS_TOKEN (и оставляет открытым, когда он пуст — локальный запуск).
+    # Prometheus подставляет переменные окружения в конфиг, поэтому токен приходит
+    # через environment сервиса и не лежит в файле в репозитории. Пустое значение
+    # безопасно: заголовок уходит с пустым credentials, а бэкенд его не требует.
+    authorization:
+      type: Bearer
+      credentials: "${METRICS_TOKEN}"
     static_configs:
       - targets: ["backend:8000"]

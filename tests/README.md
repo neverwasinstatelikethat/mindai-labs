@@ -33,6 +33,13 @@ tests/
 ├── test_ontology_relations.py # Реестр связей: разрешённые имена, тиры, глубина обхода
 ├── test_ontology_shapes.py    # SHACL-проверки и один повтор извлечения с текстом нарушения
 ├── test_benchmark_metrics.py  # Метрики retrieval-бенчмарка: recall против hit@k, идеал NDCG
+├── test_config_guards.py      # Конфигурация: production не обязан молча падать в memory
+├── test_llm_cache.py          # Кэш structured output: ключ по полному промпту, TTL, LRU, инвалидация
+├── test_provider_repair_loop.py # Цикл schema-repair провайдера: битый JSON, обрыв по max_tokens, учёт при отмене
+├── test_agent_metrics.py      # Метрики контура: retry/cache/cancel/timeout в Prometheus и в JSON-сводке
+├── test_llm_usage_accounting.py # Расход модели по аккаунтам: граница прогона, строка учёта, /api/v1/me/usage
+├── test_provider_tls.py       # TLS GigaChat: корень Минцифры и потолок ожидания свободного слота
+├── test_embeddings_retry.py   # Эмбеддинги: повторы, бюджет ретраев и отказ по 402
 ├── test_orchestrator_fixes.py # Регрессии вне выделенных зон: сравнение, корпус, прелоад, эволюция, метрики
 ├── test_stage_two.py       # Интеграционные тесты этапа 2 (поиск, слияние сущностей)
 └── test_stage_three_four.py # Интеграционные тесты этапов 3–4 (аналитика, доступ, аудит)
@@ -76,14 +83,15 @@ tests/
 | `test_numeric_range_preserves_source_and_normalized_units` | Числовое наблюдение с оператором `between` сохраняет и исходные, и нормализованные значения с единицами измерения |
 | `test_evidence_rejects_invalid_offsets` | Доказательство (EvidenceLocator) отклоняет некорректные символьные смещения (`char_end ≤ char_start`) |
 
-### `test_api.py` (28 строк)
+### `test_api.py` (88 строк)
 
 Проверяет HTTP-эндпоинты через FastAPI TestClient.
 
 | Тест | Что проверяет |
 |---|---|
 | `test_liveness` | Эндпоинт `/health/live` возвращает `200 OK` с `{"status": "ok"}` |
-| `test_query_plan_rejects_unbounded_graph_depth` | Валидация плана запроса отклоняет `max_hops=10` (лимит — 4), возвращает `422` |
+| `test_readiness_is_http_503_while_the_model_is_unavailable` | `/health/ready` отдаёт `503`, пока модель не настроена (тело то же), а `/health/live` остаётся `200` |
+| `test_plan_validation_endpoint_is_removed` | `/api/v1/queries/validate` удалён как эхо-заглушка: `401` анонимно, `404` с сессией |
 | `test_live_query_requires_configured_model` | Демо-запрос `/api/v1/demo` возвращает `503` без настроенного LLM-провайдера |
 
 ### `test_api_http.py` (HTTP-контур поверх реального ASGI)

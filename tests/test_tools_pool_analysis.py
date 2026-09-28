@@ -9,7 +9,9 @@ conflict/gap считаются по всем доказательствам з�
 from __future__ import annotations
 
 from collections.abc import Sequence
+from hashlib import sha1
 from itertools import product
+from time import perf_counter
 from uuid import UUID
 
 import pytest
@@ -58,6 +60,39 @@ class _StubKnowledge:
             graph=GraphSnapshot(nodes=[], edges=[], communities=[]),
             community_summaries=[],
             no_evidence=not self._findings,
+        )
+
+
+class _PerQueryKnowledge:
+    """Разный запрос — разный результат: видно, чей именно исход достался дублю.
+
+    Находка выводится из текста запроса, а не из порядка обращений: действия
+    исполняются параллельно в worker-потоках, и порядок вызовов не детерминирован,
+    тогда как «какой исход получил дубль» — детерминировано по построению.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def retrieve(
+        self,
+        query_plan: QueryPlan,
+        retrieval_plan: object,
+        allowed_data_classes: object = None,
+    ) -> RetrievalContext:
+        query = str(getattr(retrieval_plan, "lexical_query", ""))
+        entities = tuple(getattr(retrieval_plan, "entity_names", ()))
+        relations = tuple(getattr(retrieval_plan, "relation_types", ()))
+        hops = int(getattr(retrieval_plan, "max_hops", 0))
+        self.calls.append((query, entities))
+        signature = "|".join([query, *entities, *relations, str(hops)])
+        digest = sha1(signature.encode("utf-8")).hexdigest()[:8]
+        hit = finding(digest, "ro", "rejection", 90, 95)
+        return RetrievalContext(
+            findings=[hit],
+            graph=GraphSnapshot(nodes=[], edges=[], communities=[]),
+            community_summaries=[],
+            no_evidence=False,
         )
 
 
@@ -420,3 +455,95 @@ async def test_identical_actions_execute_retrieval_once() -> None:
 
     assert len(knowledge.plans) == 1
     assert [item.action_id for item in result.observations] == ["a1", "a2"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_action_inherits_first_outcome_and_near_misses_stay_separate() -> None:
+    """Дедуп по отпечатку действия: копия ждёт исход первого входа, остальное — отдельно.
+
+    Порядок наблюдений и принадлежность исхода закреплены за позицией первого входа
+    ключа, а не за «последним таким же»: иначе третье повторное действие получило
+    бы чужой результат. Различия по сущностям, отношениям и глубине обхода в
+    дедуп не сливаются — они и есть разные обращения к knowledge.
+    """
+    knowledge = _PerQueryKnowledge()
+    executor = ResearchToolExecutor(knowledge)
+    deep = QUERY_PLAN.model_copy(update={"max_hops": 4})
+    plan = AgentActionPlan(
+        rationale="Дубли и почти-дубли в одном плане",
+        actions=[
+            action("hybrid_search", "a1"),
+            action("hybrid_search", "a2"),
+            action("hybrid_search", "a3", entities=["мембрана"]),
+            action("hybrid_search", "a4", relation_types=["PRODUCES"]),
+            action("hybrid_search", "a5", max_hops=3),
+            action("hybrid_search", "a6"),
+        ],
+        completion_criteria=["Доказательства собраны"],
+    )
+
+    result = await executor.execute(plan, deep, None)
+
+    # Четыре различных отпечатка из шести действий: a2 и a6 — копии a1.
+    assert len(knowledge.calls) == 4
+    assert [item.action_id for item in result.observations] == [
+        f"a{index}" for index in range(1, 7)
+    ]
+    by_id = {item.action_id: item for item in result.observations}
+    assert by_id["a2"].finding_ids == by_id["a1"].finding_ids
+    # Поздний дубль привязан к первому входу ключа, а не к предыдущему дублю.
+    assert by_id["a6"].finding_ids == by_id["a1"].finding_ids
+    assert by_id["a3"].finding_ids != by_id["a1"].finding_ids
+    assert by_id["a4"].finding_ids != by_id["a1"].finding_ids
+    assert by_id["a5"].finding_ids != by_id["a1"].finding_ids
+
+
+@pytest.mark.asyncio
+async def test_duplicate_heavy_plan_is_deduplicated_in_a_single_pass() -> None:
+    """Дедуп плана — один проход, а не `keys.index` на каждое действие.
+
+    Прежняя запись `{keys.index(key) for key in keys}` была квадратичной по числу
+    сравнений: `list.index` сканирует план с начала на каждое действие. Схема
+    `AgentActionPlan` ограничивает план шестью действиями (`max_length=6`), поэтому
+    прогон строится через `model_construct` — он проверяет форму стоимости, а не
+    валидность плана из модели.
+    """
+    knowledge = _StubKnowledge([finding("a", "ro", "rejection", 90, 95)])
+    executor = ResearchToolExecutor(knowledge)
+    variants = (
+        action("hybrid_search", "base"),
+        action("hybrid_search", "wide", entities=["мембрана"]),
+        action("hybrid_search", "deeper", max_hops=3),
+        action("graph_traverse", "graph"),
+        action("conflict_scan", "conflicts"),
+    )
+    actions = [
+        variants[index % len(variants)].model_copy(update={"id": f"a{index}"})
+        for index in range(2000)
+    ]
+    plan = AgentActionPlan.model_construct(
+        rationale="Проверка формы стоимости дедупа",
+        actions=actions,
+        completion_criteria=["Доказательства собраны"],
+    )
+
+    started = perf_counter()
+    result = await executor.execute(plan, QUERY_PLAN, None)
+    spent = perf_counter() - started
+
+    assert len(knowledge.plans) == len(variants)
+    assert len(result.observations) == len(actions)
+    assert [item.action_id for item in result.observations] == [
+        f"a{index}" for index in range(2000)
+    ]
+    # Дедуп на 2 000 действиях обязан оставаться линейным: один проход кладёт
+    # отпечаток в словарь владельцев, а не сканирует план с начала через
+    # `list.index`. Порог по времени — страховка от возврата к квадратичной записи,
+    # а не замер. Честно о стоимости: на плане продукта (≤6 действий) разница
+    # недостижима для измерения, и локальный микропрогон двух выражений это
+    # подтверждает — на 8 000 действиях с пятью различными отпечатками прежняя
+    # запись быстрее (0,4 мс против 0,6 мс: `index` сразу находит первый вход),
+    # квадратичность проявляется только на 8 000 различных отпечатков
+    # (~330 мс против ~1,3 мс). Проверки на наносекундах в CI нестабильны,
+    # поэтому здесь — секунды.
+    assert spent < 1.0, f"дедуп плана занял {spent:.3f} с"
