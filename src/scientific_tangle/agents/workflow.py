@@ -361,20 +361,27 @@ class ResearchWorkflow:
             + (f"\nИСТОРИЯ ВЕТКИ:\n{history}" if history else ""),
             PlanningBundle,
         )
-        # Исходный вопрос фиксируется явно: модель может переформулировать запрос
-        # и исказить смысл условий (числа, границы, географию).
-        query_plan = bundle.query_plan.model_copy(update={"question": state["question"]})
+        # Исходный вопрос и язык фиксируются явно: модель может переформулировать
+        # запрос и исказить смысл условий (числа, границы, географию), а язык —
+        # факт входящего запроса, который она обязана лишь угадывать.
+        query_plan = bundle.query_plan.model_copy(
+            update={"question": state["question"], "language": state.get("language", "ru")}
+        )
         action_plan = self._sanitize_action_plan(bundle.action_plan, state["question"])
+        # Модель вправе не классифицировать назначение запроса — тогда в след уходит
+        # честная строка, а не выдуманный intent: ответ от этого не меняется,
+        # и интерфейс просто не показывает чип назначения.
+        intent_note = (
+            f"Intent={bundle.intent.primary}, план из {len(action_plan.actions)} действий"
+            if bundle.intent
+            else f"План из {len(action_plan.actions)} действий: "
+            "назначение запроса модель не указала"
+        )
         return {
             "intent": bundle.intent,
             "query_plan": query_plan,
             "action_plan": action_plan,
-            "trace": [
-                self._event(
-                    "planning_agent",
-                    f"Intent={bundle.intent.primary}, план из {len(action_plan.actions)} действий",
-                )
-            ],
+            "trace": [self._event("planning_agent", intent_note)],
         }
 
     async def tool_executor_node(self, state: ResearchState) -> dict[str, object]:

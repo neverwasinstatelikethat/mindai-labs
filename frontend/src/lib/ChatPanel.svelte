@@ -13,20 +13,41 @@
   import { session } from '$lib/sessionStore.svelte';
   import {
     AGENT_LABELS,
+    ANSWER_HEAD,
+    ASK_ACTIONS,
+    ASK_EMPTY,
+    ASK_NO_MATCH,
+    ASK_SOURCE,
+    ASK_TRAIL,
+    DEGRADED,
     INTENT_LABELS,
     MODEL_MODE_LABELS,
     OPERATOR_SYMBOL,
     OPERATOR_WORD,
     PREDICATE_LABELS,
     PROPERTY_LABELS,
+    READING_GUIDE,
+    RUN_OUTCOMES,
+    RUN_STAGES,
+    RUN_STRINGS,
+    RUN_TOOLS,
+    type RunStage,
+    SCALE_LABELS,
+    SHEET_LABELS,
     STEP_STATE_LABELS,
     STATUS_PHRASE,
     STATUS_SUPERSEDED,
     SUBJECT_LABELS,
+    TERM_FALLBACKS,
+    TRUST_PANEL,
+    contourRole,
+    degradationOf,
     describeScope,
     describeValue,
+    hopsText,
     knownTerm,
     termOf,
+    tracePhraseOf,
   } from '$lib/terms';
   import { DATA_CLASS_LABELS } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
@@ -120,6 +141,10 @@
     // не подтверждена, ждём: права на проход приходят с сервера.
     seed: string;
     onask: (question: string) => void;
+    // Прежний ответ уходит с экрана только по явному действию человека:
+    // серверного перечня прошлых ответов нет, и молча терять собранный ответ
+    // нельзя — его нечем восстановить.
+    onclear: () => void;
     onstop: () => void;
     onselect: (id: string | null) => void;
     onfocus: (key: string | null) => void;
@@ -153,6 +178,7 @@
     notice,
     seed = '',
     onask,
+    onclear,
     onstop,
     onselect,
     onfocus,
@@ -166,38 +192,12 @@
   }: Props = $props();
 
   // ── Имена реальных значений контракта ─────────────────────────────────────
-  // Статусы, намерения, узлы, операторы и свойства берутся из `terms.ts`:
-  // здесь остаются только те словари, которых в нём нет (инструменты обхода,
-  // исход шага, стадии прохода).
+  // Словари меток — в `terms.ts` (зона RS): стадии, инструменты, исходы шага,
+  // служебные слова и перевод строк рабочего процесса. В компоненте остаётся
+  // только привязка узла к стадии: это порядок следования, а не отображаемое
+  // имя.
 
-  const TOOL_LABELS: Record<string, string> = {
-    hybrid_search: 'Гибридный поиск',
-    graph_traverse: 'Обход графа',
-    community_search: 'Поиск по сообществам',
-    numeric_filter: 'Числовая фильтрация',
-    conflict_scan: 'Поиск конфликтов',
-    gap_scan: 'Поиск пробелов',
-    expert_lookup: 'Поиск экспертов',
-  };
-
-  const OBS_LABELS: Record<string, string> = {
-    success: 'выполнено',
-    warning: 'с предупреждением',
-    error: 'с ошибкой',
-  };
-
-  type StageKey = 'setup' | 'traverse' | 'answer' | 'other';
-
-  const STAGES: { key: StageKey; label: string; hint: string }[] = [
-    {
-      key: 'setup',
-      label: 'Постановка задачи',
-      hint: 'как прочитан вопрос: сущности, фильтры, география, период, глубина',
-    },
-    { key: 'traverse', label: 'Обход графа', hint: 'что вернул обход и чего не хватает' },
-    { key: 'answer', label: 'Сборка ответа', hint: 'тезисы, проверка и ревизии' },
-    { key: 'other', label: 'Иные шаги', hint: 'события вне трёх стадий' },
-  ];
+  type StageKey = RunStage;
 
   // Стадии соответствуют узлам ResearchWorkflow.stream: узел, которого в таблице
   // нет, честно попадает в «иные шаги», а не теряется.
@@ -229,6 +229,9 @@
   let draft = $state('');
   let seeded = false;
   let guideOpen = $state(false);
+  // Раскрытие «Почему ответу можно верить»: режим сборки, время, узлы, глубина
+  // поиска и длительность шагов. Под ним же — служебные имена ключей.
+  let trustOpen = $state(false);
   let correctionFor = $state<string | null>(null);
   let correctionComment = $state('');
   let correctionText = $state('');
@@ -264,8 +267,30 @@
   // Ответ уже лёг в лист, а проход ещё открыт: это реальный момент, когда
   // маскот «говорит», а не выдуманное состояние.
   const answerArriving = $derived(running && answer !== null);
+  // Прежний ответ остаётся на экране, пока новый не пришёл или пока человек
+  // не убрал его сам: серверного перечня прошлых ответов нет, и молча потерять
+  // собранный ответ — значит потерять работу без возможности вернуться.
+  const staleAnswer = $derived(
+    !!answer && (answer.question ?? '').trim() !== (question ?? '').trim(),
+  );
+  let staleDismissed = $state(false);
+  // Бумага на экране: ответ есть и он либо свежий, либо его не убрали.
+  const showPaper = $derived(!!answer && !(staleAnswer && staleDismissed));
+
+  // Телеметрия сборки уходит под раскрытие (см. TRUST_PANEL): узлы, длительность
+  // шагов и глубина поиска — показатели контура, а не вывод для аналитика.
+  const nodesRead = $derived(
+    (answer?.tool_observations ?? []).reduce(
+      (sum, observation) => sum + (observation.graph_node_ids?.length ?? 0),
+      0,
+    ),
+  );
+  const elapsedKnown = $derived(
+    typeof elapsedMs === 'number' && Number.isFinite(elapsedMs) && elapsedMs > 0,
+  );
+
   // Тезис, чей разбор открыт в шторке: ищется в текущем ответе, поэтому новый
-  // прогон закрывает шторку сам — прежнего тезиса в листе больше нет.
+  // ответ закрывает шторку сам — прежнего тезиса на экране больше нет.
   const sheetFinding = $derived(
     answer?.findings.find((finding) => finding.id === sheetClaimId) ?? null,
   );
@@ -305,10 +330,12 @@
     return () => query.removeEventListener('change', sync);
   });
 
-  // Новый прогон не наследует правки, вердикты и истории прошлого листа.
+  // Новый ответ не наследует правки, вердикты и истории прежнего; с ним же
+  // снимается и решение убрать прежний ответ с экрана.
   const runKey = $derived(`${answer?.query_id ?? 'нет'}|${running ? 'идёт' : 'стоп'}`);
   $effect(() => {
     void runKey;
+    staleDismissed = false;
     correctionFor = null;
     correctionComment = '';
     correctionText = '';
@@ -331,15 +358,59 @@
   }
 
   const stageStrip = $derived(
-    STAGES.filter((stage) => stage.key !== 'other' && stepsFor(stage.key).length > 0).map((stage) => ({
-      label: stage.label,
-      count: stepsFor(stage.key).length,
-    })),
+    RUN_STAGES.filter((stage) => stage.key !== 'other' && stepsFor(stage.key).length > 0).map(
+      (stage) => ({ label: stage.label, count: stepsFor(stage.key).length }),
+    ),
   );
 
   const evidenceTotal = $derived(
     answer ? answer.findings.reduce((sum, finding) => sum + finding.evidence.length, 0) : 0,
   );
+
+  // Телеметрия сборки уходит под раскрытие «Почему ответу можно верить»: узлы,
+  // глубина, длительность шагов — показатели контура, а не вывод аналитика.
+  // Вывод (статус тезиса, класс доступа и версия, цитата с локатором,
+  // расхождения и пробелы) остаётся на виду.
+  const trustRows = $derived.by(() => {
+    if (!answer) return [];
+    const rows: { label: string; value: string }[] = [
+      { label: TRUST_PANEL.modeLabel, value: MODEL_MODE_LABELS[answer.model_mode] },
+      {
+        label: TRUST_PANEL.timeLabel,
+        value: elapsedKnown ? duration(elapsedMs) : TRUST_PANEL.timeMissing,
+      },
+      { label: TRUST_PANEL.stepsLabel, value: String(trailSteps.length) },
+      { label: TRUST_PANEL.nodesLabel, value: num(nodesRead) },
+      { label: TRUST_PANEL.depthLabel, value: hopsText(planView?.hops ?? null) },
+      { label: TRUST_PANEL.filtersLabel, value: String(answer.query_plan.numeric_filters.length) },
+      {
+        label: TRUST_PANEL.confidenceLabel,
+        value: `${num(Math.round(answer.confidence * 100))} % — ${TRUST_PANEL.confidenceNote}`,
+      },
+    ];
+    return rows;
+  });
+
+  // Служебные имена и длительность шагов: то же самое содержимое, но подписью,
+  // а не заголовком. Ключ, у которого нет русского имени, живёт здесь.
+  const serviceRows = $derived.by(() => {
+    const rows: { label: string; value: string }[] = [];
+    trailSteps.forEach((step, index) => {
+      rows.push({
+        label: `${String(index + 1).padStart(2, '0')} · ${step.agent ?? RUN_STRINGS.stepFallback}`,
+        value: step.duration_ms == null ? RUN_STRINGS.noTime : duration(step.duration_ms),
+      });
+    });
+    for (const observation of obsView) {
+      rows.push({
+        label: `${observation.name} · ${RUN_STRINGS.nodeCount}`,
+        value: observation.toolCode
+          ? `${observation.nodes} (ключ: ${observation.toolCode})`
+          : String(observation.nodes),
+      });
+    }
+    return rows;
+  });
 
   // ── Форматирование ──────────────────────────────────────────────────────
   // Длительности — общий `duration` из `$lib/format`, как на остальных экранах:
@@ -359,97 +430,9 @@
     return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   }
 
-  // ── Служебные строки прохода ──────────────────────────────────────────────
-  // Рабочий процесс пишет часть строк ключами онтологии и по-английски
-  // (workflow.py). Правим только эти, проверенные шаблоны; незнакомый текст
-  // остаётся как есть — переводить данные, которые нельзя назвать, интерфейс не
-  // вправе.
-  const DECISION_WORDS: Record<string, string> = {
-    continue_tools: 'ищем недостающие доказательства',
-    reason: 'переходим к ответу',
-  };
-
-  const SERVER_PHRASES: { pattern: RegExp; say: (parts: string[]) => string }[] = [
-    {
-      pattern: /^Intent=([a-z_]+), план из (\d+) действий$/i,
-      say: ([intent, count]) =>
-        `вопрос прочитан как «${termOf(INTENT_LABELS, intent)}» · план: ${countOf(
-          Number(count),
-          'действие',
-          'действия',
-          'действий',
-        )}`,
-    },
-    {
-      pattern: /^(\d+) actions → (\d+) findings, (\d+) конфликтов, (\d+) пробелов$/i,
-      say: ([actions, findings, conflicts, gaps]) =>
-        [
-          countOf(Number(actions), 'действие', 'действия', 'действий'),
-          countOf(Number(findings), 'утверждение', 'утверждения', 'утверждений'),
-          countOf(Number(conflicts), 'расхождение', 'расхождения', 'расхождений'),
-          countOf(Number(gaps), 'пробел', 'пробела', 'пробелов'),
-        ].join(' · '),
-    },
-    {
-      pattern: /^Перепланировано: (\d+) actions$/i,
-      say: ([count]) =>
-        `план обновлён: ${countOf(Number(count), 'действие', 'действия', 'действий')}`,
-    },
-    {
-      pattern: /^Решение: (continue_tools|reason)(?:; пробелы: (\d+))?$/i,
-      say: ([decision, missing]) =>
-        DECISION_WORDS[decision.toLowerCase()] +
-        (missing ? ` · не хватает подтверждений: ${missing}` : ''),
-    },
-    { pattern: /^Собран answer на подтверждённых findings$/i, say: () => 'ответ собран по подтверждённым утверждениям' },
-    { pattern: /^Critic одобрил ответ$/i, say: () => 'проверка ответа пройдена' },
-    {
-      pattern: /^Ревизия ответа по замечаниям Critic$/i,
-      say: () => 'ответ пересобран по замечаниям проверки',
-    },
-    { pattern: /^Деградированный ответ: (.+)$/i, say: ([reason]) => `ответ неполный: ${reason}` },
-    { pattern: /^Ответ собран$/i, say: () => 'ответ собран' },
-  ];
-
   function agentName(key: string | null | undefined): string | null {
     if (!key) return null;
     return AGENT_LABELS[key] ?? AGENT_LABELS[key.toLowerCase()] ?? null;
-  }
-
-  // Замечания проверки и причины деградации приходят свободным текстом и
-  // склеиваются в одну строку: служебные имена, перечни идентификаторов и классы
-  // python-ошибок вычищаются по частям.
-  // Все замены — функциями: `String.replace` не принимает смешанный набор
-  // «строка или функция», а возвращаемая строка нужна одна и та же.
-  const PROSE_FIXES: [RegExp, (...parts: string[]) => string][] = [
-    [/неизвестные finding ids:\s*\[[^\]]*\]/gi, () => 'утверждения вне собранного доказательства'],
-    [/числовая fidelity не выдержана/gi, () => 'числа не подтверждены цитатами'],
-    [/\bfinding ids?\b/gi, () => 'идентификаторы утверждений'],
-    // Идентификатор записи в середине предложения аналитику не о чём говорит.
-    [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, () => 'утверждение'],
-    [
-      /узел ([a-z_]+) завершился ошибкой(?:\s*\([^)]*\))?/gi,
-      (_all: string, node: string) => `${agentName(node) ?? 'шаг прохода'}: сбой`,
-    ],
-    [
-      /^Узел ([a-z_]+):/i,
-      (_all: string, node: string) => `${agentName(node) ?? 'Проход'}:`,
-    ],
-  ];
-
-  function phraseOf(text: string): string {
-    let phrase = text;
-    for (const { pattern, say } of SERVER_PHRASES) {
-      const match = pattern.exec(text);
-      if (match) {
-        phrase = say(match.slice(1).map((part) => part ?? ''));
-        break;
-      }
-    }
-    return PROSE_FIXES.reduce(
-      (value, [pattern, replacement]) => value.replace(pattern, replacement),
-      phrase,
-    );
   }
 
   // Полоса интервала: цвет несёт статус, поэтому варианты consensus/disputed
@@ -463,11 +446,11 @@
   function stepName(step: TrailStep): { label: string; code: string | null } {
     const known = agentName(step.agent);
     if (known) return { label: known, code: null };
-    return { label: 'шаг прохода', code: step.agent ?? null };
+    return { label: RUN_STRINGS.stepFallback, code: step.agent ?? null };
   }
 
   function stepNote(step: TrailStep): string {
-    if (step.duration_ms == null) return 'нет данных';
+    if (step.duration_ms == null) return RUN_STRINGS.noTime;
     return step.duration_ms > 0 ? duration(step.duration_ms) : '—';
   }
 
@@ -496,15 +479,15 @@
   }
 
   function propertyTerm(name: string): { label: string; code: string | null } {
-    return termPair(PROPERTY_LABELS, name, 'свойство вне словаря');
+    return termPair(PROPERTY_LABELS, name, TERM_FALLBACKS.property);
   }
 
   function subjectTerm(finding: Finding): { label: string; code: string | null } {
-    return termPair(SUBJECT_LABELS, finding.subject, 'субъект не указан');
+    return termPair(SUBJECT_LABELS, finding.subject, TERM_FALLBACKS.subject);
   }
 
   function predicateTerm(finding: Finding): { label: string; code: string | null } {
-    return termPair(PREDICATE_LABELS, finding.predicate, 'предикат не указан');
+    return termPair(PREDICATE_LABELS, finding.predicate, TERM_FALLBACKS.predicate);
   }
 
   function filterText(filter: {
@@ -546,9 +529,23 @@
     if (evidence.sheet) parts.push(`лист ${evidence.sheet}`);
     if (evidence.cell_range) parts.push(`ячейки ${evidence.cell_range}`);
     if (evidence.char_start != null) {
-      parts.push(`сим. ${evidence.char_start}–${evidence.char_end ?? evidence.char_start}`);
+      parts.push(
+        `${SHEET_LABELS.chars} ${evidence.char_start}–${evidence.char_end ?? evidence.char_start}`,
+      );
     }
-    return parts.length ? parts : ['без локатора'];
+    return parts.length ? parts : [SHEET_LABELS.noLocator];
+  }
+
+  // Ссылка на первоисточник из ответа: находки принимают срез по утверждению
+  // (`claim`) и по документу (`document`) — имена параметров зафиксированы в
+  // DESIGN.md. Раздел не знает этих параметров — тогда это обычный вход в
+  // «Находки», где свой список и свой фильтр: ссылка ведёт, но не пустит в пустоту.
+  function findingsHref(finding: Finding): string {
+    const params = new URLSearchParams();
+    params.set('claim', finding.id);
+    const doc = finding.evidence[0]?.document_id;
+    if (doc) params.set('document', doc);
+    return `/findings?${params.toString()}`;
   }
 
   function scopeText(scope: Record<string, string> | undefined): string {
@@ -697,7 +694,7 @@
       scaleFrom: num(from),
       scaleTo: num(to),
       filterNote: comparable
-        ? `условие плана: ${labelOf(comparable.operator)} ${filterText(comparable)}`
+        ? `${SHEET_LABELS.planCondition}: ${labelOf(comparable.operator)} ${filterText(comparable)}`
         : '',
       outsideFilter: outside,
     };
@@ -802,13 +799,13 @@
   // деградации в шапке листа.
   const obsView = $derived(
     (answer?.tool_observations ?? []).map((observation, index) => {
-      const tool = knownTerm(TOOL_LABELS, observation.tool);
+      const tool = knownTerm(RUN_TOOLS, observation.tool);
       return {
         key: `${observation.action_id}#${index}`,
-        name: tool ?? 'чтение корпуса',
+        name: tool ?? RUN_STRINGS.planTool,
         toolCode: tool ? null : observation.tool,
         status: observation.status,
-        statusLabel: knownTerm(OBS_LABELS, observation.status) ?? 'исход не описан',
+        statusLabel: knownTerm(RUN_OUTCOMES, observation.status) ?? RUN_STRINGS.noOutcome,
         summary: observation.summary,
         findings: observation.finding_ids?.length ?? 0,
         nodes: observation.graph_node_ids?.length ?? 0,
@@ -821,7 +818,7 @@
   // по ним аналитик читает проход.
   const stageBlocks = $derived.by(() => {
     const waiting = !answer;
-    return STAGES.map((stage) => {
+    return RUN_STAGES.map((stage) => {
       const items = stepsFor(stage.key);
       const data =
         stage.key === 'setup'
@@ -1003,10 +1000,34 @@
   }}
 />
 
+<!-- Правила чтения одного набора: они же на пустом экране, они же в ответе.
+     Разделённое состояние раскрытия — подсказка нужна ровно один раз на экран. -->
+{#snippet readingGuide(id: string)}
+  <div class="acc ask__guide">
+    <button
+      class="acc__head"
+      type="button"
+      aria-expanded={guideOpen}
+      aria-controls={id}
+      onclick={() => (guideOpen = !guideOpen)}
+    >
+      <span>{READING_GUIDE.title}</span>
+      <Icon name="plus" size={16} class="acc__icon" />
+    </button>
+    <div id={id} class="acc__body" hidden={!guideOpen}>
+      <ul class="paper__guide-list">
+        {#each READING_GUIDE.items as item (item)}
+          <li>{item}</li>
+        {/each}
+      </ul>
+    </div>
+  </div>
+{/snippet}
+
 <div class="ask">
   <div class="ask__flow" bind:this={flow}>
     <!-- ── 1. СОСТОЯНИЯ ДО ОТВЕТА ────────────────────────────────────────── -->
-    {#if !answer && !running && !error}
+    {#if !showPaper && !running && !error}
       {#if corpusEmpty === true}
         <Panel tone="sunk">
           <div class="case">
@@ -1037,45 +1058,46 @@
           </div>
         </Panel>
       {:else}
-        <Empty icon="compass" title="Ни одного прогона на этом листе" body="
-          Впишите вопрос с числом и условием применения: проход вернёт утверждения, и каждое — с
-          цитатой и локатором до страницы, листа или диапазона ячеек.">
+        <!-- Одно главное действие — вопрос в поле композера ниже. Готовые
+             вопросы и файл корпуса второстепенны: они помогают вопросу, а не
+             спорят с ним за внимание, поэтому у пустого состояния нет своей
+             крупной кнопки. -->
+        <Empty icon="compass" title={ASK_EMPTY.title} body={ASK_EMPTY.body}>
           {#snippet action()}
             <div class="case__actions">
               {#if corpusEmpty === false}
-                <p class="micro">
-                  корпус читается: каждый новый вопрос собирает отдельный проход и отдельный лист
-                </p>
+                <p class="micro">{ASK_EMPTY.corpusReading}</p>
               {:else if corpusState === 'loading'}
-                <p class="micro">показания корпуса ещё не пришли — вопрос можно задать и без них</p>
+                <p class="micro">{ASK_EMPTY.corpusLoading}</p>
               {:else if corpusState === 'error'}
-                <p class="micro">
-                  показания корпуса не получены — вопрос можно задать и без них, на ход это не влияет
-                </p>
+                <p class="micro">{ASK_EMPTY.corpusError}</p>
               {/if}
               {#if examplesState === 'loading'}
-                <p class="micro">читаем эталонные вопросы корпуса…</p>
+                <p class="micro">{ASK_EMPTY.examplesLoading}</p>
               {:else if examplesState === 'error'}
-                <Notice tone="error" title="Эталонные вопросы не получены">
-                  <p>Список не загрузился — свои вопросы можно задавать как обычно.</p>
+                <Notice tone="error" title={ASK_EMPTY.examplesError}>
+                  <p>{ASK_EMPTY.examplesErrorHint}</p>
                   <div class="row">
                     <Button variant="quiet" size="sm" icon="refresh" onclick={onexamples}>
-                      Загрузить снова
+                      {ASK_EMPTY.examplesRetry}
                     </Button>
                   </div>
                 </Notice>
               {:else if examples.length}
-                <p class="micro case__label">эталонные вопросы корпуса</p>
-                {#each examples as example (example)}
-                  <Button variant="quiet" size="sm" icon="quote" class="example" onclick={() => ask(example)}>
-                    {example}
-                  </Button>
-                {/each}
+                <p class="micro case__label">{ASK_EMPTY.examplesLabel}</p>
+                <div class="examples">
+                  {#each examples as example (example)}
+                    <button class="example" type="button" onclick={() => ask(example)}>
+                      {example}
+                    </button>
+                  {/each}
+                </div>
               {:else}
-                <p class="micro">
-                  эталонных вопросов в этом наборе нет — сформулируйте свой, поле ниже
-                </p>
+                <p class="micro">{ASK_EMPTY.examplesNone}</p>
               {/if}
+              <!-- Тот же «Как читать ответ», что и в ответе: новичок обязан
+                   увидеть правила до первого ответа, а не после него. -->
+              {@render readingGuide('guide-empty')}
             </div>
           {/snippet}
         </Empty>
@@ -1088,14 +1110,21 @@
           <Notice tone="error" title={error.label}>
             <p>{error.detail}</p>
           </Notice>
-          <p class="micro"><b>Что дальше.</b> {error.recovery}</p>
+          <p class="micro"><b>{ASK_ACTIONS.whatNext}</b> {error.recovery}</p>
+          {#if staleAnswer && answer}
+            <!-- Сбой не притворяется пустотой, а пустота не притворяется сбоем:
+                 прежний ответ остаётся на экране и назван как прежний. -->
+            <p class="micro">
+              {ANSWER_HEAD.stale.replace('{question}', `«${answer.question}»`)}
+            </p>
+          {/if}
           {#if error.question}
             <div class="row">
               <Button variant="ink" size="sm" icon="refresh" onclick={() => ask(error.question)}>
-                Повторить проход
+                {ASK_ACTIONS.retry}
               </Button>
               {#if error.login}
-                <!-- По гайдлайну 401 вход возвращает на текущий лист, а не на
+                <!-- По гайдлайну 401 вход возвращает на этот же экран, а не на
                      страницу по умолчанию: вопрос здесь остался нетронутым. -->
                 <a class="small" href={`/login?next=${encodeURIComponent(page.url.pathname)}`}
                   >Войти заново</a
@@ -1116,7 +1145,7 @@
       </div>
     {/if}
 
-    <!-- ── 2. СЛЕД ПРОХОДА: стадии обхода на утопленном листе ───────────── -->
+    <!-- ── 2. КАК СОБИРАЛСЯ ОТВЕТ: стадии на утопленном листе ────────────── -->
     {#if running || trailSteps.length}
       <Panel tone="sunk">
         <section class="trail" aria-labelledby="trail-title">
@@ -1124,10 +1153,10 @@
             <div class="trail__title">
               <h2 class="h4" id="trail-title">
                 {#if running}
-                  <Mascot mood={answerArriving ? 'say' : 'think'} size={32} label="Агент собирает ответ" />
-                  {answerArriving ? 'Ответ приходит' : 'Собираем ответ'}
+                  <Mascot mood={answerArriving ? 'say' : 'think'} size={32} label="Собираем ответ" />
+                  {answerArriving ? ASK_TRAIL.arriving : ASK_TRAIL.running}
                 {:else}
-                  След прохода
+                  {ASK_TRAIL.title}
                 {/if}
               </h2>
               <p class="micro">
@@ -1136,25 +1165,25 @@
                     <span class="tag">{stage.label} · <b class="num">{stage.count}</b></span>
                   {/each}
                 {:else}
-                  <span class="tag">шагов ещё не было</span>
+                  <span class="tag">{ASK_TRAIL.noSteps}</span>
                 {/if}
               </p>
             </div>
             <div class="trail__meter">
-              <span class="trail__elapsed">{duration(elapsedMs)}</span>
+              <!-- Отсчёт живёт только пока идёт сборка: после неё секундомер —
+                  телеметрия, и она ушла под «Почему ответу можно верить». -->
+              {#if running}<span class="trail__elapsed">{duration(elapsedMs)}</span>{/if}
               <!-- Живая область вне сворачиваемого тела: объявление доходит и
                    тогда, когда след закрыт (так он закрыт по умолчанию).
                    Внутри — только счётчик шагов: тикающие каждую секунду
                    сотые доли объявляли бы себя каждые 100 мс. -->
               <p class="micro trail__count" role="status" aria-live="polite" aria-atomic="true">
-                получено {countOf(trailSteps.length, 'шаг', 'шага', 'шагов')}{#if !running}
-                  · проход занял {duration(elapsedMs)}
-                {/if}
+                {ASK_TRAIL.stepsGathered} {countOf(trailSteps.length, 'шаг', 'шага', 'шагов')}
               </p>
               {#if running}
                 <!-- Слово «идёт» держит признак живого отсчёта: сами сотые доли
                      читают глазами, и две строки с одним числом не нужны. -->
-                <span class="micro trail__tick">идёт…</span>
+                <span class="micro trail__tick">{ASK_TRAIL.live}</span>
               {/if}
               <Button
                 variant="quiet"
@@ -1164,7 +1193,7 @@
                 controls="trail-body"
                 onclick={() => (trailUser = !trailOpen)}
               >
-                {trailOpen ? 'Свернуть след' : 'Развернуть след'}
+                {trailOpen ? ASK_TRAIL.collapse : ASK_TRAIL.expand}
               </Button>
             </div>
           </div>
@@ -1172,12 +1201,12 @@
           <div id="trail-body" class="trail__body" hidden={!trailOpen}>
             <p class="micro trail__honest">
               <Icon name="info" size={14} />
-              Общего числа шагов у прохода нет: ниже состоявшиеся шаги и время.
+              {ASK_TRAIL.honest}
             </p>
 
             {#if running && !trailSteps.length}
               <p class="trail__waiting">
-                Читаем корпус — шаги появятся по мере прохода.
+                {ASK_TRAIL.waiting}
               </p>
             {/if}
 
@@ -1195,37 +1224,36 @@
                   <ol class="stage__steps">
                     {#each block.items as step, index (index)}
                       {@const name = stepName(step)}
-                      {@const phrase = step.message ? phraseOf(step.message) : ''}
+                      {@const phrase = step.message ? tracePhraseOf(step.message) : ''}
                       <li class="step" data-state={step.status ?? 'unknown'}>
                         <span class="step__idx num">{String(index + 1).padStart(2, '0')}</span>
                         <span class="step__body">
                           <span class="step__agent">{name.label}</span>
-                          {#if name.code}<code class="code tech">{name.code}</code>{/if}
                           {#if phrase}<span class="step__msg">{phrase}</span>{/if}
                         </span>
-                        {#if step.status}
-                          <StatusPill
-                            status={stepPill(step.status)}
-                            label={STEP_STATE_LABELS[step.status]}
-                          />
-                        {:else}
-                          <span class="tag">нет данных</span>
-                        {/if}
-                        <span class="step__note num">{stepNote(step)}</span>
+                        <!-- Служебное имя шага и его длительность — под
+                             «Служебными данными» в конце следа: здесь читается
+                             ход ответа, а не журнал. -->
+                        <StatusPill
+                          status={stepPill(step.status ?? 'completed')}
+                          label={step.status
+                            ? STEP_STATE_LABELS[step.status]
+                            : RUN_STRINGS.stepStateFallback}
+                        />
                       </li>
                     {/each}
                   </ol>
                 {:else}
-                  <p class="micro">шагов этой стадии ещё не было</p>
+                  <p class="micro">{ASK_TRAIL.stageNoSteps}</p>
                 {/if}
 
                 {#if block.key === 'setup'}
                   {#if intentView || planView}
                     {#if intentView}
                       <dl class="kv stage__kv">
-                        <dt>основное намерение</dt>
+                        <dt>{ASK_TRAIL.intentPrimary}</dt>
                         <dd>{intentView.label}</dd>
-                        <dt>вторичные</dt>
+                        <dt>{ASK_TRAIL.intentSecondary}</dt>
                         <dd>{intentView.secondary}</dd>
                       </dl>
                       {#if intentView.entities.length || intentView.constraints.length}
@@ -1247,42 +1275,37 @@
                             <span class="chip chip--static"><Icon name="target" size={13} />{mention}</span>
                           {/each}
                         {:else}
-                          <span class="chip chip--static">сущности в вопросе не распознаны</span>
+                          <span class="chip chip--static">{RUN_STRINGS.noEntities}</span>
                         {/if}
                         {#each planView.countries as country (country)}
                           <span class="chip chip--static"><Icon name="pin" size={13} />{country}</span>
                         {/each}
                       </div>
+                      <!-- Глубину поиска и число условий вопроса видно под
+                           «Почему ответу можно верить»: это показатели контура.
+                           Период остаётся — его человек задаёт сам. -->
                       <dl class="kv stage__kv">
-                        <dt>период</dt>
+                        <dt>{ASK_TRAIL.period}</dt>
                         <dd class="num">{planView.period}</dd>
-                        <dt>глубина обхода</dt>
-                        <dd class="num">
-                          {planView.hops ?? '—'}
-                          {planView.hops ? plural(planView.hops, 'скачок', 'скачка', 'скачков') : ''}
-                        </dd>
-                        <dt>числовых фильтров</dt>
-                        <dd class="num">{planView.filters}</dd>
                       </dl>
                       {#if filterRows.length}
-                        <div class="table-wrap" role="region" aria-label="Числовые условия вопроса" use:scrollRegion>
+                        <div class="table-wrap" role="region" aria-label={ASK_TRAIL.filtersTitle} use:scrollRegion>
                           <table class="table">
-                            <caption class="micro">
-                              условия вопроса по числам
-                            </caption>
+                            <caption class="micro">{ASK_TRAIL.filtersCaption}</caption>
                             <thead>
                               <tr>
-                                <th>свойство</th><th>условие</th><th>значение</th><th>покрытие</th>
+                                <th>{ASK_TRAIL.colProperty}</th>
+                                <th>{ASK_TRAIL.colCondition}</th>
+                                <th>{ASK_TRAIL.colValue}</th>
+                                <th>{ASK_TRAIL.colCoverage}</th>
                               </tr>
                             </thead>
                             <tbody>
                               {#each filterRows as row (row.filter.property_name + row.filter.operator)}
                                 {@const property = propertyTerm(row.filter.property_name)}
                                 <tr class:no-coverage={row.covered === 0}>
-                                  <td>
-                                    {property.label}
-                                    {#if property.code}<code class="code tech">{property.code}</code>{/if}
-                                  </td>
+                                  <!-- Русское имя свойства; ключ — в «Служебных данных». -->
+                                  <td>{property.label}</td>
                                   <td>
                                     {labelOf(row.filter.operator)}
                                     <span class="num">{signOf(row.filter.operator)}</span>
@@ -1301,16 +1324,11 @@
                             </tbody>
                           </table>
                         </div>
-                        <p class="micro">
-                          «покрытие» — сколько числовых наблюдений ответа попало под условие вопроса.
-                        </p>
+                        <p class="micro">{RUN_STRINGS.coverageNote}</p>
                       {/if}
                     {/if}
                   {:else}
-                    <p class="micro">
-                      намерение и параметры вопроса (сущности, фильтры, география, период, глубина)
-                      приходят одним блоком с ответом
-                    </p>
+                    <p class="micro">{ASK_TRAIL.noPlan}</p>
                   {/if}
                 {/if}
 
@@ -1321,7 +1339,6 @@
                         <div class="obs">
                           <div class="obs__head">
                             <span class="small">{observation.name}</span>
-                            {#if observation.toolCode}<code class="code tech">{observation.toolCode}</code>{/if}
                             <StatusPill
                               status={observation.status === 'error'
                                 ? 'disputed'
@@ -1332,17 +1349,13 @@
                             />
                           </div>
                           <p class="small">{observation.summary}</p>
-                          <p class="micro">
-                            утверждений <b class="num">{observation.findings}</b> · узлов
-                            <b class="num">{observation.nodes}</b>
-                          </p>
+                          <!-- Счётчики утверждений и узлов — телеметрия обхода:
+                              она ушла под «Служебные данные» в конце следа. -->
                         </div>
                       {/each}
                     </div>
                   {:else if !answer}
-                    <p class="micro">
-                      итоги обхода приходят вместе с ответом — пока видно только завершение шагов
-                    </p>
+                    <p class="micro">{ASK_TRAIL.noObserve}</p>
                   {/if}
                 {/if}
               </div>
@@ -1353,18 +1366,30 @@
     {/if}
 
     <!-- ── 3. ОТВЕТ = БУМАГА ─────────────────────────────────────────────── -->
-    {#if answer}
+    {#if showPaper && answer}
       {@const payload = answer}
       <article class="paper">
         <header class="paper__head">
+          {#if staleAnswer}
+            <!-- Новый вопрос ещё без ответа: прежний не стирается молча, он
+                 назван прежним и остаётся до явного действия человека. -->
+            <div class="paper__stale">
+              <Notice tone="info" title={ANSWER_HEAD.eyebrow}>
+                <p>{ANSWER_HEAD.stale.replace('{question}', `«${answer.question}»`)}</p>
+              </Notice>
+              <Button variant="quiet" size="sm" onclick={() => (staleDismissed = true)}>
+                {ANSWER_HEAD.discard}
+              </Button>
+            </div>
+          {/if}
           <p class="eyebrow">
             <Icon name="doc" size={16} />
-            Ответ прогона
+            {ANSWER_HEAD.eyebrow}
             <code class="code paper__id">{shortCode(payload.query_id)}</code>
           </p>
           <h2 class="h3">{payload.question || question}</h2>
-          <!-- Режим сборки меняет доверие к ответу: «scripted» и «unavailable»
-               выглядят на листе иначе, чем ответ модели. -->
+          <!-- Режим сборки меняет доверие к ответу: «без модели» и «служебный
+               режим» читаются иначе, чем ответ модели. -->
           {#if payload.model_mode !== 'gigachat'}
             <p class="micro paper__mode">
               <Icon name="alert" size={14} />
@@ -1372,22 +1397,18 @@
             </p>
           {/if}
           <div class="prose">
-            <p class="summary">
-              {payload.summary || 'Проход не вернул текстового резюме — ниже только утверждения.'}
-            </p>
+            <p class="summary">{payload.summary || ANSWER_HEAD.summaryMissing}</p>
           </div>
           <div class="paper__bar">
             <dl class="kv paper__kv">
-              <dt>затрачено</dt>
-              <dd class="num">{duration(elapsedMs)}</dd>
-              <dt>утверждений · ссылок</dt>
+              <dt>{ANSWER_HEAD.claimsLabel}</dt>
               <dd class="num">{payload.findings.length} · {evidenceTotal}</dd>
-              <dt>расхождений · пробелов</dt>
+              <dt>{ANSWER_HEAD.divergencesLabel}</dt>
               <dd class="num">{payload.conflicts.length} · {payload.knowledge_gaps.length}</dd>
             </dl>
             {#if canExport}
               <div class="paper__export">
-                <span class="micro">выгрузка этого ответа</span>
+                <span class="micro">{ANSWER_HEAD.exportLabel}</span>
                 <Button
                   variant="quiet"
                   size="sm"
@@ -1408,78 +1429,87 @@
                 </Button>
               </div>
             {/if}
-            <p class="micro paper__confidence">
-              уверенность сборки {num(Math.round(payload.confidence * 100))} % — оценка полноты
-              подбора, не проверка числа
-            </p>
           </div>
-          <!-- Легенда листа свёрнута: порядок чтения важнее пояснений, а правила
-               нужны ровно один раз. -->
-          <div class="acc paper__guide">
+          <!-- Правила чтения одинаковы на пустом экране и в ответе; порядок
+               чтения важнее пояснений, поэтому свёрнуто. -->
+          {@render readingGuide('guide-answer')}
+          <!-- Телеметрия сборки — под тем же раскрытием, что объясняет доверие:
+               в тексте ответа ей не место. -->
+          <div class="acc paper__trust">
             <button
               class="acc__head"
               type="button"
-              aria-expanded={guideOpen}
-              aria-controls="paper-guide"
-              onclick={() => (guideOpen = !guideOpen)}
+              aria-expanded={trustOpen}
+              aria-controls="paper-trust"
+              onclick={() => (trustOpen = !trustOpen)}
             >
-              <span>Как читать этот лист</span>
+              <span>{TRUST_PANEL.title}</span>
               <Icon name="plus" size={16} class="acc__icon" />
             </button>
-            <div id="paper-guide" class="acc__body" hidden={!guideOpen}>
-              <ul class="paper__guide-list">
-                <li>
-                  Число без условия применения и локатора результатом не считается: раскройте тезис и
-                  прочитайте фрагмент первоисточника.
-                </li>
-                <li>
-                  Шкала интервалов повторяет список тезисов: ↑ ↓ — переход по шкале, Enter — открыть
-                  тезис; полосы сравнимы только внутри одной единицы измерения.
-                </li>
-                <li>
-                  Неполный ответ помечен причинами над списком тезисов; там же видно, что снять из
-                  условий, чтобы проход собрался целиком.
-                </li>
-              </ul>
+            <div id="paper-trust" class="acc__body" hidden={!trustOpen}>
+              <p class="micro">{TRUST_PANEL.hint}</p>
+              <dl class="kv paper__kv trust__kv">
+                {#each trustRows as row (row.label)}
+                  <dt>{row.label}</dt>
+                  <dd>{row.value}</dd>
+                {/each}
+              </dl>
+              {#if serviceRows.length}
+                <details class="svc">
+                  <summary class="micro">{TRUST_PANEL.serviceTitle}</summary>
+                  <p class="micro">{TRUST_PANEL.serviceHint}</p>
+                  <ul class="svc__list">
+                    {#each serviceRows as row (row.label)}
+                      <li>
+                        <span>{row.label}</span>
+                        <code class="code tech">{row.value}</code>
+                      </li>
+                    {/each}
+                  </ul>
+                </details>
+              {/if}
             </div>
           </div>
         </header>
 
         {#if payload.degradation_reasons.length}
+          <!-- Неполный ответ назван причиной, а не молчаливой обрезкой: сырая
+               строка сервиса остаётся под «Служебными данными». -->
           <div class="paper__degraded">
-            <Notice tone="warn" title="Ответ собран не полностью">
+                      <Notice tone="warn" title={DEGRADED.title}>
               {#each payload.degradation_reasons as reason (reason)}
-                <p>{phraseOf(reason)}</p>
+                <p>{degradationOf(reason)}</p>
               {/each}
             </Notice>
-            <p class="micro">
-              Снимите часть условий — числовой фильтр, период или глубину обхода — и спросите заново.
-            </p>
+            <p class="micro">{DEGRADED.hint}</p>
+            <details class="svc">
+              <summary class="micro">{TRUST_PANEL.serviceTitle}</summary>
+              <p class="micro">{TRUST_PANEL.serviceHint}</p>
+              <ul class="svc__list">
+                {#each payload.degradation_reasons as reason (reason)}
+                  <li>
+                    <code class="code tech">{reason}</code>
+                  </li>
+                {/each}
+              </ul>
+            </details>
           </div>
         {/if}
 
         {#if !payload.findings.length}
           <div class="paper__empty">
-            <Empty icon="search" title="Совпадений нет" body="
-              Обход корпуса прошёл до конца и не нашёл ни одного утверждения под этот вопрос. Это
-              результат, а не сбой.">
+            <Empty icon="search" title={ASK_NO_MATCH.title} body={ASK_NO_MATCH.body}>
               {#snippet action()}
                 <div class="case__actions">
                   {#if payload.knowledge_gaps.length}
-                    <p class="micro case__label">пробелы, отмеченные прогоном</p>
+                    <p class="micro case__label">{ASK_NO_MATCH.gapsLabel}</p>
                     {#each payload.knowledge_gaps.slice(0, 3) as gap, position (position)}
                       <p class="small gap">{gap}</p>
                     {/each}
                   {/if}
-                  <p class="micro">
-                    Снимите числовой фильтр, расширьте период или переформулируйте вопрос ближе к
-                    формулировкам источников — параметры плана видны в следу прохода выше.
-                  </p>
+                  <p class="micro">{ASK_NO_MATCH.hint}</p>
                   {#if payload.conflicts.length || payload.recommendations.length}
-                    <p class="micro">
-                      При этом прогон всё равно вернул расхождения и рекомендации — они под этим
-                      блоком.
-                    </p>
+                    <p class="micro">{ASK_NO_MATCH.aside}</p>
                   {/if}
                 </div>
               {/snippet}
@@ -1489,9 +1519,9 @@
           <div class="paper__body">
             <!-- Шкала интервалов: клавиатурный путь к тому же содержимому,
                  что и список тезисов, и общий масштаб по единице. -->
-            <nav class="scale" bind:this={rail} aria-label="Шкала интервалов ответа">
+            <nav class="scale" bind:this={rail} aria-label={SCALE_LABELS.aria}>
               <div class="scale__head">
-                <h3 class="small">Шкала интервалов</h3>
+                <h3 class="small">{SCALE_LABELS.title}</h3>
                 <span class="micro">
                   {countOf(payload.findings.length, 'утверждение', 'утверждения', 'утверждений')}
                 </span>
@@ -1515,7 +1545,7 @@
                         {#if Number.isFinite(group.lo)}
                           <span class="num">{num(group.lo)}–{num(group.hi)}</span>
                         {:else}
-                          <span>числовых наблюдений нет</span>
+                          <span>{SCALE_LABELS.noNumbers}</span>
                         {/if}
                       </p>
                       {#each group.rows as row (row.item.id)}
@@ -1548,20 +1578,18 @@
                               {#if row.bounds}
                                 <b class="num">{num(row.bounds[0])}–{num(row.bounds[1])} {group.unit}</b>
                               {:else}
-                                <b>без числа</b>
+                                <b>{SCALE_LABELS.withoutNumber}</b>
                               {/if}
-                              · ссылок <b class="num">{row.item.evidence.length}</b>
+                              · {SCALE_LABELS.links} <b class="num">{row.item.evidence.length}</b>
                             </span>
                           </span>
                         </button>
                       {/each}
                     </div>
                   {/each}
-                  <p class="micro">
-                    полосы сравнимы только внутри одной единицы: шкала группирует наблюдения по ней.
-                  </p>
+                  <p class="micro">{SCALE_LABELS.unitNote}</p>
                 {:else}
-                  <p class="micro">проход не оставил интервалов — утверждения без числовых наблюдений</p>
+                  <p class="micro">{RUN_STRINGS.noIntervals}</p>
                 {/if}
               </div>
             </nav>
@@ -1596,13 +1624,10 @@
                       {/if}
                     </div>
                     <h3 class="thesis__statement">{finding.statement}</h3>
+                    <!-- Только русское имя: ключ онтологии — подписью в разборе
+                        тезиса, под «Служебными данными». -->
                     <p class="micro thesis__spo">
                       <b>{subject.label}</b> · {predicate.label} · {scopeText(finding.scope)}
-                      {#if subject.code || predicate.code}
-                        <code class="code tech"
-                          >{subject.code ?? ''}{#if subject.code && predicate.code} · {/if}{predicate.code ?? ''}</code
-                        >
-                      {/if}
                     </p>
                     <Button
                       variant="quiet"

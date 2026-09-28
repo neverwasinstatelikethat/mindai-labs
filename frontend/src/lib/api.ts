@@ -1,6 +1,8 @@
 import { env } from '$env/dynamic/public';
 import type {
   AccountInfo,
+  ActivityEntry,
+  AuditEntry,
   ClaimHistory,
   ComparisonTable,
   CorpusStats,
@@ -152,6 +154,12 @@ export const api = {
   export: (queryId: string, format: ExportFormat) =>
     requestRaw('/api/v1/export', { method: 'POST', body: JSON.stringify({ query_id: queryId, format }) }),
   dashboard: () => request<DashboardData>('/api/v1/dashboard'),
+  // Журнал собственного аккаунта для профиля: /audit требует audit:read и
+  // отдаёт акты всех, а здесь actor_id определяет сервер по сессии.
+  myActivity: () => request<ActivityEntry[]>('/api/v1/me/activity'),
+  // Журнал корпуса — под тем же audit:read, что и право в профиле: без него
+  // обещание «журнал действий аккаунтов» нечем было бы проверить.
+  audit: (limit = 50) => request<AuditEntry[]>(`/api/v1/audit?limit=${limit}`),
 };
 
 export function apiUrl(path: string): string {

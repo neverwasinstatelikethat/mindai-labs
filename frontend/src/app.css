@@ -293,15 +293,16 @@
   padding-bottom: var(--s9);
 }
 
-/* Рабочая оболочка — экран на весь вьюпорт со внутренним скроллом: панели
-   доходят до краёв, прокрутка области не трогает навигацию. */
+/* Рабочая оболочка: прокрутку ведёт документ, а не контейнер. Собственный
+   overflow-y у оболочки превращал навигацию в единственное место, где скролл
+   не работал (колесо над шапкой, клавиатура, поиск по странице, мобильная
+   инерция), и на экранах с длинными секциями читалось как «страница зависла».
+   Высота холстов задают сами через dvh, поэтому высоте вьюпорта тут делать нечего. */
 .app-body {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: 100dvh;
-  overflow-y: auto;
-  overscroll-behavior-y: contain;
+  min-height: 100dvh;
   scrollbar-gutter: stable;
   scroll-padding-top: calc(var(--topbar-h) + var(--s4));
   padding-top: calc(var(--topbar-h) + var(--s4));
@@ -709,6 +710,39 @@
   white-space: nowrap;
   scroll-snap-align: center;
   flex: none;
+}
+
+/* Тач-цели навигации. На палец полоса была 39px — ниже минимума 44px, а это
+   единственный способ переключить раздел на мобильном. Правило привязано к
+   типу указателя, а не только к ширине: планшет в горизонте широкий и тоже
+   пальцем. */
+@media (pointer: coarse), (max-width: 640px) {
+  .seg__item {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+
+  .pill-nav__brand {
+    min-width: 44px;
+    min-height: 44px;
+    justify-content: center;
+  }
+
+  /* Остальные цели померяны на 390px: кнопки разделов были 39px, строка
+     текстового чтения карты — 23px, переключатель показа пароля — 38px.
+     Селекторы с тегом перебивают скоупленные правила компонентов, иначе
+     компонентный height побеждал. */
+  a.btn,
+  button.btn,
+  button.chip {
+    min-height: 44px;
+  }
+
+  button.field__toggle {
+    min-width: 44px;
+    min-height: 44px;
+  }
 }
 
 .seg__item:hover {
@@ -1472,6 +1506,14 @@
     transition-delay: var(--reveal-delay, 0ms);
   }
 
+  /* На рабочих экранах появление ничего не скрывает: `.reveal` висит и на каждом
+     SectionHead, а заголовок экрана не должен ждать наблюдателя. Движение украшает
+     витрину и не стоит на пути у аналитика. Специфичность выше правила выше. */
+  html.motion-ok .app-body .reveal {
+    opacity: 1;
+    transform: none;
+  }
+
   html.motion-ok .reveal.is-in {
     opacity: 1;
     transform: none;
@@ -1836,46 +1878,25 @@ html.motion-ok .prompt {
   box-shadow: var(--shadow-aura);
 }
 
-/* Подпись уходит за край строки, её место занимает бегущая строка раздела. */
+/* Название раздела и его пояснение читаются вместе: пояснение — единственный
+   ответ на «а этот раздел для чего», и прятать его за наведением нельзя. */
 .flow__rows {
-  position: relative;
-  height: 1.5em;
-  overflow: hidden;
-}
-
-.flow__label,
-.flow__marquee {
-  display: block;
-  font-size: var(--t-h4);
-  font-weight: 500;
-  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  min-width: 0;
 }
 
 .flow__label {
-  transition: transform var(--dur) var(--ease-enter), opacity var(--dur) var(--ease-soft);
+  font-size: var(--t-h4);
+  font-weight: 500;
+  line-height: 1.3;
 }
 
-.flow__marquee {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  width: max-content;
-  color: var(--ink-2);
-  opacity: 0;
-  transform: translateY(calc(var(--flow-dir) * 110%));
-  transition: transform var(--dur) var(--ease-enter), opacity var(--dur) var(--ease-soft);
-}
-
-.flow__strip {
-  display: flex;
-  width: max-content;
-  color: inherit;
-}
-
-.flow__chunk {
-  padding-inline-end: var(--s8);
-  white-space: nowrap;
+.flow__gloss {
+  font-size: var(--t-small);
+  line-height: var(--lh-dense);
+  color: var(--ink-3);
 }
 
 .flow__arrow {
@@ -1886,29 +1907,6 @@ html.motion-ok .prompt {
 .flow__item:hover .flow__arrow {
   transform: translateX(5px);
   color: var(--action-ink);
-}
-
-html.motion-ok .flow__item:hover .flow__label,
-html.motion-ok .flow__item:focus-visible .flow__label {
-  transform: translateY(calc(var(--flow-dir) * -110%));
-  opacity: 0;
-}
-
-html.motion-ok .flow__item:hover .flow__marquee,
-html.motion-ok .flow__item:focus-visible .flow__marquee {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-html.motion-ok .flow__item:hover .flow__strip,
-html.motion-ok .flow__item:focus-visible .flow__strip {
-  animation: flow-marquee var(--dur-marquee) linear infinite;
-}
-
-@keyframes flow-marquee {
-  to {
-    transform: translateX(-50%);
-  }
 }
 
 /* ── Микро-взаимодействия: отклик на каждое движение ──────────────────── */

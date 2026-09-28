@@ -1,19 +1,33 @@
 <script lang="ts">
-  // Проверка решений — верстак: основание отзыва, вердикт с комментарием и
-  // разбор предложений эволюции с настоящими числами A/B-прогонов. Решение
-  // принимает эксперт; без расширенного доступа экран объясняет, что именно
-  // недоступно, а не показывает мёртвую кнопку.
+  // Оценка ответов: по ответу системы выносят вердикт — принять, отклонить или
+  // попросить правку, а комментарием называют основание. Разбор предложений модели
+  // с числами A/B-прогона и правка самого утверждения относятся к расширенному
+  // доступу: без него экран объясняет, что именно недоступно, а не показывает
+  // мёртвую кнопку, и в обычной прокрутке экспертных строк не стоит.
+  import { onMount } from 'svelte';
+  import { page } from '$app/state';
   import { api, ApiError } from '$lib/api';
+  import { navLabel } from '$lib/nav';
   import { countOf, dateTime, num, pct } from '$lib/format';
   import { session } from '$lib/sessionStore.svelte';
-  import { PREDICATE_LABELS, SUBJECT_LABELS, STATUS_SHORT, knownTerm, termOf } from '$lib/terms';
+  import {
+    FEEDBACK_GATE,
+    FEEDBACK_VERDICTS,
+    PREDICATE_LABELS,
+    PROPOSAL_KIND_FALLBACK,
+    PROPOSAL_KIND_LABELS,
+    PROPOSAL_STATUS_LABELS,
+    STATUS_SHORT,
+    knownTerm,
+    SUBJECT_LABELS,
+    termOf,
+  } from '$lib/terms';
   import {
     type ClaimHistory,
     type EvaluationRun,
     type EvolutionExperiment,
     type EvolutionProposal,
     type FindingListItem,
-    type ModelMode,
   } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
@@ -25,23 +39,11 @@
   import Sheet from '$lib/ui/Sheet.svelte';
   import StatusPill from '$lib/ui/StatusPill.svelte';
 
-  const VERDICTS: { key: 'accept' | 'reject' | 'correct'; label: string }[] = [
-    { key: 'accept', label: 'ответ принят' },
-    { key: 'reject', label: 'ответ отклонён' },
-    { key: 'correct', label: 'нужна правка' },
-  ];
-
   // Журнал предложений порциями: список растёт вместе с корпусом, и 500
-  // предложений не должны становиться одним бесконечным листом.
+  // предложений не должны становиться одним бесконечным списком.
   const PROPOSAL_PAGE_SIZE = 10;
-  // Прогони оценки приходят пачкой до нескольких сотен — листуем и их.
+  // Прогоны оценки приходят пачкой до нескольких сотен — разбиваем и их.
   const RUNS_PAGE_SIZE = 8;
-
-  const PROPOSAL_STATUS: Record<EvolutionProposal['status'], string> = {
-    proposed: 'ожидает решения',
-    accepted: 'принято',
-    rejected: 'отклонено',
-  };
 
   // Статус предложения показываем тем же языком статусов, что и утверждения:
   // ждёт решения — гипотеза, принято — консенсус, отклонено — заменённая версия.
@@ -51,33 +53,23 @@
     rejected: 'superseded',
   };
 
-  const KIND_RU: Record<string, string> = {
-    prompt: 'политика промпта',
-    rule: 'правило отбора',
-    alias: 'алиас сущности',
-    gold_case: 'эталонный кейс',
-  };
-
-  const EXPERT_GATE = 'Экспертные действия доступны при расширенном доступе.';
-
   // Классы отказа различаем, чтобы подобрать верную формулировку и тон плашки,
   // но человеку показываем что не получилось и что нажать — без кодов ответа.
   type Failure = { kind: 'model' | 'backend' | 'denied' | 'conflict' | 'other'; text: string };
-  type Target = {
-    queryId: string;
-    provenance: string;
-    createdAt?: string;
-    summary?: string;
-    confidence?: number;
-    modelMode?: ModelMode;
-    findings: FindingListItem[];
-    evaluation?: EvaluationRun;
-  };
-
   // FeedbackRequest.query_id — UUID без исключения. Свободный комментарий,
   // который не указывает на конкретный ответ, уходит с nil-UUID: сервер его
   // принимает, и в журнале предложений он читается как «не привязан».
   const NIL_QUERY_ID = '00000000-0000-0000-0000-000000000000';
+
+  // Основание отзыва: прогон оценки из журнала либо вывод, принесённый из
+  // «Сравнения» (свободный комментарий). Вопрос корпусу задают в разделе «Вопрос»,
+  // а не здесь.
+  type Target = {
+    queryId: string;
+    provenance: string;
+    createdAt?: string;
+    evaluation?: EvaluationRun;
+  };
 
   // Ответ на отзыв раскладывается по полочкам: решение эксперта (superseded)
   // и предложение от модели — разные по надёжности части, плюс явный канал
@@ -130,14 +122,14 @@
 
   /** Сбой по-человечески: что не вышло и одно действие. */
   function failureText(failure: Failure): string {
-    if (failure.kind === 'denied') return EXPERT_GATE;
+    if (failure.kind === 'denied') return FEEDBACK_GATE;
     if (failure.kind === 'conflict') {
       return 'Что заменять, уже не найдено: версия утверждения изменилась. Перечитайте указатель находок и выберите актуальную версию.';
     }
     if (failure.kind === 'model') {
-      return 'Модель не ответила, поэтому предложение не сформулировано. Повторите позже — экспертное решение можно записать и сейчас.';
+      return 'Модель не ответила, поэтому предложение не сформулировано. Повторите позже — вердикт можно записать и сейчас.';
     }
-    if (failure.kind === 'backend') return 'Показания не пришли. Проверьте соединение и повторите отправку.';
+    if (failure.kind === 'backend') return 'Данные не пришли. Проверьте соединение и повторите отправку.';
     return 'Не получилось. Проверьте соединение и повторите попытку.';
   }
 
@@ -153,7 +145,7 @@
   let runs = $state<EvaluationRun[]>([]);
   let runsFailure = $state('');
   let proposals = $state<EvolutionProposal[]>([]);
-  // Сколько предложений листа открыто: порция растёт действием читателя, а не
+  // Сколько предложений открыто: порция растёт действием читателя, а не
   // молчаливой прокруткой всего журнала.
   let proposalLimit = $state(PROPOSAL_PAGE_SIZE);
   let runsShown = $state(RUNS_PAGE_SIZE);
@@ -162,18 +154,11 @@
   let experimentsFailure = $state('');
   let corpus = $state<FindingListItem[]>([]);
   let corpusFailure = $state('');
-  // Счётчики печатаются, только когда журналы реально прочитаны loadAll:
-  // иначе у читателя без прав стояли бы честные, но бессмысленные нули.
-  let ledgerLoaded = $state(false);
+  // Частичный сбой чтения: часть журналов прочитана, часть нет — это отдельная
+  // строка, а не молчаливая пустота в секции.
   let softFailure = $state('');
 
   let target = $state<Target | null>(null);
-  let questionDraft = $state('');
-  let asking = $state(false);
-  // Attempt, а не «форма невалидна»: претензия к вопросу — после попытки,
-  // как у вердикта; кнопка из-за короткого текста не гаснет.
-  let askAttempted = $state(false);
-  let askFailure = $state<Failure | null>(null);
 
   let verdict = $state<'accept' | 'reject' | 'correct' | null>(null);
   let comment = $state('');
@@ -182,7 +167,7 @@
   let correction = $state('');
   let submitting = $state(false);
   // Attempt, а не «форма невалидна»: претензии показываются после попытки,
-  // а не как выговор за ещё не тронутый лист.
+  // а не как выговор за ещё не тронутую форму.
   let submitAttempted = $state(false);
   let result = $state<FeedbackResult | null>(null);
   let submitFailure = $state<Failure | null>(null);
@@ -238,18 +223,10 @@
         : `Нужен комментарий от 3 символов: сейчас ${comment.trim().length}.`,
   );
 
-  // Вопрос к корпусу — тот же принцип: претензия появляется после попытки,
-  // а кнопка не гаснет из-за ещё не набранного текста.
-  const questionError = $derived(
-    questionDraft.trim().length >= 3 || (!askAttempted && questionDraft.trim().length === 0)
-      ? ''
-      : questionDraft.trim().length === 0
-        ? 'Нужен вопрос корпусу: без него прогон не запустить.'
-        : `Нужен вопрос от 3 символов: сейчас ${questionDraft.trim().length}.`,
-  );
-
+  // Пул для правки — указатель находок: своего ответа на вопрос раздел больше не
+  // держит (его задают в «Запросе»), сужать выбор до утверждений ответа нечему.
   const candidates = $derived.by(() => {
-    const pool = target?.findings.length ? target.findings : corpus;
+    const pool = corpus;
     const query = findingQuery.trim().toLowerCase();
     const list = query
       ? pool.filter(
@@ -262,12 +239,11 @@
     return list.slice(0, 12);
   });
 
-  // Пул для замены пуст и без поиска: «уточните поиск» про другое — про фильтр,
+  // Пул для правки пуст и без поиска: «уточните поиск» про другое — про фильтр,
   // который ничего не отобрал из существующего пула.
-  const poolEmpty = $derived(!target?.findings.length && corpus.length === 0);
+  const poolEmpty = $derived(corpus.length === 0);
 
-  const openCount = $derived(proposals.filter((item) => item.status === 'proposed').length);
-  // Журнал предложений растёт вместе с корпусом: лист разбит на порции, чтобы
+  // Журнал предложений растёт вместе с корпусом: список разбит на порции, чтобы
   // пятьсот предложений не становились одним DOM-полотном.
   const shownProposals = $derived(proposals.slice(0, proposalLimit));
 
@@ -360,17 +336,19 @@
       queryId: run.query_id,
       provenance: 'прогон оценки из журнала',
       createdAt: run.created_at,
-      findings: [],
       evaluation: run,
     };
     clearForm();
   }
 
-  function chooseFreeForm(): void {
+  /**
+   * Комментарий без привязки к ответу: так оставляют замечание о корпусе в целом
+   * или вывод, принесённый из «Сравнения» (ссылка ведёт сюда с `?about=…`).
+   */
+  function chooseFreeForm(about = ''): void {
     target = {
       queryId: NIL_QUERY_ID,
-      provenance: 'комментарий без привязки к ответу',
-      findings: [],
+      provenance: about ? `вывод по сравнению «${about}»` : 'комментарий без привязки к ответу',
     };
     clearForm();
   }
@@ -378,32 +356,6 @@
   function dropTarget(): void {
     target = null;
     clearForm();
-  }
-
-  async function askQuestion(): Promise<void> {
-    const question = questionDraft.trim();
-    askAttempted = true;
-    if (question.length < 3) return;
-    asking = true;
-    askFailure = null;
-    try {
-      const feedbackResponse = await api.query(question);
-      target = {
-        queryId: feedbackResponse.answer.query_id,
-        provenance: `ответ на вопрос «${feedbackResponse.answer.question}»`,
-        createdAt: feedbackResponse.evaluation.created_at,
-        summary: feedbackResponse.answer.summary,
-        confidence: feedbackResponse.answer.confidence,
-        modelMode: feedbackResponse.answer.model_mode,
-        findings: feedbackResponse.answer.findings,
-        evaluation: feedbackResponse.evaluation,
-      };
-      clearForm();
-    } catch (reason) {
-      askFailure = classify(reason);
-    } finally {
-      asking = false;
-    }
   }
 
   async function submitReview(): Promise<void> {
@@ -435,9 +387,7 @@
         // Формулировку берём из того же пула, из которого выбирали: шторка
         // называет утверждение по-русски, id остаётся подписью.
         lastCorrectedStatement =
-          (target?.findings.length ? target.findings : corpus).find(
-            (item) => item.id === correctedFinding,
-          )?.statement ?? '';
+          corpus.find((item) => item.id === correctedFinding)?.statement ?? '';
         // Цепочку версий читаем сразу и открываем в шторке: правку без
         // показанной цепочки не проверяешь глазами.
         await loadHistory(correctedFinding, lastCorrectedStatement, true);
@@ -445,7 +395,7 @@
           corpus = await api.findings();
           corpusFailure = '';
         } catch {
-          softFailure = 'Правка записана, но указатель находок не перечитан. Обновите лист позже.';
+          softFailure = 'Правка записана, но указатель находок не перечитан. Обновите раздел позже.';
         }
       }
       correction = '';
@@ -454,6 +404,17 @@
       submitFailure = classify(reason);
     } finally {
       submitting = false;
+    }
+  }
+
+  // Указатель находок перечитывают отдельно: пустой пул для правки лечится
+  // пополнением корпуса, а не перечитыванием журналов предложений.
+  async function reloadCorpus(): Promise<void> {
+    try {
+      corpus = await api.findings();
+      corpusFailure = '';
+    } catch {
+      corpusFailure = 'Не удалось прочитать указатель находок. Попробуйте ещё раз.';
     }
   }
 
@@ -471,13 +432,13 @@
         experimentsFailure = '';
       } else softFailure = 'Результаты A/B-прогонов не перечитаны.';
     } catch {
-      softFailure = 'Лист не перечитан: проверьте соединение и повторите попытку.';
+      softFailure = 'Журналы не перечитаны: проверьте соединение и повторите попытку.';
     }
   }
 
   async function decide(proposal: EvolutionProposal, decision: boolean): Promise<void> {
     if (!canReview) {
-      reviewFailure = EXPERT_GATE;
+      reviewFailure = FEEDBACK_GATE;
       return;
     }
     reviewingId = proposal.id;
@@ -486,12 +447,12 @@
     try {
       const updated = await api.review(proposal.id, decision);
       proposals = proposals.map((item) => (item.id === updated.id ? updated : item));
-      reviewNotice = `«${updated.title}» · ${PROPOSAL_STATUS[updated.status]}`;
+      reviewNotice = `«${updated.title}» · ${PROPOSAL_STATUS_LABELS[updated.status]}`;
     } catch (reason) {
       const failureKind = classify(reason);
       reviewFailure =
         failureKind.kind === 'denied'
-          ? EXPERT_GATE
+          ? FEEDBACK_GATE
           : failureKind.kind === 'conflict'
             ? 'Сначала нужен A/B-прогон этого предложения — без замера решение не записывается.'
             : 'Решение не записано. Проверьте соединение и повторите.';
@@ -511,9 +472,9 @@
       const failureKind = classify(reason);
       experimentFailure =
         failureKind.kind === 'denied'
-          ? EXPERT_GATE
+          ? FEEDBACK_GATE
           : failureKind.kind === 'conflict'
-            ? 'Прогон не выполнен: предложение изменилось, обновите лист.'
+            ? 'Прогон не выполнен: предложение изменилось, обновите журнал.'
             : 'A/B-прогон не выполнен. Проверьте соединение и повторите прогон.';
     } finally {
       runningId = '';
@@ -535,7 +496,7 @@
       const failureKind = classify(reason);
       historyFailure =
         failureKind.kind === 'denied'
-          ? EXPERT_GATE
+          ? FEEDBACK_GATE
           : 'Цепочка версий не открылась. Проверьте соединение и повторите.';
       // Правка уже записана — потеря цепочки не отменяет её, но скрывает замены.
       // Два факта называются отдельно: «записано» и «не открылось» не склеиваются
@@ -576,13 +537,14 @@
     runsFailure = '';
     experimentsFailure = '';
     corpusFailure = '';
-    ledgerLoaded = false;
     softFailure = '';
     const [proposalsResult, findingsResult, runsResult, experimentsResult] = await Promise.allSettled([
-      api.proposals(),
+      // Журнал предложений и прогоны читает только эксперт: без права не просим —
+      // сервер ответит 403, а отказ по доступу не должен выглядеть сбоем раздела.
+      canReview ? api.proposals() : Promise.resolve([] as EvolutionProposal[]),
       canRead ? api.findings() : Promise.resolve([] as FindingListItem[]),
       canEvaluate ? api.evaluations() : Promise.resolve([] as EvaluationRun[]),
-      api.experiments(),
+      canReview ? api.experiments() : Promise.resolve([] as EvolutionExperiment[]),
     ]);
     if (proposalsResult.status === 'rejected') {
       failure = classify(proposalsResult.reason);
@@ -597,22 +559,21 @@
       experimentsFailure = '';
     } else {
       experiments = [];
-      experimentsFailure = 'Не удалось прочитать результаты A/B-прогонов. Обновите лист ещё раз.';
+      experimentsFailure = 'Не удалось прочитать результаты A/B-прогонов. Обновите раздел ещё раз.';
     }
     if (findingsResult.status === 'fulfilled') {
       corpus = findingsResult.value;
       corpusFailure = '';
     } else {
       corpus = [];
-      corpusFailure = 'Не удалось прочитать указатель находок. Обновите лист ещё раз.';
+      corpusFailure = 'Не удалось прочитать указатель находок. Обновите раздел ещё раз.';
     }
     if (runsResult.status === 'fulfilled') runs = runsResult.value;
-    else runsFailure = 'Не удалось прочитать журнал прогонов. Обновите лист ещё раз.';
-    ledgerLoaded = true;
+    else runsFailure = 'Не удалось прочитать журнал прогонов. Обновите раздел ещё раз.';
     phase = 'ready';
   }
 
-  // Доступ приходит вместе с подтверждённым входом: лист пересобирается,
+  // Доступ приходит вместе с подтверждённым входом: раздел перечитывается,
   // когда он появился.
   let started = false;
   $effect(() => {
@@ -625,13 +586,45 @@
     started = true;
     void loadAll();
   });
+
+  // «Сравнение» присылает сюда действием «Записать вывод»: основание —
+  // свободный комментарий, а строка `about` говорит, о чём именно вывод.
+  // «Расхождения» присылают конкретное утверждение (`?claim=`): выбор вердикта и
+  // факта проделывается за человека ровно в том объёме, в каком он его назвал,
+  // и объявляется строкой — молча подставленный факт читался бы как своя правка.
+  let pendingClaim = '';
+  let claimNote = $state('');
+
+  onMount(() => {
+    const about = page.url.searchParams.get('about')?.trim().slice(0, 160) ?? '';
+    const claim = page.url.searchParams.get('claim')?.trim() ?? '';
+    if (claim) pendingClaim = claim;
+    if (about) chooseFreeForm(about);
+    else if (claim) chooseFreeForm('разбор расхождения из раздела «Расхождения»');
+  });
+
+  $effect(() => {
+    // Факт ищется, только когда указатель прочитан: до ответа сервера нечего
+    // выбирать, а отказ указателя уже назван своей строкой.
+    if (!pendingClaim || corpus.length === 0) return;
+    const found = corpus.find((item) => item.id === pendingClaim);
+    pendingClaim = '';
+    if (!found) {
+      claimNote = 'Утверждение из «Расхождений» в указателе не нашлось — возможно, оно закрыто вашим доступом. Выберите факт для правки поиском.';
+      return;
+    }
+    verdict = 'correct';
+    findingId = found.id;
+    findingQuery = '';
+    claimNote = `Факт для правки принесён из «Расхождений»: ${found.statement}`;
+  });
 </script>
 
 <svelte:head>
-  <title>Проверка решений — Научный Клубок</title>
+  <title>Оценка ответов — Научный Клубок</title>
   <meta
     name="description"
-    content="Верстак проверки: отзыв по конкретному ответу системы, экспертная правка утверждения с новой версией, разбор предложений эволюции и результатов A/B-прогонов."
+    content="Оцените ответ системы: принять, отклонить или попросить правку. Комментарий служит основанием отзыва; правка утверждения и разбор предложений модели открыты при расширенном доступе."
   />
 </svelte:head>
 
@@ -639,59 +632,37 @@
   <div class="wrap">
     <SectionHead
       level="1"
-      eyebrow="Проверка решений · верстак"
-      title="Отзыв, правка и разбор предложений"
-      lead="Отзыв привязывается к конкретному ответу системы, правка — к утверждению с доказательством. Модель лишь формулирует предложение эволюции: решение о применении принимает эксперт — сначала A/B-прогон, затем «Принять».">
-      {#if phase === 'ready' && ledgerLoaded}
-        <p class="micro muted work__counts">
-          предложений <span class="num">{proposals.length}</span> · ожидают решения
-          <span class="num">{openCount}</span>
-          {#if canEvaluate}
-            · прогонов <span class="num">{runs.length}</span>
-          {/if}
-          · A/B <span class="num">{experiments.length}</span>
-        </p>
-        {#if canEvaluate && runs.length >= 200}
-          <p class="micro muted work__counts">
-            прогоны: показаны последние <span class="num">{num(runs.length)}</span> записей журнала
-          </p>
-        {/if}
-        {#if experiments.length >= 50}
-          <p class="micro muted work__counts">
-            A/B: показаны последние <span class="num">{num(experiments.length)}</span> записей журнала
-          </p>
-        {/if}
-      {/if}
-    </SectionHead>
+      eyebrow="Корпус · оценка ответов"
+      title="Оцените ответ системы"
+      lead="Примите ответ, отклоните его или попросите правку — основанием служит ваш комментарий."
+    />
 
     {#if !canGive && !canReview}
-      <Notice tone="warn" title="Проверка решений недоступна">
-        {EXPERT_GATE} Журнал предложений не читается, отзывы и правки не записываются.
+      <Notice tone="warn" title="Оценка ответов недоступна">
+        {FEEDBACK_GATE} Отзывы и правки не записываются, предложения модели не открываются.
         <div class="row work__actions">
           <Button href="/findings" variant="quiet" size="sm">Указатель находок</Button>
           <Button href="/research" variant="ghost" size="sm">Рабочее пространство запроса</Button>
         </div>
       </Notice>
     {:else if phase === 'loading'}
-      <div class="work__loading" role="status" aria-label="Считываем показания корпуса">
-        <p class="eyebrow"><span class="spinner spinner--quiet"></span> Считываем показания корпуса</p>
+      <div class="work__loading" role="status" aria-label="Загружаем данные проверки">
+        <p class="eyebrow"><span class="spinner spinner--quiet"></span> Загружаем данные проверки</p>
         <div class="skeleton" style="height:120px"></div>
         <div class="skeleton" style="height:120px"></div>
-        <p class="micro muted">
-          Предложения эволюции, результаты A/B-прогонов, журнал прогонов оценки и указатель находок.
-        </p>
-        <!-- Выход из подвешенного листа: если сессия не ответила, чтение может
-             не начаться вовсе — выход здесь, а не вечный «считываем». -->
+        <p class="micro muted">Читаем прогоны оценки и указатель находок.</p>
+        <!-- Выход из подвешенной загрузки: если сессия не ответила, чтение может
+             не начаться вовсе — выход здесь, а не вечное «загружаем». -->
         <div class="row work__actions">
-          <p class="micro muted">Если показания не появляются — проверьте соединение.</p>
+          <p class="micro muted">Если данные не появляются — проверьте соединение.</p>
           <Button variant="quiet" size="sm" onclick={() => void session.refresh()}>
             Проверить соединение
           </Button>
         </div>
       </div>
     {:else if phase === 'failed'}
-      <Notice tone={failure?.kind === 'denied' ? 'warn' : 'error'} title="Лист не собран">
-        {failure ? failureText(failure) : 'Лист не собран. Проверьте соединение и повторите попытку.'}
+      <Notice tone={failure?.kind === 'denied' ? 'warn' : 'error'} title="Данные не прочитаны">
+        {failure ? failureText(failure) : 'Данные не прочитаны. Проверьте соединение и повторите попытку.'}
         <div class="row work__actions">
           {#if failure?.kind === 'denied'}
             <!-- Повтор отказа по праву даёт тот же отказ: здесь только то, что
@@ -699,13 +670,13 @@
             <Button variant="quiet" size="sm" href="/account">Что открыто моему аккаунту</Button>
             <Button variant="ghost" size="sm" href="/findings">Указатель находок</Button>
           {:else}
-            <Button variant="action" size="sm" icon="refresh" onclick={() => void loadAll()}>Пересобрать лист</Button>
+            <Button variant="action" size="sm" icon="refresh" onclick={() => void loadAll()}>Прочитать заново</Button>
           {/if}
         </div>
       </Notice>
     {:else}
       {#if softFailure}
-        <Notice tone="error" title="Лист прочитан не полностью">
+        <Notice tone="error" title="Данные прочитаны не полностью">
           {softFailure}
           <div class="row work__actions">
             <Button variant="quiet" size="sm" onclick={() => (softFailure = '')}>Понятно</Button>
@@ -721,34 +692,19 @@
                 <p class="eyebrow"><Icon name="target" size={16} /> Основание отзыва</p>
                 <h2 class="h3">Ответ, который проверяем</h2>
                 <p class="micro muted">
-                  Отзыв привязывается к конкретному ответу: возьмите прогон из журнала ниже или
-                  спросите корпус прямо здесь.
+                  Основание отзыва — прогон оценки из журнала ниже либо вывод, принесённый
+                  из «Сравнения».
                 </p>
               </div>
             </div>
 
-            {#if askFailure}
-              <div class="work__note">
-                <Notice tone="error" title="Ответ не получен">
-                  {failureText(askFailure)}
-                </Notice>
-              </div>
-            {/if}
-
-            <form class="ask" onsubmit={(event) => { event.preventDefault(); void askQuestion(); }}>
-              <Field
-                label="Вопрос корпусу — чтобы разобрать свежий ответ"
-                name="ask-question"
-                placeholder="напр. какие пределы по сухому остатку для шахтной воды"
-                bind:value={questionDraft}
-                onenter={() => void askQuestion()}
-                error={questionError}
-                hint="Тот же запрос, что и в рабочем пространстве."
-              />
-              <Button type="submit" variant="action" busy={asking}>
-                {asking ? 'Прогон запроса…' : 'Спросить'}
-              </Button>
-            </form>
+            <div class="work__ask">
+              <p class="micro muted">
+                Свежий ответ системы получают вопросом в разделе «Вопрос» — прогон оценки
+                сразу попадает в журнал ниже.
+              </p>
+              <Button href="/research" variant="link" size="sm">Задайте вопрос в разделе «Вопрос»</Button>
+            </div>
 
             {#if target}
               <div class="target">
@@ -759,14 +715,7 @@
                     · <time class="num" datetime={target.createdAt}>{dateTime(target.createdAt)}</time>
                   {/if}
                 </p>
-                {#if target.summary}<p class="small target__summary">{target.summary}</p>{/if}
                 <dl class="kv target__facts">
-                  {#if target.confidence != null}
-                    <dt>уверенность ответа</dt>
-                    <dd class="num">{pct(target.confidence)}</dd>
-                  {/if}
-                  <dt>утверждений в ответе</dt>
-                  <dd class="num">{num(target.findings.length)}</dd>
                   {#if target.evaluation}
                     <dt>полнота цитат</dt>
                     <dd class="num">{pct(target.evaluation.metrics.citation_coverage)}</dd>
@@ -776,33 +725,18 @@
                     <dd>{target.evaluation.passed ? 'да' : 'нет'}</dd>
                   {/if}
                 </dl>
-                {#if target.findings.length > 0}
-                  <div class="stack target__claims">
-                    <p class="micro muted">Утверждения ответа · версии и локаторы</p>
-                    {#each target.findings as claim (claim.id)}
-                      <div class="claim-row">
-                        <span class="micro num">{claim.version}</span>
-                        <span class="small grow">{claim.statement}</span>
-                        <StatusPill status={claim.status} label={STATUS_SHORT[claim.status]} />
-                        <Button variant="ghost" size="sm" icon="clock" onclick={() => void loadHistory(claim.id, claim.statement)}>
-                          версии
-                        </Button>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
                 <div class="row work__actions">
                   <Button variant="quiet" size="sm" onclick={dropTarget}>Снять основание</Button>
                 </div>
               </div>
             {:else}
               <div class="freeform">
-                <Button variant="quiet" size="sm" onclick={chooseFreeForm}>
+                <Button variant="quiet" size="sm" onclick={() => chooseFreeForm()}>
                   Комментарий без привязки к ответу
                 </Button>
                 <p class="micro muted">
-                  Так оставляют замечание, которое касается не одного ответа, а корпуса в целом:
-                  в журнале предложений такой отзыв читается не привязанным к прогону.
+                  Так оставляют замечание не об одном ответе, а о корпусе в целом:
+                  к прогону оценки такое не привязывается.
                 </p>
               </div>
 
@@ -815,12 +749,12 @@
                       <Empty
                         icon="list"
                         title="Журнал прогонов пуст"
-                        body="Прогон оценки появляется сразу после вопроса: задайте его выше или в рабочем пространстве."
+                        body="Прогон оценки появляется сразу после вопроса к корпусу: задайте его в разделе «Вопрос»."
                       >
                         {#snippet action()}
                           <div class="row">
                             <Button href="/research" variant="quiet" size="sm">К разделу запроса</Button>
-                            <Button href="/dashboard" variant="ghost" size="sm">Состояние корпуса</Button>
+                            <Button href="/dashboard" variant="ghost" size="sm">{navLabel('/dashboard')}</Button>
                           </div>
                         {/snippet}
                       </Empty>
@@ -856,9 +790,9 @@
                 {/if}
               {:else}
                 <div class="work__note">
-                  <Notice tone="info" title="Журнал прогонов скрыт">
-                    Метрики качества ответов доступны при расширенном доступе. Разберите ответ
-                    полем запроса выше.
+                  <Notice tone="info" title="Журнал прогонов не открыт">
+                    Прогоны оценки с метриками качества этому аккаунту не показывают. Ответ
+                    всё равно можно проверить: оставьте комментарий без привязки к прогону.
                   </Notice>
                 </div>
               {/if}
@@ -870,38 +804,39 @@
           <div class="stack work__region">
             <div class="panel__head">
               <div class="stack">
-                <p class="eyebrow"><Icon name="quote" size={16} /> Вердикт и комментарий</p>
-                <h2 class="h3">Что не так с ответом</h2>
+                <p class="eyebrow"><Icon name="quote" size={16} /> Вердикт</p>
+                <h2 class="h3">Оцените ответ</h2>
                 <p class="micro muted">
-                  Комментарий — основание предложения: без него отзыв не принимается.
+                  Комментарий — основание вердикта: без него отзыв не принимается.
                 </p>
               </div>
             </div>
 
             {#if result?.proposal}
               <div class="work__note">
-                <Notice tone="ok" title="Отзыв принят · предложение сформулировано">
+                <Notice tone="ok" title="Отзыв записан · предложение сформулировано">
                   <span class="notice__line">
-                    {KIND_RU[result.proposal.kind] ?? 'предложение модели'} · «{result.proposal.title}» —
+                    {knownTerm(PROPOSAL_KIND_LABELS, result.proposal.kind) ?? PROPOSAL_KIND_FALLBACK} · «{result.proposal.title}» —
                     {result.proposal.change}
                   </span>
                   <span class="micro notice__line">
                     Затрагивает: {result.proposal.impact.join(' · ') || '—'} · статус
-                    {PROPOSAL_STATUS[result.proposal.status]} · строка журнала ниже
+                    {PROPOSAL_STATUS_LABELS[result.proposal.status]}
+                    {#if canReview}· строка журнала ниже{/if}
                   </span>
                 </Notice>
               </div>
             {:else if result}
               <div class="work__note">
-                <Notice tone="warn" title="Отзыв записан, предложения эволюции нет">
+                <Notice tone="warn" title="Отзыв записан, предложения модели нет">
                   {#if result.degradation.length > 0}
                     <span class="micro notice__line">
                       Ответ собран не полностью: {result.degradation.join(' · ')}
                     </span>
                   {/if}
                   <span class="micro notice__line">
-                    Формулировку предложения делает модель: без её ответа предложения нет. Экспертное
-                    решение при этом сохранено.
+                    Формулировку предложения делает модель: без её ответа предложения нет.
+                    Ваше решение при этом сохранено.
                   </span>
                 </Notice>
               </div>
@@ -947,7 +882,7 @@
               >
                 <legend class="field__label">Вердикт</legend>
                 <div class="row">
-                  {#each VERDICTS as item (item.key)}
+                  {#each FEEDBACK_VERDICTS as item (item.key)}
                     <label class="verdict">
                       <input
                         class="verdict__input"
@@ -978,12 +913,15 @@
               />
 
               {#if verdict === 'correct'}
+                {#if claimNote}
+                  <!-- Ссылка из «Расхождений» объявляет себя и там, где пул правки
+                       закрыт доступом: иначе человек пришёл бы на форму с
+                       подставленным, но невидимым фактом. -->
+                  <p class="micro muted">{claimNote}</p>
+                {/if}
                 {#if canRestricted}
                   <fieldset class="stack picks">
-                    <legend class="field__label">
-                      Утверждение для замены ·
-                      {target?.findings.length ? 'список из ответа' : 'из указателя корпуса'}
-                    </legend>
+                    <legend class="field__label">Утверждение для замены · из указателя находок</legend>
                     <Field
                       label="Поиск утверждения"
                       name="fb-finding-query"
@@ -995,16 +933,16 @@
                       <Notice tone="error" title="Указатель находок не прочитан">{corpusFailure}</Notice>
                     {:else if poolEmpty}
                       <!-- Пустой пул и пустой поиск — разные состояния: первый
-                           лечится чтением листа и пополнением корпуса. -->
+                           лечится перечитыванием указателя и пополнением корпуса. -->
                       <Empty
                         icon="list"
                         title="Утверждений для замены пока нет"
-                        body="Здесь появятся утверждения: обновите лист, когда корпус пополнен, или загрузите документ в указателе находок."
+                        body="Здесь появятся утверждения: перечитайте указатель, когда корпус пополнен, или загрузите документ в разделе «Находки»."
                       >
                         {#snippet action()}
                           <div class="row">
-                            <Button variant="quiet" size="sm" icon="refresh" onclick={() => void reloadLedgers()}>
-                              Обновить лист
+                            <Button variant="quiet" size="sm" icon="refresh" onclick={() => void reloadCorpus()}>
+                              Перечитать указатель
                             </Button>
                             <Button href="/findings" variant="ghost" size="sm">Пополнить корпус</Button>
                           </div>
@@ -1080,9 +1018,12 @@
                     hint="Правка создаёт новую версию утверждения; старая помечается заменённой."
                   />
                 {:else}
-                  <Notice tone="warn" title="Экспертная замена утверждения недоступна">
-                    {EXPERT_GATE} Выбрать утверждение и ввести текст правки нельзя, поэтому поля нет —
-                    отзыв можно отправить комментарием, и он попадёт в журнал.
+                  <!-- Вердикт «нужна правка» остаётся отзывом: поля замены утверждения
+                       просто нет, чтобы не вести читателя в отказ по праву. -->
+                  <Notice tone="info" title="Новую формулировку утверждения выбирает автор проверки">
+                    Здесь вы описываете, что именно поправить, — выбором утверждения и
+                    новой формулировкой занимается аккаунт с расширенным доступом.
+                    Отзыв с комментарием записывается и так.
                   </Notice>
                 {/if}
               {/if}
@@ -1101,216 +1042,203 @@
           </div>
         </Panel>
       {:else}
-        <Notice tone="info" title="Отзыв недоступен, разбор предложений открыт">
-          {EXPERT_GATE} Форма отзыва скрыта. Ниже — журнал предложений эволюции: читать его можно.
+        <Notice tone="info" title="Отзыв не записывается">
+          {FEEDBACK_GATE} Форму вердикта скрыта, а ответы корпуса читаются в разделах
+          «Вопрос» и «Находки».
         </Notice>
       {/if}
 
-      <section class="work__ledger">
-        <SectionHead
-          level="2"
-          eyebrow="Разбор предложений эволюции"
-          title="Что модель предложила и чем это мерили"
-          lead="Каждая строка — предложение, сформулированное моделью по отзыву, и только измеренные результаты A/B-прогона. Решение о применении принимает эксперт: сначала прогон, затем «Принять»."
-        >
-          <div class="row work__actions">
-            <Button variant="quiet" size="sm" icon="refresh" onclick={() => void reloadLedgers()}>
-              Обновить лист
-            </Button>
-          </div>
-        </SectionHead>
-
-        {#if !canReview}
-          <div class="work__note">
-            <Notice tone="warn" title="Решения по предложениям закрыты">
-              {EXPERT_GATE} Журнал предложений и результаты прогонов открыты, кнопок «Принять» и
-              «Отклонить» нет.
-            </Notice>
-          </div>
-        {/if}
-
-        {#if reviewNotice}
-          <div class="work__note">
-            <Notice tone="ok" title="Решение записано">
-              {reviewNotice}
-              <div class="row work__actions">
-                <Button variant="quiet" size="sm" onclick={() => (reviewNotice = '')}>Понятно</Button>
-              </div>
-            </Notice>
-          </div>
-        {/if}
-        {#if experimentNotice}
-          <div class="work__note">
-            <Notice tone="ok" title="A/B-прогон записан">
-              {experimentNotice}
-              <span class="micro notice__line">
-                Замер относится к текущему рабочему сеансу: позже прогон можно повторить.
-              </span>
-              <div class="row work__actions">
-                <Button variant="quiet" size="sm" onclick={() => (experimentNotice = '')}>Понятно</Button>
-              </div>
-            </Notice>
-          </div>
-        {/if}
-        {#if reviewFailure}
-          <div class="work__note">
-            <Notice tone="error" title="Решение не принято">
-              {reviewFailure}
-              <span class="micro notice__line">
-                «Принять» открывается после A/B-прогона этого предложения.
-              </span>
-              <div class="row work__actions">
-                <Button variant="quiet" size="sm" onclick={() => (reviewFailure = '')}>Понятно</Button>
-              </div>
-            </Notice>
-          </div>
-        {/if}
-        {#if experimentFailure}
-          <div class="work__note">
-            <Notice tone="error" title="A/B-прогон не выполнен">
-              {experimentFailure}
-              <div class="row work__actions">
-                <Button variant="quiet" size="sm" onclick={() => (experimentFailure = '')}>Понятно</Button>
-              </div>
-            </Notice>
-          </div>
-        {/if}
-        {#if experimentsFailure}
-          <div class="work__note">
-            <Notice tone="error" title="Результаты A/B-прогонов не прочитаны">{experimentsFailure}</Notice>
-          </div>
-        {/if}
-
-        {#if proposals.length === 0}
-          <Empty
-            icon="sparkles"
-            title="Предложений нет"
-            body="Они рождаются из отзывов на этом листе и в рабочем пространстве запроса. Пока ни одного отзыва нет — нет и предложений."
+      {#if canReview}
+        <section class="work__ledger">
+          <SectionHead
+            level="2"
+            eyebrow="Разбор предложений модели"
+            title="Что модель предложила и чем это мерили"
+            lead="Каждая строка — предложение, сформулированное моделью по отзыву, и только измеренные результаты A/B-прогона. Решение о применении принимает эксперт: сначала прогон, затем «Принять»."
           >
-            {#snippet action()}
+            <div class="row work__actions">
               <Button variant="quiet" size="sm" icon="refresh" onclick={() => void reloadLedgers()}>
-                Обновить список
+                Обновить журнал
               </Button>
-            {/snippet}
-          </Empty>
-        {:else}
-          <div class="stack rows">
-            {#each shownProposals as proposal (proposal.id)}
-              {@const ab = experimentOf(proposal.id)}
-              {@const promotable = promoteOf(proposal.id)}
-              {@const measurable = proposal.kind === 'prompt' || proposal.kind === 'rule'}
-              {@const busy = reviewingId === proposal.id || runningId === proposal.id}
-              <Panel tone="sunk" tag="article">
-                <div class="row-card">
-                  <div class="row-card__head">
-                    <p class="row-card__kind">
-                      {KIND_RU[proposal.kind] ?? 'предложение модели'}
-                    </p>
-                    <StatusPill status={PROPOSAL_TONE[proposal.status]} label={PROPOSAL_STATUS[proposal.status]} />
-                    <p class="micro muted row-card__src">
-                      {#if proposal.created_at}
-                        <time datetime={proposal.created_at}>{dateTime(proposal.created_at)}</time> ·
-                      {/if}
-                      {#if proposal.source_query_id === NIL_QUERY_ID}
-                        без привязки к ответу
-                      {:else}
-                        привязано к ответу на вопрос
-                      {/if}
-                    </p>
-                  </div>
+            </div>
+          </SectionHead>
 
-                  <h3 class="h4">{proposal.title}</h3>
-                  <p class="quote row-card__change">{proposal.change}</p>
-                  {#if proposal.impact.length > 0}
-                    <p class="row row-card__impact">
-                      <span class="micro muted">затрагивает</span>
-                      {#each proposal.impact as area (area)}<span class="tag">{area}</span>{/each}
-                    </p>
-                  {/if}
+          {#if reviewNotice}
+            <div class="work__note">
+              <Notice tone="ok" title="Решение записано">
+                {reviewNotice}
+                <div class="row work__actions">
+                  <Button variant="quiet" size="sm" onclick={() => (reviewNotice = '')}>Понятно</Button>
+                </div>
+              </Notice>
+            </div>
+          {/if}
+          {#if experimentNotice}
+            <div class="work__note">
+              <Notice tone="ok" title="A/B-прогон записан">
+                {experimentNotice}
+                <span class="micro notice__line">
+                  Замер относится к текущему рабочему сеансу: позже прогон можно повторить.
+                </span>
+                <div class="row work__actions">
+                  <Button variant="quiet" size="sm" onclick={() => (experimentNotice = '')}>Понятно</Button>
+                </div>
+              </Notice>
+            </div>
+          {/if}
+          {#if reviewFailure}
+            <div class="work__note">
+              <Notice tone="error" title="Решение не принято">
+                {reviewFailure}
+                <span class="micro notice__line">
+                  «Принять» открывается после A/B-прогона этого предложения.
+                </span>
+                <div class="row work__actions">
+                  <Button variant="quiet" size="sm" onclick={() => (reviewFailure = '')}>Понятно</Button>
+                </div>
+              </Notice>
+            </div>
+          {/if}
+          {#if experimentFailure}
+            <div class="work__note">
+              <Notice tone="error" title="A/B-прогон не выполнен">
+                {experimentFailure}
+                <div class="row work__actions">
+                  <Button variant="quiet" size="sm" onclick={() => (experimentFailure = '')}>Понятно</Button>
+                </div>
+              </Notice>
+            </div>
+          {/if}
+          {#if experimentsFailure}
+            <div class="work__note">
+              <Notice tone="error" title="Результаты A/B-прогонов не прочитаны">{experimentsFailure}</Notice>
+            </div>
+          {/if}
 
-                  {#if ab}
-                    <div class="stack ab">
-                      <p class="micro ab__title">
-                        A/B-прогон · {countOf(ab.cases, 'кейс', 'кейса', 'кейсов')} · зачёт
-                        {#if ab.delta_pass_rate > 0}
-                          вырос на <span class="num">{num(ab.delta_pass_rate * 100)}</span> п.п.
-                        {:else if ab.delta_pass_rate < 0}
-                          упал на <span class="num">{num(Math.abs(ab.delta_pass_rate) * 100)}</span> п.п.
-                        {:else}
-                          без изменения
-                        {/if}
-                        · решение
-                        <strong>{ab.decision === 'promote' ? 'продвигать' : 'не продвигать'}</strong>
+          {#if proposals.length === 0}
+            <Empty
+              icon="sparkles"
+              title="Предложений нет"
+              body="Они рождаются из отзывов здесь и в разделе «Вопрос». Пока ни одного отзыва нет — нет и предложений."
+            >
+              {#snippet action()}
+                <Button variant="quiet" size="sm" icon="refresh" onclick={() => void reloadLedgers()}>
+                  Обновить журнал
+                </Button>
+              {/snippet}
+            </Empty>
+          {:else}
+            <div class="stack rows">
+              {#each shownProposals as proposal (proposal.id)}
+                {@const ab = experimentOf(proposal.id)}
+                {@const promotable = promoteOf(proposal.id)}
+                {@const measurable = proposal.kind === 'prompt' || proposal.kind === 'rule'}
+                {@const busy = reviewingId === proposal.id || runningId === proposal.id}
+                <Panel tone="sunk" tag="article">
+                  <div class="row-card">
+                    <div class="row-card__head">
+                      <p class="row-card__kind">
+                        {knownTerm(PROPOSAL_KIND_LABELS, proposal.kind) ?? PROPOSAL_KIND_FALLBACK}
                       </p>
-                      <div class="ab__grid">
-                        {#each metricRows(ab) as row (row.key)}
-                          <div class="ab__metric">
-                            <p class="micro ab__label">{row.label} · чем {row.better}, тем лучше</p>
-                            <div class="ab__line">
-                              <span class="micro ab__who">база</span>
-                              <span class="bar ab__track">
-                                {#if row.baseWidth !== null}
-                                  <span class="bar__fill" style="width: {row.baseWidth}%"></span>
-                                {/if}
-                              </span>
-                              <span class="micro num ab__val">{row.baseText}</span>
-                            </div>
-                            <div class="ab__line">
-                              <span class="micro ab__who">кандидат</span>
-                              <span class="bar ab__track">
-                                {#if row.candWidth !== null}
-                                  <span
-                                    class="bar__fill {ab.decision === 'promote' ? 'bar__fill--consensus' : 'bar__fill--disputed'}"
-                                    style="width: {row.candWidth}%"></span>
-                                {/if}
-                              </span>
-                              <span class="micro num ab__val">{row.candText}</span>
-                            </div>
-                          </div>
-                        {/each}
-                      </div>
-                      <dl class="kv ab__extra">
-                        <dt>задержка, 95-й процентиль</dt>
-                        <dd>
-                          база <span class="num">{num(ab.baseline.p95_latency_ms)} мс</span> · кандидат
-                          <span class="num">{num(ab.candidate.p95_latency_ms)} мс</span>
-                        </dd>
-                        <dt>повторов модели на кейс</dt>
-                        <dd>
-                          база <span class="num">{num(ab.baseline.retries_per_case)}</span> · кандидат
-                          <span class="num">{num(ab.candidate.retries_per_case)}</span>
-                        </dd>
-                        <dt>токенов на прогон</dt>
-                        <dd>
-                          база <span class="num">{num(ab.baseline.total_tokens)}</span> · кандидат
-                          <span class="num">{num(ab.candidate.total_tokens)}</span>
-                        </dd>
-                        <dt>кейсов стало хуже</dt>
-                        <dd class="num {ab.regressions.length > 0 ? 'ab__bad' : ''}">
-                          {num(ab.regressions.length)}
-                        </dd>
-                      </dl>
-                      {#if ab.regressions.length > 0}
-                        <p class="micro ab__regress">
-                          Служебные номера кейсов с ухудшением — по ним прогон сверяют с журналом:
-                          <code class="ab__codes">{ab.regressions.join(' · ')}</code>
-                        </p>
-                      {/if}
+                      <StatusPill status={PROPOSAL_TONE[proposal.status]} label={PROPOSAL_STATUS_LABELS[proposal.status]} />
+                      <p class="micro muted row-card__src">
+                        {#if proposal.created_at}
+                          <time datetime={proposal.created_at}>{dateTime(proposal.created_at)}</time> ·
+                        {/if}
+                        {#if proposal.source_query_id === NIL_QUERY_ID}
+                          без привязки к ответу
+                        {:else}
+                          привязано к ответу на вопрос
+                        {/if}
+                      </p>
                     </div>
-                  {:else if measurable && !experimentsFailure}
-                    <p class="micro ab__none">
-                      Прогона нет: без измеренной пары решение не принимается. Сначала A/B-прогон на
-                      эталонных кейсах.
-                    </p>
-                  {:else}
-                    <p class="micro ab__none">
-                      A/B-прогон поддержан для политики промпта и правила отбора: для
-                      «{KIND_RU[proposal.kind] ?? 'этого предложения'}» пары метрик не будет.
-                    </p>
-                  {/if}
 
-                  <div class="row row-card__foot">
-                    {#if canReview}
+                    <h3 class="h4">{proposal.title}</h3>
+                    <p class="quote row-card__change">{proposal.change}</p>
+                    {#if proposal.impact.length > 0}
+                      <p class="row row-card__impact">
+                        <span class="micro muted">затрагивает</span>
+                        {#each proposal.impact as area (area)}<span class="tag">{area}</span>{/each}
+                      </p>
+                    {/if}
+
+                    {#if ab}
+                      <div class="stack ab">
+                        <p class="micro ab__title">
+                          A/B-прогон · {countOf(ab.cases, 'кейс', 'кейса', 'кейсов')} · зачёт
+                          {#if ab.delta_pass_rate > 0}
+                            вырос на <span class="num">{num(ab.delta_pass_rate * 100)}</span> п.п.
+                          {:else if ab.delta_pass_rate < 0}
+                            упал на <span class="num">{num(Math.abs(ab.delta_pass_rate) * 100)}</span> п.п.
+                          {:else}
+                            без изменения
+                          {/if}
+                          · решение
+                          <strong>{ab.decision === 'promote' ? 'продвигать' : 'не продвигать'}</strong>
+                        </p>
+                        <div class="ab__grid">
+                          {#each metricRows(ab) as row (row.key)}
+                            <div class="ab__metric">
+                              <p class="micro ab__label">{row.label} · чем {row.better}, тем лучше</p>
+                              <div class="ab__line">
+                                <span class="micro ab__who">база</span>
+                                <span class="bar ab__track">
+                                  {#if row.baseWidth !== null}
+                                    <span class="bar__fill" style="width: {row.baseWidth}%"></span>
+                                  {/if}
+                                </span>
+                                <span class="micro num ab__val">{row.baseText}</span>
+                              </div>
+                              <div class="ab__line">
+                                <span class="micro ab__who">кандидат</span>
+                                <span class="bar ab__track">
+                                  {#if row.candWidth !== null}
+                                    <span
+                                      class="bar__fill {ab.decision === 'promote' ? 'bar__fill--consensus' : 'bar__fill--disputed'}"
+                                      style="width: {row.candWidth}%"></span>
+                                  {/if}
+                                </span>
+                                <span class="micro num ab__val">{row.candText}</span>
+                              </div>
+                            </div>
+                          {/each}
+                        </div>
+                        <!-- Стоимость прогона (токены, повторы модели, 95-й процентиль
+                             задержки) к решению о предложении не относится: это
+                             показатели контура, их место на «Состоянии». Здесь остаётся
+                             то, что меняет вердикт, — ухудшения на кейсах. -->
+                        <dl class="kv ab__extra">
+                          <dt>кейсов стало хуже</dt>
+                          <dd class="num {ab.regressions.length > 0 ? 'ab__bad' : ''}">
+                            {num(ab.regressions.length)}
+                          </dd>
+                        </dl>
+                        {#if ab.regressions.length > 0}
+                          <details class="ab__svc">
+                            <summary class="micro">Служебные данные</summary>
+                            <p class="micro ab__regress">
+                              Номера кейсов с ухудшением — по ним прогон сверяют с журналом:
+                              <code class="ab__codes">{ab.regressions.join(' · ')}</code>
+                            </p>
+                          </details>
+                        {/if}
+                      </div>
+                    {:else if measurable && !experimentsFailure}
+                      <p class="micro ab__none">
+                        Прогона нет: без измеренной пары решение не принимается. Сначала A/B-прогон на
+                        эталонных кейсах.
+                      </p>
+                    {:else}
+                      <p class="micro ab__none">
+                        A/B-прогон поддержан для политики промпта и правила отбора: для
+                        «{knownTerm(PROPOSAL_KIND_LABELS, proposal.kind) ?? PROPOSAL_KIND_FALLBACK}» пары метрик не будет.
+                      </p>
+                    {/if}
+
+                    <div class="row row-card__foot">
+                      <!-- Раздел предложений рендерится только там, где право проверки
+                           есть: отдельной ветки «кнопок нет» для базового пользователя
+                           здесь больше не нужно. -->
                       {#if measurable && canEvaluate}
                         <Button
                           variant="quiet"
@@ -1384,39 +1312,37 @@
                           кнопки нет.
                         </p>
                       {/if}
-                    {:else}
-                      <p class="micro muted row-card__gate">{EXPERT_GATE} Кнопок решения здесь нет.</p>
-                    {/if}
+                    </div>
                   </div>
-                </div>
-              </Panel>
-            {/each}
-          </div>
-
-          <div class="work__pager">
-            <p class="micro">
-              показано {countOf(shownProposals.length, 'предложение', 'предложения', 'предложений')} из
-              <span class="num">{num(proposals.length)}</span> журнала
-            </p>
-            <div class="row">
-              {#if proposals.length > shownProposals.length}
-                <Button variant="quiet" size="sm" onclick={() => (proposalLimit += PROPOSAL_PAGE_SIZE)}>
-                  Показать ещё {countOf(Math.min(PROPOSAL_PAGE_SIZE, proposals.length - shownProposals.length), 'предложение', 'предложения', 'предложений')}
-                </Button>
-              {:else if proposalLimit > PROPOSAL_PAGE_SIZE}
-                <Button variant="ghost" size="sm" onclick={() => (proposalLimit = PROPOSAL_PAGE_SIZE)}>
-                  Только первые <span class="num">{PROPOSAL_PAGE_SIZE}</span>
-                </Button>
-              {/if}
+                </Panel>
+              {/each}
             </div>
-          </div>
 
-          <div class="row work__actions">
-            <Button href="/findings" variant="ghost" size="sm">Указатель находок</Button>
-            <Button href="/dashboard" variant="ghost" size="sm">Состояние корпуса</Button>
-          </div>
-        {/if}
-      </section>
+            <div class="work__pager">
+              <p class="micro">
+                показано {countOf(shownProposals.length, 'предложение', 'предложения', 'предложений')} из
+                <span class="num">{num(proposals.length)}</span> журнала
+              </p>
+              <div class="row">
+                {#if proposals.length > shownProposals.length}
+                  <Button variant="quiet" size="sm" onclick={() => (proposalLimit += PROPOSAL_PAGE_SIZE)}>
+                    Показать ещё {countOf(Math.min(PROPOSAL_PAGE_SIZE, proposals.length - shownProposals.length), 'предложение', 'предложения', 'предложений')}
+                  </Button>
+                {:else if proposalLimit > PROPOSAL_PAGE_SIZE}
+                  <Button variant="ghost" size="sm" onclick={() => (proposalLimit = PROPOSAL_PAGE_SIZE)}>
+                    Только первые <span class="num">{PROPOSAL_PAGE_SIZE}</span>
+                  </Button>
+                {/if}
+              </div>
+            </div>
+
+            <div class="row work__actions">
+              <Button href="/findings" variant="ghost" size="sm">Указатель находок</Button>
+              <Button href="/dashboard" variant="ghost" size="sm">{navLabel('/dashboard')}</Button>
+            </div>
+          {/if}
+        </section>
+      {/if}
     {/if}
   </div>
 </div>
@@ -1487,10 +1413,6 @@
     gap: var(--s6);
   }
 
-  .work__counts {
-    text-align: right;
-  }
-
   .work__actions {
     justify-content: flex-start;
     margin-top: var(--s3);
@@ -1528,11 +1450,23 @@
   }
 
   /* ── Основание отзыва ────────────────────────────────────────────────── */
-  .ask {
-    display: grid;
-    gap: var(--s4);
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: end;
+  /* Вопрос корпусу задают в разделе «Вопрос»: здесь остаётся одна строка-
+     подсказка с переходом, а не второй композер. */
+  .work__ask {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3) var(--s5);
+    flex-wrap: wrap;
+    padding: var(--s3) var(--s4);
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--r-lg);
+  }
+
+  .work__ask p {
+    flex: 1 1 42ch;
+    margin: 0;
+    text-wrap: pretty;
   }
 
   .freeform {
@@ -1567,29 +1501,9 @@
     text-wrap: pretty;
   }
 
-  .target__summary {
-    text-wrap: pretty;
-  }
-
   .target__facts {
     gap: var(--s1) var(--s5);
     margin-top: var(--s2);
-  }
-
-  .target__claims {
-    --gap: var(--s2);
-    margin-top: var(--s4);
-  }
-
-  .claim-row {
-    display: flex;
-    align-items: center;
-    gap: var(--s3);
-    flex-wrap: wrap;
-    padding: var(--s3) var(--s4);
-    border: 1px solid var(--line-soft);
-    border-radius: var(--r-md);
-    background: var(--surface-raised);
   }
 
   .runs {
@@ -1843,11 +1757,25 @@
     gap: var(--s1) var(--s5);
   }
 
-  .ab__regress {
+  /* Служебные номера кейсов — под раскрытием: они нужны, чтобы сверить прогон
+     с журналом, но не для чтения вердикта. */
+  .ab__svc {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+  }
+
+  .ab__svc summary {
+    cursor: pointer;
     color: var(--ink-3);
   }
 
-  /* Служебные номера кейсов — подчинённая строка, а не заголовок метрики. */
+  .ab__regress {
+    margin: 0;
+    color: var(--ink-3);
+  }
+
+  /* Моно-номера кейсов — подчинённая строка, а не заголовок метрики. */
   .ab__codes {
     font-family: var(--font-data);
     color: var(--ink-3);
@@ -1899,8 +1827,8 @@
   }
 
   @media (max-width: 900px) {
-    .ask {
-      grid-template-columns: minmax(0, 1fr);
+    .work__ask {
+      align-items: flex-start;
     }
 
     .row-card__src {

@@ -1,11 +1,25 @@
 <script lang="ts">
-  // Карта связей: поле корреляции (GraphCanvas) + инспектор выбранного узла с
-  // доказательствами. Шапку, skip-link и <main id="main"> рендерит +layout.svelte.
+  // Карта связей: обзор корпуса → цепочки области (GraphMap) + инспектор
+  // выбранного узла с доказательствами. Инспектор показывается, только когда
+  // узел выбран: до выбора экран принадлежит карте, и держать под ней пустую
+  // панель на весь экран нечего.
   import { api, ApiError } from '$lib/api';
-  import GraphCanvas, { classOf, relationLabel, typeLabel } from '$lib/GraphCanvas.svelte';
-  import { plural } from '$lib/format';
+  import GraphMap, { classOf } from '$lib/GraphMap.svelte';
+  import { navLabel } from '$lib/nav';
+  import { countOf } from '$lib/format';
   import { session } from '$lib/sessionStore.svelte';
-  import { OPERATOR_WORD, STATUS_SHORT } from '$lib/terms';
+  import {
+    MAP_KNOWLEDGE_STATUS_LABELS,
+    MAP_META_LABELS,
+    OPERATOR_WORD,
+    PREDICATE_LABELS,
+    STATUS_SHORT,
+    SUBJECT_LABELS,
+    knownTerm,
+    mapNodeType,
+    mapRelationKnown,
+    mapRelationLabel,
+  } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
   import Icon from '$lib/ui/Icon.svelte';
@@ -38,6 +52,9 @@
   let error = $state('');
   let loadedAt = $state<Date | null>(null);
   let selected = $state<GraphNode | null>(null);
+  // Выбранная связь — состояние экрана: поле подсвечивает её, инспектор описывает
+  // словами и ведёт к обоим узлам.
+  let pickedEdge = $state<GraphEdge | null>(null);
 
   // Доказательства берутся из настоящих находок корпуса: /api/v1/findings отдаёт
   // тот же Finding, что и ответ запроса, уже срезанный по классу данных сессии.
@@ -46,32 +63,23 @@
   let findingsError = $state('');
   let findingsRequested = false;
 
-  // Мобильная композиция: инспектор уходит в шторку, поле карты остаётся один.
+  // Инспектор на узком экране — нижняя шторка, а не вторая колонка.
   let narrow = $state(false);
-  // Показание среза и пояснение чтения карты свёрнуты в рельсе: поле карты —
-  // главный объект экрана, оно открывается в первом вьюпорте.
-  let helpOpen = $state(false);
+
   $effect(() => {
-    const media = window.matchMedia('(max-width: 900px)');
-    narrow = media.matches;
-    const onChange = (event: MediaQueryListEvent): void => {
-      narrow = event.matches;
+    const tablet = window.matchMedia('(max-width: 900px)');
+    const sync = (): void => {
+      narrow = tablet.matches;
     };
-    media.addEventListener('change', onChange);
-    return () => media.removeEventListener('change', onChange);
+    sync();
+    tablet.addEventListener('change', sync);
+    return () => tablet.removeEventListener('change', sync);
   });
 
   const nf = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 3 });
   function fmt(v: number): string {
     return nf.format(v);
   }
-
-  const typeCount = $derived(new Set(graph.nodes.map((n) => n.type)).size);
-  const classCount = $derived(new Set(graph.nodes.map((n) => n.data_class)).size);
-  // Классы данных в срезе читаются человеческими словами, а не кодом контракта.
-  const classLabels = $derived(
-    [...new Set(graph.nodes.map((node) => classOf(node).ru))].sort((a, b) => a.localeCompare(b, 'ru')).join(' · '),
-  );
 
   function obsValue(obs: NumericObservation): string {
     if (obs.min_value != null && obs.max_value != null) {
@@ -94,54 +102,74 @@
   }
 
   /**
-   * Узел → находки, которым он принадлежит. Связки настоящие: узел-утверждение
-   * имеет id `claim-…`, а соответствующая находка — `finding-claim-…`; узел
-   * документа `document-<uuid>` совпадает с `evidence.document_id`; остальное —
-   * совпадение субъекта или вхождение метки узла в формулировку.
+   * Узел → находки, которым он принадлежит: только совпадение идентификаторов.
+   * claim-узел `claim-…` и находка `finding-claim-…`, узел документа
+   * `document-<uuid>` и `evidence.document_id`.
+   *
+   * Прежняя привязка по подстроке метки («метка встречается в формулировке»)
+   * превращала «Доказательства узла» хаба в стену из сотен несвязанных тезисов:
+   * пересечение по идентификатору — единственная связка, которую нельзя
+   * выдумать из названия.
    */
   const relatedFindings = $derived.by<FindingListItem[]>(() => {
     if (!selected || findingsStatus !== 'ready') return [];
-    const nodeId = selected.id.toLowerCase();
-    const label = selected.label.trim().toLowerCase();
+    const nodeId = selected.id;
     const docId = nodeId.startsWith('document-') ? nodeId.slice('document-'.length) : '';
-    const scored: { finding: FindingListItem; score: number }[] = [];
-    for (const finding of findings) {
-      const subject = (finding.subject ?? '').toLowerCase().replace(/[_\s]+/g, '-');
-      let score = 0;
-      if (finding.id === `finding-${selected.id}` || finding.id === selected.id) score = 4;
-      else if (docId && finding.evidence.some((e) => e.document_id === docId)) score = 3;
-      else if (subject && (subject === nodeId || subject === label.replace(/\s+/g, '-'))) score = 3;
-      else if (label.length > 3 && finding.statement.toLowerCase().includes(label)) score = 2;
-      else if (label.length > 3 && finding.predicate?.toLowerCase() === label) score = 1;
-      if (score > 0) scored.push({ finding, score });
-    }
-    return scored
-      .sort((a, b) => b.score - a.score || b.finding.confidence - a.finding.confidence)
-      .map((row) => row.finding);
+    const rows = findings.filter((finding) => {
+      if (finding.id === nodeId || finding.id === `finding-${nodeId}`) return true;
+      return docId !== '' && finding.evidence.some((ev) => ev.document_id === docId);
+    });
+    return rows.sort((a, b) => b.confidence - a.confidence);
   });
+
+  // Списки под инспектором ограничены: стена на сотню строк не читается, а
+  // «показать всё» остаётся явным действием.
+  const FINDINGS_PAGE = 3;
+  const CONNECTIONS_PAGE = 12;
+  let findingsAll = $state(false);
+  let connectionsAll = $state(false);
+
+  const shownFindings = $derived(
+    findingsAll ? relatedFindings : relatedFindings.slice(0, FINDINGS_PAGE),
+  );
 
   interface Connection {
     edge: GraphEdge;
     outgoing: boolean;
     other: GraphNode | null;
-    otherId: string;
   }
+
+  const nodeIndex = $derived(new Map(graph.nodes.map((node) => [node.id, node])));
 
   /** Связи выбранного узла: направление и вторая сторона — из того же среза. */
   const connections = $derived.by<Connection[]>(() => {
     if (!selected) return [];
-    const index = new Map(graph.nodes.map((n) => [n.id, n]));
     const rows: Connection[] = [];
     for (const edge of graph.edges) {
       if (edge.source === selected.id) {
-        rows.push({ edge, outgoing: true, other: index.get(edge.target) ?? null, otherId: edge.target });
+        rows.push({ edge, outgoing: true, other: nodeIndex.get(edge.target) ?? null });
       } else if (edge.target === selected.id) {
-        rows.push({ edge, outgoing: false, other: index.get(edge.source) ?? null, otherId: edge.source });
+        rows.push({ edge, outgoing: false, other: nodeIndex.get(edge.source) ?? null });
       }
     }
     return rows;
   });
   const outgoingCount = $derived(connections.filter((c) => c.outgoing).length);
+  const shownConnections = $derived(
+    connectionsAll ? connections : connections.slice(0, CONNECTIONS_PAGE),
+  );
+
+  /** Смена узла обнуляет раскрытия и выбор связи: чужое состояние не держим. */
+  function pick(node: GraphNode | null): void {
+    findingsAll = false;
+    connectionsAll = false;
+    pickedEdge = null;
+    selected = node;
+  }
+
+  function pickEdge(edge: GraphEdge | null): void {
+    pickedEdge = edge;
+  }
 
   let requestSeq = 0;
   async function load(): Promise<void> {
@@ -152,7 +180,7 @@
       const snapshot = await api.graph();
       if (call !== requestSeq) return;
       graph = snapshot;
-      selected = null;
+      pick(null);
       loadedAt = new Date();
       status = 'ready';
     } catch (reason) {
@@ -202,29 +230,25 @@
     loadedAt ? loadedAt.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'medium' }) : '',
   );
 
-  // Метаданные узла: переводим известные ключи, JSON-блоб не печатаем.
-  const META_LABELS: Record<string, string> = {
-    community: 'сообщество',
-    year: 'год',
-    geography: 'география',
-    aliases: 'альтернативные названия',
-    knowledge_status: 'статус знания',
-  };
+  // Метаданные узла: переводим известные ключи словарём карты, JSON-блоб и
+  // неизвестные ключи не печатаем. Эти строки — служебные, они живут под
+  // раскрытием «Служебные данные», а не в фактах узла.
   const META_SKIP = new Set(['observations']);
 
-  function metaEntries(node: GraphNode | null): [string, string][] {
+  function metaEntries(node: GraphNode | null): { key: string; label: string; value: string }[] {
     if (!node) return [];
-    const rows: [string, string][] = [];
-    for (const [key, value] of Object.entries(node.metadata)) {
+    const rows: { key: string; label: string; value: string }[] = [];
+    for (const [key, raw] of Object.entries(node.metadata)) {
       if (META_SKIP.has(key)) continue;
-      const label = META_LABELS[key];
+      const label = MAP_META_LABELS[key];
       // Без словарного перевода строку пропускаем: сырой snake_case-ключ не
       // становится видимой подписью.
       if (!label) continue;
-      const text = String(value);
+      let text = String(raw);
+      if (key === 'knowledge_status') text = MAP_KNOWLEDGE_STATUS_LABELS[text] ?? text;
       // год=0 — сервисный маркер «года нет», печатать его нельзя
       if (text.trim() === '' || (key === 'year' && text === '0')) continue;
-      rows.push([label, text]);
+      rows.push({ key, label, value: text });
     }
     return rows;
   }
@@ -269,7 +293,7 @@
     <div class="stack map__node-facts">
       <dl class="kv">
         <dt>тип узла</dt>
-        <dd>{typeLabel(selected.type)} <code>{selected.type}</code></dd>
+        <dd>{mapNodeType(selected.type)}</dd>
         <dt>класс данных</dt>
         <dd><StatusPill status={cls.pill} label={cls.ru} /></dd>
         <dt>уверенность</dt>
@@ -279,12 +303,6 @@
           {connections.length}
           <span class="micro muted">· исходящих {outgoingCount}, входящих {connections.length - outgoingCount}</span>
         </dd>
-        <dt>код узла</dt>
-        <dd><code>{selected.id}</code></dd>
-        {#each metaEntries(selected) as [key, value] (key)}
-          <dt>{key}</dt>
-          <dd><code>{value}</code></dd>
-        {/each}
       </dl>
 
       <div class="bar" role="img" aria-label="Уверенность узла {fmt(selected.confidence)} из 1">
@@ -292,36 +310,59 @@
       </div>
 
       <div class="map__conn">
-        <p class="small">
-          Связи узла · <span class="num">{connections.length}</span>
-        </p>
+        <p class="small">Связи узла · <span class="num">{connections.length}</span></p>
         {#if connections.length === 0}
           <p class="micro muted">
             В этом срезе у узла нет связей — по корпусу он стоит особняком.
           </p>
         {:else}
+          <p class="micro muted map__list-head">
+            направление · отношение · второй узел · уверенность
+          </p>
           <ul class="map__conn-list">
-            {#each connections as conn, i (`${conn.edge.id}-${i}`)}
+            {#each shownConnections as conn, i (`${conn.edge.id}-${i}`)}
               <li>
-                <span class="micro muted map__dir">{conn.outgoing ? '→' : '←'}</span>
-                <span class="small map__rel">
-                  {relationLabel(conn.edge.relation)} <code>{conn.edge.relation}</code>
-                </span>
+                <span class="micro muted map__dir">{conn.outgoing ? 'исходит' : 'входит'}</span>
+                <span class="small map__rel">{mapRelationLabel(conn.edge.relation)}</span>
                 {#if conn.other}
                   {@const target = conn.other}
-                  <button type="button" class="map__jump" onclick={() => (selected = target)}>
+                  <button type="button" class="map__jump" onclick={() => pick(target)}>
                     {target.label}
-                    <span class="micro muted">{typeLabel(target.type)}</span>
+                    <span class="micro muted">{mapNodeType(target.type)}</span>
                   </button>
                 {:else}
-                  <span class="micro muted map__hidden">узел вне среза · <code>{conn.otherId}</code></span>
+                  <span class="micro muted">узел вне текущего среза</span>
                 {/if}
                 <span class="num micro map__conf">{fmt(conn.edge.confidence)}</span>
               </li>
             {/each}
           </ul>
+          {#if connections.length > shownConnections.length}
+            <Button variant="quiet" size="sm" onclick={() => (connectionsAll = true)}>
+              Показать все связи
+              <span class="num">
+                {countOf(connections.length - shownConnections.length, 'связь', 'связи', 'связей')}
+              </span>
+            </Button>
+          {/if}
         {/if}
       </div>
+
+      <details class="map__tech">
+        <summary class="micro">Служебные данные узла</summary>
+        <dl class="kv">
+          <dt>код узла</dt>
+          <dd><code class="tech">{selected.id}</code></dd>
+          <dt>тип узла</dt>
+          <dd><code class="tech">{selected.type}</code></dd>
+          <dt>класс данных</dt>
+          <dd><code class="tech">{cls.code}</code></dd>
+          {#each metaEntries(selected) as row (row.key)}
+            <dt>{row.label}</dt>
+            <dd><code class="tech">{row.value}</code></dd>
+          {/each}
+        </dl>
+      </details>
     </div>
   {/if}
 {/snippet}
@@ -332,7 +373,12 @@
       <div class="row row--between">
         <h3 class="h4">Доказательства узла</h3>
         {#if findingsStatus === 'ready'}
-          <p class="micro muted">находок: <span class="num">{relatedFindings.length}</span></p>
+          <p class="micro muted">
+            находок: <span class="num">{relatedFindings.length}</span>
+            {#if relatedFindings.length > shownFindings.length}
+              · показано <span class="num">{shownFindings.length}</span>
+            {/if}
+          </p>
         {/if}
       </div>
 
@@ -358,12 +404,11 @@
         </Button>
       {:else if relatedFindings.length === 0}
         <p class="small muted">
-          Узел <code>{selected.id}</code> стоит в срезе без связанного утверждения: он мог
-          попасть на карту как сущность или документ, из которого ещё не извлечён тезис с
-          доказательствами.
+          Этот узел стоит в срезе без связанного утверждения: он мог попасть на карту как
+          сущность или документ, из которого ещё не извлечён тезис с доказательствами.
         </p>
         <div class="row">
-          <Button href="/findings" variant="quiet" size="sm">Все находки корпуса</Button>
+          <Button href="/findings" variant="quiet" size="sm">Находки корпуса</Button>
           <Button href="/research" variant="ghost" size="sm">Спросить по этому узлу</Button>
         </div>
 
@@ -391,12 +436,12 @@
               <tbody>
                 {#each nodeObs.rows as obs, i (`${selected.id}-nobs-${i}`)}
                   <tr>
-                    <td><code>{obs.property_name}</code></td>
-                    <td>{OPERATOR_WORD[obs.operator]} <code>{obs.operator}</code></td>
+                    <td><code class="tech">{obs.property_name}</code></td>
+                    <td>{OPERATOR_WORD[obs.operator]} <code class="tech">{obs.operator}</code></td>
                     <td class="num">{obsValue(obs)}</td>
-                    <td><code>{obs.unit || '—'}</code></td>
+                    <td><code class="tech">{obs.unit || '—'}</code></td>
                     <td class="num">{obsNormalized(obs)}</td>
-                    <td><code>{obs.raw_text}</code></td>
+                    <td><code class="tech">{obs.raw_text}</code></td>
                   </tr>
                 {/each}
               </tbody>
@@ -408,12 +453,14 @@
           </p>
         {/if}
       {:else}
-        {#each relatedFindings as finding (finding.id)}
+        {#each shownFindings as finding (finding.id)}
+          {@const subjectName = knownTerm(SUBJECT_LABELS, finding.subject)}
+          {@const predicateName = knownTerm(PREDICATE_LABELS, finding.predicate)}
           <article class="map__claim">
             <div class="row row--between">
               <p class="eyebrow">
-                {finding.subject || 'субъект не задан'}
-                {#if finding.predicate}· <code>{finding.predicate}</code>{/if}
+                {#if subjectName}{subjectName}{:else}утверждение без субъекта{/if}
+                {#if predicateName} · {predicateName}{/if}
                 · версия <span class="num">{finding.version}</span>
               </p>
               <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
@@ -426,11 +473,9 @@
               <dd class="num">{fmt(finding.confidence)}</dd>
               <dt>класс данных</dt>
               <dd>{DATA_CLASS_LABELS[finding.data_class]}</dd>
-              <dt>находка</dt>
-              <dd><code>{finding.id}</code></dd>
               {#if finding.superseded_by}
                 <dt>заменена</dt>
-                <dd><code>{finding.superseded_by}</code></dd>
+                <dd>более новой версией — код версии в служебных данных</dd>
               {/if}
             </dl>
 
@@ -458,14 +503,14 @@
                   <tbody>
                     {#each finding.observations as obs, i (`${finding.id}-obs-${i}`)}
                       <tr>
-                        <td><code>{obs.property_name}</code></td>
+                        <td><code class="tech">{obs.property_name}</code></td>
                         <td>
-                          {OPERATOR_WORD[obs.operator]} <code>{obs.operator}</code>
+                          {OPERATOR_WORD[obs.operator]} <code class="tech">{obs.operator}</code>
                         </td>
                         <td class="num">{obsValue(obs)}</td>
-                        <td><code>{obs.unit || '—'}</code></td>
+                        <td><code class="tech">{obs.unit || '—'}</code></td>
                         <td class="num">{obsNormalized(obs)}</td>
-                        <td><code>{obs.raw_text}</code></td>
+                        <td><code class="tech">{obs.raw_text}</code></td>
                       </tr>
                     {/each}
                   </tbody>
@@ -493,19 +538,36 @@
                       <Icon name="doc" size={14} />
                       <span>{ev.source_title || 'источник без названия'}</span>
                       {#if ev.page != null}<span>стр. <span class="num">{ev.page}</span></span>{/if}
-                      {#if ev.sheet}<span>лист <code>{ev.sheet}</code></span>{/if}
-                      {#if ev.cell_range}<span>ячейки <code>{ev.cell_range}</code></span>{/if}
+                      {#if ev.sheet}<span>лист <code class="tech">{ev.sheet}</code></span>{/if}
+                      {#if ev.cell_range}
+                        <span>ячейки <code class="tech">{ev.cell_range}</code></span>
+                      {/if}
                       {#if ev.char_start != null && ev.char_end != null}
                         <span>
                           символы <span class="num">{ev.char_start}</span>–<span class="num">{ev.char_end}</span>
                         </span>
                       {/if}
-                      <code>{ev.document_id}</code>
                     </figcaption>
                   </figure>
                 {/each}
               {/if}
             </div>
+
+            <details class="map__tech">
+              <summary class="micro">Служебные данные находки</summary>
+              <dl class="kv">
+                <dt>код находки</dt>
+                <dd><code class="tech">{finding.id}</code></dd>
+                <dt>субъект</dt>
+                <dd><code class="tech">{finding.subject || '—'}</code></dd>
+                <dt>предикат</dt>
+                <dd><code class="tech">{finding.predicate || '—'}</code></dd>
+                {#if finding.superseded_by}
+                  <dt>заменена на</dt>
+                  <dd><code class="tech">{finding.superseded_by}</code></dd>
+                {/if}
+              </dl>
+            </details>
 
             <div class="row">
               <Button href="/findings" variant="quiet" size="sm">Раздел «Находки»</Button>
@@ -515,6 +577,15 @@
             </div>
           </article>
         {/each}
+
+        {#if relatedFindings.length > shownFindings.length}
+          <Button variant="quiet" size="sm" onclick={() => (findingsAll = true)}>
+            Показать все
+            <span class="num">
+              {countOf(relatedFindings.length - shownFindings.length, 'находка', 'находки', 'находок')}
+            </span>
+          </Button>
+        {/if}
       {/if}
     </div>
   {/if}
@@ -524,7 +595,7 @@
   <div class="wrap">
     <!-- Узкий экран отдаёт вертикаль полю карты: метку раздела на нём заменяет
          заголовок. -->
-    <SectionHead level="1" eyebrow={narrow ? '' : 'Граф доказательств'} title="Карта связей корпуса">
+    <SectionHead level="1" eyebrow={narrow ? '' : 'Корпус · связи'} title="Карта связей корпуса">
       {#if status === 'ready'}
         <div class="map__head-tools">
           <p class="micro muted map__meta">
@@ -562,7 +633,7 @@
         {#if error}<p class="micro muted">{error}</p>{/if}
         <div class="row">
           <Button href="/research" variant="quiet">Рабочее пространство</Button>
-          <Button href="/dashboard" variant="ghost">Панель состояния</Button>
+          <Button href="/dashboard" variant="ghost">{navLabel('/dashboard')}</Button>
         </div>
       </Panel>
     {:else if status === 'loading' || status === 'idle'}
@@ -572,10 +643,7 @@
             Собираем карту: узлы, связи и сообщества корпуса.
           </p>
           <span class="skeleton map__skeleton-line"></span>
-          <span class="skeleton map__skeleton-line map__skeleton-line--short"></span>
           <span class="skeleton map__skeleton-field"></span>
-          <span class="skeleton map__skeleton-line"></span>
-          <span class="skeleton map__skeleton-line map__skeleton-line--short"></span>
         </div>
       </Panel>
     {:else if status === 'error'}
@@ -593,112 +661,80 @@
       <Empty
         icon="graph"
         title="Карта связей пуста"
-        body="На карте пока ни одного узла: материалы, методы и выводы появятся вместе с документами корпуса и ответами на запросы."
+        body="Сервер вернул срез без узлов: на карте появляются только те документы, из которых уже извлечены утверждения. Пустой или непрочитанный корпус остаётся без дисков и штрихов."
       >
         {#snippet action()}
           <div class="row">
-            <Button href="/research" variant="quiet">Рабочее пространство</Button>
-            <Button href="/findings" variant="ghost">Находки корпуса</Button>
+            <Button href="/findings" variant="quiet">Загрузить документ в находках</Button>
+            <Button href="/research" variant="ghost">Задать вопрос по корпусу</Button>
           </div>
         {/snippet}
       </Empty>
     {:else}
-      <nav class="map__nav micro" aria-label="Переходы по карте">
-        <a href="#corr-panel">К полю корреляции</a>
-        <a href="#evidence">
-          {selected ? 'К доказательствам узла' : 'Узел не выбран — доказательства появятся здесь'}
-        </a>
-        <a href="#map-text">К текстовому чтению карты</a>
-      </nav>
+      <GraphMap
+        {graph}
+        selectedId={selected ? selected.id : undefined}
+        edgeId={pickedEdge ? pickedEdge.id : undefined}
+        onselect={pick}
+        onpickEdge={pickEdge}
+      />
 
-      <div class="split map__work">
-        <div id="corr-panel" class="map__stage">
-          <GraphCanvas {graph} selectedId={selected?.id} onselect={(node) => (selected = node)} />
-        </div>
-
-        <aside class="stack map__rail" aria-label="Показания среза">
-          <div class="grid grid--4 map__gauges">
-            <Panel tone="sage" class="map__gauge">
-              <p class="metric__num num">{graph.nodes.length}</p>
-              <p class="small">{plural(graph.nodes.length, 'узел', 'узла', 'узлов')}</p>
-              <p class="micro muted">типов в срезе: <span class="num">{typeCount}</span></p>
-            </Panel>
-            <Panel tone="lav" class="map__gauge">
-              <p class="metric__num num">{graph.edges.length}</p>
-              <p class="small">{plural(graph.edges.length, 'связь', 'связи', 'связей')}</p>
-              <p class="micro muted">отношения читаются у выбранного узла</p>
-            </Panel>
-            <Panel tone="default" class="map__gauge">
-              <p class="metric__num num">{graph.communities.length}</p>
-              <p class="small">
-                {plural(graph.communities.length, 'сообщество', 'сообщества', 'сообществ')}
-              </p>
-              <p class="micro muted">
-                {#if graph.communities.length > 0}
-                  имена сообществ подобраны по ключевым словам меток
-                {:else}
-                  сообщества этого среза ещё не собраны
-                {/if}
-              </p>
-            </Panel>
-            <Panel tone="default" class="map__gauge">
-              <p class="metric__num num">{classCount}</p>
-              <p class="small">
-                {plural(classCount, 'класс данных', 'класса данных', 'классов данных')}
-              </p>
-              <p class="micro muted">в срезе: {classLabels || '—'}</p>
-            </Panel>
-          </div>
-
-          <div class="acc">
-            <button
-              type="button"
-              class="acc__head"
-              aria-expanded={helpOpen}
-              aria-controls="map-read-body"
-              onclick={() => (helpOpen = !helpOpen)}
+      {#if selected}
+        <section id="evidence" class="map__inspector">
+          {#if narrow}
+            <Sheet
+              title="Узел карты: {selected.label}"
+              onclose={() => pick(null)}
+              width="760px"
             >
-              <span>Как устроена карта</span>
-              <Icon name="plus" size={16} class="acc__icon" />
-            </button>
-            {#if helpOpen}
-              <div class="acc__body" id="map-read-body">
-                <p>
-                  Узлы собраны кластерами по типам онтологии: материал, метод, вывод, источник.
-                  Диск — узел, его тон задаёт тип, размер — уверенность и число связей; штрихи
-                  между дисками — отношения. Любой узел открывается с клавиатуры и раскрывает
-                  находки с локаторами первоисточника.
-                </p>
-              </div>
-            {/if}
-          </div>
-        </aside>
-      </div>
-
-      <section id="evidence" class="map__inspector">
-        {#if selected && narrow}
-          <Sheet
-            title="Узел карты: {selected.label}"
-            description="Инспектор узла с доказательствами; на широком экране он стоит под картой, а не шторкой."
-            onclose={() => (selected = null)}
-            width="760px"
-          >
-            {@render nodeBody()}
-            {@render evidenceBlock()}
-          </Sheet>
-        {:else}
-          <Panel tone={selected ? 'default' : 'sunk'} raised={Boolean(selected)}>
-            {#if selected}
+              {@render nodeBody()}
+              {@render evidenceBlock()}
+            </Sheet>
+          {:else}
+            <Panel tone="default" raised>
               <div class="panel__head">
                 <div>
                   <p class="eyebrow">
                     <Icon name="pin" size={16} />
-                    выбранный узел · {typeLabel(selected.type)} <code>{selected.type}</code>
+                    выбранный узел · {mapNodeType(selected.type)}
                   </p>
                   <h2 class="h3">{selected.label}</h2>
                 </div>
-                <Button variant="ghost" size="sm" onclick={() => (selected = null)}>Снять выбор</Button>
+                <Button variant="ghost" size="sm" onclick={() => pick(null)}>Снять выбор</Button>
               </div>
+
+              {#if pickedEdge}
+                {@const fromNode = nodeIndex.get(pickedEdge.source) ?? null}
+                {@const toNode = nodeIndex.get(pickedEdge.target) ?? null}
+                <div class="map__edge-card">
+                  <p class="eyebrow">
+                    <Icon name="link" size={16} />
+                    выбранная связь
+                  </p>
+                  <p class="small map__edge-line">
+                    {mapRelationLabel(pickedEdge.relation)}
+                    {#if !mapRelationKnown(pickedEdge.relation)}
+                      <code class="tech">{pickedEdge.relation}</code>
+                    {/if}
+                    :
+                    <button type="button" class="map__jump" onclick={() => fromNode && pick(fromNode)}>
+                      {fromNode?.label ?? 'узел недоступен в этом срезе'}
+                    </button>
+                    <span aria-hidden="true">→</span>
+                    <button type="button" class="map__jump" onclick={() => toNode && pick(toNode)}>
+                      {toNode?.label ?? 'узел недоступен в этом срезе'}
+                    </button>
+                  </p>
+                  <p class="micro muted">
+                    уверенность связи <span class="num">{fmt(pickedEdge.confidence)}</span>
+                    · класс данных {DATA_CLASS_LABELS[pickedEdge.data_class]}
+                  </p>
+                  <Button variant="ghost" size="sm" onclick={() => pickEdge(null)}>
+                    Снять связь
+                  </Button>
+                </div>
+              {/if}
+
               <div class="split map__split">
                 <div class="stack" style="--gap: var(--s5)">
                   {@render nodeBody()}
@@ -707,20 +743,13 @@
                   {@render evidenceBlock()}
                 </div>
               </div>
-            {:else}
-              <Empty
-                icon="target"
-                title="Узел не выбран"
-                body="Tab — по дискам поля, стрелки — ход к ближайшему узлу в направлении, Enter или Space — выбрать, Esc — снять выбор. Выбранный узел подсвечивает свои связи на карте и раскрывает доказательства здесь."
-              />
-            {/if}
-          </Panel>
-        {/if}
-      </section>
+            </Panel>
+          {/if}
+        </section>
+      {/if}
     {/if}
   </div>
 </div>
-
 
 <style>
   .map-page .wrap {
@@ -741,47 +770,27 @@
     white-space: normal;
   }
 
-  .map__nav {
+  /* Карточка выбранной связи: та же трасса, что у строки на поле, но словами. */
+  .map__edge-card {
     display: flex;
-    gap: var(--s4);
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: thin;
-    padding-block-end: var(--s1);
+    flex-direction: column;
+    gap: var(--s2);
+    margin-block: var(--s4) 0;
+    padding: var(--s4);
+    border-radius: var(--r-md);
+    background: var(--surface-sunk);
+    align-items: flex-start;
   }
 
-  .map__nav a {
-    white-space: nowrap;
-  }
-
-  /* Рабочая зона экрана: поле корреляции тянется на остаток вьюпорта,
-     показания среза и пояснение чтения уходят в правый рельс. */
-  .map__work {
-    --gap: var(--s5);
-    grid-template-columns: minmax(0, 1fr) var(--rail-w);
-    align-items: start;
-  }
-
-  .map__rail {
-    --gap: var(--s4);
-  }
-
-  .map__gauges {
-    --gap: var(--s3);
-  }
-
-  .map__gauges p {
+  .map__edge-card p {
     margin: 0;
   }
 
-  .map__gauges .metric__num {
-    font-size: clamp(24px, 2.2vw, 30px);
-  }
-
-  /* Плотность карточек показания: рельс уже страницы, поля панели тоже меньше. */
-  :global(.panel.map__gauge) {
-    padding: var(--s4);
-    border-radius: var(--r-lg);
+  .map__edge-line {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    flex-wrap: wrap;
   }
 
   .map__skeleton {
@@ -790,7 +799,11 @@
     gap: var(--s3);
   }
 
-  /* Загрузка без скачка вёрстки: очертания поля и строк занимают место сразу. */
+  .map__skeleton p {
+    margin: 0;
+  }
+
+  /* Загрузка без скачка вёрстки: очертания поля занимают место сразу. */
   .map__skeleton-line {
     height: 14px;
     width: 100%;
@@ -800,18 +813,11 @@
     width: 46%;
   }
 
+  /* Поле больше не имеет жёсткой высоты: оно растёт с содержимым, поэтому на
+     время чтения достаточно очертания в треть экрана. */
   .map__skeleton-field {
-    height: clamp(320px, 48dvh, 500px);
+    height: clamp(240px, 34dvh, 420px);
     border-radius: var(--r-xl);
-  }
-
-  .map__skeleton p {
-    margin: 0;
-  }
-
-  #corr-panel,
-  #evidence {
-    scroll-margin-top: calc(var(--topbar-h) + var(--s5));
   }
 
   .map__inspector {
@@ -834,6 +840,11 @@
     flex-wrap: wrap;
   }
 
+  .map__list-head {
+    margin: var(--s2) 0 0;
+    letter-spacing: var(--tr-body);
+  }
+
   .map__conn-list {
     list-style: none;
     margin: var(--s2) 0 0;
@@ -844,7 +855,7 @@
 
   .map__conn-list li {
     display: grid;
-    grid-template-columns: 20px minmax(96px, 0.9fr) minmax(0, 1.4fr) 52px;
+    grid-template-columns: 66px minmax(96px, 0.9fr) minmax(0, 1.4fr) 52px;
     gap: var(--s3);
     align-items: baseline;
     padding: var(--s2) 0;
@@ -852,20 +863,10 @@
   }
 
   .map__dir {
-    font-family: var(--font-data);
     color: var(--ink-3);
   }
 
   .map__rel {
-    color: var(--ink-2);
-  }
-
-  .map__rel code,
-  .map__hidden code,
-  .kv code,
-  .map__claim code {
-    font-family: var(--font-data);
-    font-size: var(--t-micro);
     color: var(--ink-2);
   }
 
@@ -881,6 +882,10 @@
     font: inherit;
     text-align: left;
     cursor: pointer;
+    min-width: 0;
+    /* Метки узлов — часто одно длинное слово (имя файла, «руда_медногорского_…»):
+       без переноса оно распирает колонку и уходит за край шторки. */
+    overflow-wrap: anywhere;
   }
 
   .map__jump:hover {
@@ -925,6 +930,26 @@
     padding: var(--s3) var(--s4) 0;
   }
 
+  /* Технические имена — только под раскрытием «Служебные данные»: в фактах узла
+     и находки они не заголовки. */
+  .map__tech {
+    border-top: 1px solid var(--line-soft);
+    padding-top: var(--s3);
+  }
+
+  .map__tech summary {
+    cursor: pointer;
+    color: var(--ink-3);
+  }
+
+  .map__tech .kv {
+    margin-top: var(--s2);
+  }
+
+  .map__tech dd {
+    overflow-wrap: anywhere;
+  }
+
   @media (max-width: 900px) {
     /* Шапка в один плотный ряд: подпись среза переносится, кнопка остаётся
        на своей ширине, и поле карты поднимается к первому вьюпорту. */
@@ -942,22 +967,19 @@
       flex: none;
     }
 
-    /* Рельс не тащится за узким экраном: показания среза становятся лентой
-       под полем карты, а не второй колонкой. */
-    .map__work {
-      grid-template-columns: minmax(0, 1fr);
-    }
-
-    .map__rail {
-      --gap: var(--s5);
+    /* Строка связи перестраивается в текучую: трёхколоночная сетка на ширине
+       шторки оставляла метке ~30 px, и слово разваливалось по буквам. */
+    .map__conn-list li {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: var(--s1) var(--s2);
     }
   }
 
   @media (max-width: 640px) {
-    .map__conn-list li {
-      grid-template-columns: 20px minmax(0, 1fr) 52px;
-    }
-
+    /* В узкой колонке читаются направление, отношение и второй узел;
+       уверенность остаётся в полном составе списка. */
     .map__conf {
       display: none;
     }

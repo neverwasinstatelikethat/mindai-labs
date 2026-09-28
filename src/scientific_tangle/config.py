@@ -24,6 +24,12 @@ _GIGACHAT_CONTEXT_WINDOWS: dict[str, int] = {
 }
 # Резерв под систему, JSON-схему structured output, историю ветки и вывод модели.
 _PROMPT_OVERHEAD_TOKENS = 3072
+# Бюджет по умолчанию выводится из тех же констант, что и предупреждение ниже:
+# GigaChat — единственный провайдер продукта, и базовая конфигурация не должна
+# стартовать значением, которое её же проверка называет недостижимым.
+_DEFAULT_CONTEXT_TOKEN_BUDGET = (
+    _GIGACHAT_CONTEXT_WINDOWS["GigaChat"] - _PROMPT_OVERHEAD_TOKENS
+)
 
 # Доверенные источники cookie-запросов (CSRF). Порты контура взяты из диапазона
 # 20000–49000 и выбраны нестандартно: 3000/8000/9090 на рабочих машинах обычно
@@ -76,7 +82,7 @@ class Settings(BaseSettings):
     agent_max_tool_rounds: int = Field(default=2, ge=1, le=4)
     agent_max_revisions: int = Field(default=1, ge=0, le=2)
     # Сколько токенов доказательства помещается в промпт reasoner/critic/improver.
-    context_token_budget: int = Field(default=24000, ge=500)
+    context_token_budget: int = Field(default=_DEFAULT_CONTEXT_TOKEN_BUDGET, ge=500)
     # Потолок одновременных исследований: сверх него запрос получает 429, а не
     # очередь внутри чужого дедлайна. Держится ниже GIGACHAT_MAX_CONCURRENT косвенно:
     # один агентный запрос делает несколько вызовов модели, поэтому большой порог

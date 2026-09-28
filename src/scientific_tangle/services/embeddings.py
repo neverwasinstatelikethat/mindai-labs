@@ -23,6 +23,25 @@ class EmbeddingError(RuntimeError):
     """Эмбеддинг не получен — семантическая ветка retrieval деградирует."""
 
 
+# Повторные попытки лечат задержку и перегрузку, но не приговор аккаунта.
+_RETRYABLE_STATUSES = frozenset({408, 409, 425, 429})
+
+
+def _refused_for_good(error: BaseException) -> bool:
+    """4xx кроме перегрузочных — отказ, который повтором не снять.
+
+    Живой контур с неоплаченным `/embeddings` отдавал `402` на каждом поиске, а
+    четыре попытки с backoff 2+4+8 = 14 с под общим замком превращали постоянный
+    отказ тарифа в минуты ожидания: новичок получал «модель не ответила» там, где
+    корпус просто не успевал отдать лексическую ветку.
+    """
+    status = getattr(error, "status_code", None)
+    if status is None:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status not in _RETRYABLE_STATUSES
+
+
 class EmbeddingClient(Protocol):
     @property
     def dimensions(self) -> int: ...
@@ -103,7 +122,7 @@ class GigaChatEmbeddingClient:
                     # отказ эмбеддингов деградировал векторную ветку, а не валил
                     # индексацию целиком.
                     last_error = error
-                    if attempt == 3:
+                    if _refused_for_good(error) or attempt == 3:
                         break
                     time.sleep(min(2.0 ** (attempt + 1), 8.0))
             raise EmbeddingError(f"Эмбеддинги недоступны: {last_error}") from last_error

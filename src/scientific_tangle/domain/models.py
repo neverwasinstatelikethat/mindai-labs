@@ -117,7 +117,10 @@ class NumericFilter(BaseModel):
 
 class QueryPlan(BaseModel):
     question: str = Field(min_length=3)
-    language: Literal["ru", "en"]
+    # Язык плана — факт входящего запроса, а не вывод модели: planning_agent
+    # проставляет его сам. Без значения по умолчанию пролёт падал на валидации
+    # всякий раз, когда модель не пересказывала язык.
+    language: Literal["ru", "en"] = "ru"
     mode: Literal["local", "global", "hybrid"] = "hybrid"
     entity_mentions: list[str] = Field(default_factory=list)
     numeric_filters: list[NumericFilter] = Field(default_factory=list)

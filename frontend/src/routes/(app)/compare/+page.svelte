@@ -1,17 +1,26 @@
 <script lang="ts">
-  // Сравнение объектов по измерениям: та же матрица, что и в старом листе, но
-  // собранная композициями Softly — широкая утопленная панель с условиями
-  // сравнения и таблицей в `.table-wrap`, а на мобильном матрица разворачивается
-  // в стек заметок на объект, а не сжимается до горизонтального скролла.
-  // Списки корпуса стоят в правом рельсе отдельной колонкой сетки: он не
-  // отодвигает результат и не растёт выше вьюпорта.
-  import { onMount } from 'svelte';
+  // Сравнение технологий по измерениям: условия и результат — в главной колонке,
+  // списки корпуса — в правом рельсе (на узком экране свёрнуты в аккордеон под
+  // результатом). Отметить технологию или измерение можно единственным способом —
+  // нажатием по списку корпуса, поэтому в условиях сравнения остаётся итог
+  // выбора, а не второй и третий параллельный ввод. Ниже 900px сравнение
+  // разворачивается в стек заметок на технологию, а не сжимается в горизонтальный
+  // скролл.
+  import { onMount, tick } from 'svelte';
   import { page } from '$app/state';
   import { api, ApiError } from '$lib/api';
   import { countOf, num, pct } from '$lib/format';
   import { scrollRegion } from '$lib/scroll-region';
   import { session } from '$lib/sessionStore.svelte';
-  import { OPERATOR_SYMBOL, PROPERTY_LABELS, SUBJECT_LABELS, termOf } from '$lib/terms';
+  import {
+    COMPARE_CELL_LABELS,
+    COMPARE_LIMIT_SOURCE,
+    COMPARE_ROW_LABELS,
+    OPERATOR_SYMBOL,
+    PROPERTY_LABELS,
+    SUBJECT_LABELS,
+    termOf,
+  } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
   import Chip from '$lib/ui/Chip.svelte';
   import Empty from '$lib/ui/Empty.svelte';
@@ -42,10 +51,13 @@
   );
 
   let question = $state('');
+  // Вопрос сравнения необязателен и ни на какие числа не влияет — это подпись к
+  // результату, а не пропуск на сравнение. Серверному контракту нужен ориентир
+  // прогона (от 3 символов), поэтому при пустом поле уходит подпись по отмеченным
+  // технологиям, а на экран выводится только вопрос человека (`questionEcho`).
+  let questionEcho = $state('');
   let entities = $state<string[]>([]);
   let dimensions = $state<string[]>([]);
-  let entityDraft = $state('');
-  let dimensionDraft = $state('');
   let matrix = $state<ComparisonTable | null>(null);
   let corpus = $state<FindingListItem[] | null>(null);
   let corpusError = $state('');
@@ -53,16 +65,14 @@
   let attempted = $state(false);
   let error = $state('');
   let forbidden = $state('');
-  let questionErr = $state('');
-  let entitiesErr = $state('');
-  let submitted = $state(false);
+  let needsEntities = $state(false);
 
-  // Мобильная композиция матрицы: стек заметок на объект вместо таблицы.
+  // Мобильная композиция сравнения: стек заметок на технологию вместо таблицы.
   // Точка перестройки — проектный брейкпоинт 900px: ниже него и рельс уходит
   // под условия, и матрица разворачивается в заметки, поэтому ничего не
   // сжимается в горизонтальный скролл на 781–900px.
   let narrow = $state(false);
-  // Списки корпуса и пояснение матрицы — вторичный слой: на широком экране они
+  // Списки корпуса и пояснение чтения — вторичный слой: на широком экране они
   // в правом рельсе, на узком свёрнуты, чтобы условия и результат читались сразу.
   let corporaOpen = $state(false);
   let helpOpen = $state(false);
@@ -140,27 +150,29 @@
     let checked = 0;
     for (const header of headers) {
       const result = checkOf(header, row.cells[header]);
-      if (result.check === 'outside') return { pill: 'disputed', label: 'вне предела', why: result.why };
+      if (result.check === 'outside') {
+        return { pill: 'disputed', label: COMPARE_ROW_LABELS.outside, why: result.why };
+      }
       if (result.check === 'within') checked += 1;
     }
     return checked > 0
-      ? { pill: 'consensus', label: 'сверки выдержаны', why: '' }
-      : { pill: 'off', label: 'нечего сверять', why: '' };
+      ? { pill: 'consensus', label: COMPARE_ROW_LABELS.passed, why: '' }
+      : { pill: 'off', label: COMPARE_ROW_LABELS.nothing, why: '' };
   }
 
   const resultStatus = $derived.by(() => {
     if (forbidden) return 'Сравнение закрыто: нужен доступ к корпусу.';
     if (error) return 'Сравнение не выполнено.';
-    if (loading) return 'Считаем матрицу…';
-    if (!matrix) return 'Матрица ещё не построена.';
+    if (loading) return 'Считаем сравнение…';
+    if (!matrix) return 'Сравнения пока нет — отметьте технологии в списках корпуса.';
     if (matrix.headers.length === 0) return 'Указанных измерений в находках нет.';
-    if (matrix.rows.length === 0) return 'Субъекты не найдены.';
-    return `Матрица готова: ${countOf(matrix.rows.length, 'строка', 'строки', 'строк')}, ${countOf(
-      matrix.headers.length,
-      'измерение',
-      'измерения',
-      'измерений',
-    )}.`;
+    if (matrix.rows.length === 0) return 'Таких технологий в находках нет.';
+    return `Готово: ${countOf(
+      matrix.rows.length,
+      'технология',
+      'технологии',
+      'технологий',
+    )} и ${countOf(matrix.headers.length, 'измерение', 'измерения', 'измерений')}.`;
   });
 
   // Направление предела берётся из оператора наблюдения, а когда оператора нет —
@@ -228,12 +240,12 @@
     header: string,
     cell: ComparisonCell | undefined,
   ): { pill: 'consensus' | 'hypothesis' | 'disputed' | 'off'; label: string } {
-    if (!cell?.value) return { pill: 'off', label: 'наблюдения нет' };
-    if (!limits[header]) return { pill: 'hypothesis', label: 'не сверено' };
+    if (!cell?.value) return { pill: 'off', label: COMPARE_CELL_LABELS.novalue };
+    if (!limits[header]) return { pill: 'hypothesis', label: COMPARE_CELL_LABELS.unchecked };
     const result = checkOf(header, cell);
-    if (result.check === 'outside') return { pill: 'disputed', label: 'вне предела' };
-    if (result.check === 'within') return { pill: 'consensus', label: 'в пределе' };
-    return { pill: 'hypothesis', label: 'не сверено' };
+    if (result.check === 'outside') return { pill: 'disputed', label: COMPARE_CELL_LABELS.outside };
+    if (result.check === 'within') return { pill: 'consensus', label: COMPARE_CELL_LABELS.within };
+    return { pill: 'hypothesis', label: COMPARE_CELL_LABELS.unchecked };
   }
 
   // Цвет полосы уверенности честный: зелёный и красный — только когда сверку
@@ -246,38 +258,14 @@
     return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
   }
 
+  // Отметка ставится и снимается одним движением — нажатием по списку корпуса.
   function toggleEntity(name: string): void {
     entities = entities.includes(name) ? entities.filter((v) => v !== name) : [...entities, name];
-    entitiesErr = '';
+    needsEntities = false;
   }
 
   function toggleDimension(name: string): void {
     dimensions = dimensions.includes(name) ? dimensions.filter((v) => v !== name) : [...dimensions, name];
-  }
-
-  function commitEntity(): void {
-    const value = entityDraft.trim();
-    if (value && !entities.includes(value)) entities = [...entities, value];
-    entityDraft = '';
-    entitiesErr = '';
-  }
-
-  function commitDimension(): void {
-    const value = dimensionDraft.trim();
-    if (value && !dimensions.includes(value)) dimensions = [...dimensions, value];
-    dimensionDraft = '';
-  }
-
-  function onEntityKey(event: KeyboardEvent): void {
-    if (event.key !== 'Enter') return;
-    event.preventDefault();
-    commitEntity();
-  }
-
-  function onDimensionKey(event: KeyboardEvent): void {
-    if (event.key !== 'Enter') return;
-    event.preventDefault();
-    commitDimension();
   }
 
   async function loadCorpus(): Promise<void> {
@@ -294,19 +282,30 @@
   }
 
   async function runCompare(): Promise<void> {
-    submitted = true;
-    error = '';
-    forbidden = '';
-    questionErr = question.trim().length < 3 ? 'Вопрос сравнения — от 3 символов.' : '';
-    entitiesErr = entities.length === 0 ? 'Добавьте хотя бы одну сущность.' : '';
-    // Валидационные ошибки живут у полей и построенную матрицу не стирают:
-    // результат сбрасывает только новый запрос — успех или отказ сервера.
-    if (questionErr || entitiesErr) return;
-
+    if (entities.length === 0) {
+      // Без технологий сравнивать нечего: пустая таблица выглядела бы как «данных
+      // нет», поэтому называем пропущенный выбор и не идём на сервер.
+      needsEntities = true;
+      error = '';
+      forbidden = '';
+      return;
+    }
+    needsEntities = false;
     loading = true;
     attempted = true;
+    error = '';
+    forbidden = '';
+    // Смысл поля — подпись к результату, а не пропуск: короткую строку (<3 символов
+    // требует контракт) не показываем и не отправляем, сравнение идёт по отмеченным
+    // технологиям.
+    const asked = question.trim().length >= 3 ? question.trim() : '';
+    questionEcho = asked;
     try {
-      matrix = await api.compare(question.trim(), entities, dimensions);
+      matrix = await api.compare(
+        asked || `Сравнение: ${entities.map(entityLabel).join(', ')}`,
+        entities,
+        dimensions,
+      );
     } catch (reason) {
       matrix = null;
       // Отказ по доступу и технический сбой — две разные строки, и обе человеческие.
@@ -314,7 +313,7 @@
         forbidden =
           'Сравнение открыто аккаунтам с доступом к корпусу — запросите его у администратора сервиса.';
       } else {
-        error = 'Не удалось посчитать матрицу. Проверьте соединение и повторите сравнение.';
+        error = 'Не удалось получить сравнение. Проверьте соединение и повторите.';
       }
     } finally {
       loading = false;
@@ -326,14 +325,33 @@
     await runCompare();
   }
 
-  async function compareWithSubject(name: string): Promise<void> {
-    entities = [name];
-    await runCompare();
-  }
-
   function takeSubjects(): void {
     entities = subjectNames.slice(0, 4);
+    needsEntities = false;
   }
+
+  /**
+   * Способ выбрать технологию и измерение один — списки корпуса: рельс на широком
+   * экране, свёрнутый аккордеон под результатом на узком. Подсказка в условиях
+   * раскрывает его и прокручивает к нему вместо второго поля ввода.
+   */
+  function openCorpora(): void {
+    corporaOpen = true;
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    void tick().then(() =>
+      document
+        .getElementById('cmp-corpora')
+        ?.scrollIntoView({ block: 'nearest', behavior: reduced ? 'auto' : 'smooth' }),
+    );
+  }
+
+  // Вывод по сравнению записывают в «Проверке решений»: ссылка передаёт, о чём
+  // именно вывод, чтобы не набирать основание отзыва заново.
+  const feedbackHref = $derived(
+    `/feedback?about=${encodeURIComponent(
+      questionEcho || entities.map(entityLabel).join(', ') || 'сравнение технологий',
+    )}`,
+  );
 
   // Переход с карты или из ответа: ?q=…&entities=a,b запускает сравнение, как
   // только сервер подтвердил права сессии (порядок инициализации эффекта и
@@ -372,12 +390,12 @@
 {#snippet corporaBlock()}
   <Panel tone="sunk" class="cmp__list">
     <p class="micro muted">
-      Нажатие на субъект или свойство добавляет его в условия сравнения, повторное нажатие
-      убирает.
+      Нажатие добавляет технологию или измерение в условия сравнения, повторное
+      нажатие убирает.
     </p>
 
     <p class="field__label">
-      Субъекты текущего корпуса
+      Технологии корпуса
       <!-- Число при заголовке говорит, сколько меток в списке всего: в рельсе
            сразу видно не все. Во время загрузки счётчика нет — «0» выглядел бы
            как пустой корпус. -->
@@ -387,9 +405,14 @@
     </p>
     {#if corpus}
       {#if subjectNames.length === 0}
+        <!-- Пустой корпус — не «нет совпадений»: сравнивать нечего, пока в него
+             не положен документ. Вводить вручную нечего, поэтому подсказка ведёт
+             туда, где корпус пополняется. -->
         <p class="micro muted">
-          В находках корпуса пока нет ни одного субъекта — сущность можно ввести вручную.
+          В находках корпуса нет ни одного субъекта: технология приходит вместе с
+          документом.
         </p>
+        <Button href="/findings" variant="quiet" size="sm">Пополнить корпус</Button>
       {:else}
         <!-- Чипы переносятся строками: в рельсе 272 px горизонтальная полоса
              показала бы один чип и срезала остальные без подсказки. -->
@@ -402,7 +425,7 @@
         </div>
       {/if}
     {:else if corpusError}
-      <p class="micro muted">Список субъектов не получен: {corpusError}</p>
+      <p class="micro muted">Список технологий не получен: {corpusError}</p>
     {:else}
       <div class="cmp__skeleton" role="status">
         <span class="skeleton cmp__skeleton-line"></span>
@@ -412,7 +435,7 @@
     {/if}
 
     <p class="field__label">
-      Свойства наблюдений
+      Измерения в находках
       {#if corpus}
         <span class="muted">(<span class="num">{propertyNames.length}</span>)</span>
       {/if}
@@ -420,8 +443,8 @@
     {#if corpus}
       {#if propertyNames.length === 0}
         <p class="micro muted">
-          В находках корпуса нет ни одного числового свойства — измерения можно ввести
-          вручную или снять фильтр.
+          Числовых свойств в находках нет — колонок не будет, пока корпус не
+          пополнится числами.
         </p>
       {:else}
         <div class="cmp__chips">
@@ -433,9 +456,9 @@
         </div>
       {/if}
     {:else if corpusError}
-      <p class="micro muted">Свойства не получены: {corpusError}</p>
+      <p class="micro muted">Измерения не получены: {corpusError}</p>
     {:else}
-      <p class="micro muted" role="status">Свойства появятся, когда прочитаем находки корпуса.</p>
+      <p class="micro muted" role="status">Измерения появятся, когда прочитаем находки корпуса.</p>
     {/if}
 
     <div class="cmp__list-actions">
@@ -443,8 +466,14 @@
         Обновить списки корпуса
       </Button>
       {#if subjectNames.length}
-        <Button variant="ghost" size="sm" disabled={loading} onclick={takeSubjects}>
-          Взять первые четыре субъекта
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={loading}
+          title="Берём не больше четырёх технологий — остальное отмечаете сами"
+          onclick={takeSubjects}
+        >
+          Взять технологии из корпуса
         </Button>
       {/if}
     </div>
@@ -460,20 +489,35 @@
       aria-controls="cmp-help-body"
       onclick={() => (helpOpen = !helpOpen)}
     >
-      <span>Как устроена матрица</span>
+      <span>Как читать сравнение</span>
       <Icon name="plus" size={16} class="acc__icon" />
     </button>
     <!-- Тело остаётся в DOM и получает `hidden`: ссылка aria-controls ведёт к
          существующему элементу в обоих состояниях раскрытия. -->
     <div class="acc__body" id="cmp-help-body" hidden={!helpOpen}>
       <p>
-        Строки — субъекты утверждений, колонки — свойства числовых наблюдений. В ячейке
-        значение с единицей, цитата источника и уверенность извлечения.
+        Строки — технологии (субъекты утверждений), колонки — измеримые свойства
+        наблюдений. В ячейке стоит каждое различное число источников с единицей, цитата
+        и уверенность извлечения: расхождение не сводится к одной удачной цифре.
       </p>
       <p>
-        Сущность ищется как подстрока субъекта утверждения, измерение сопоставляется со
-        свойством числового наблюдения. Как считаются метки предела — сказано под таблицей,
-        там же, где сами пределы.
+        Технология ищется в субъекте утверждения целым словом, а не фрагментом: «Fe» не
+        стянет в одну строку Fe2O3 и FeS. Если измерений не отмечено, показываем все
+        свойства наблюдений выбранных технологий.
+      </p>
+      <p>
+        Метки соответствия считаются по пределу, распознанному в самом наблюдении: если у
+        наблюдения есть оператор «≤» или «≥», берём его нормализованное число, если
+        оператора нет — направление распознаём по формулировке («не выше», «выше»). Это
+        распознавание, а не поле корпуса, поэтому у каждой метки предела в подписи сказано,
+        откуда он взят. Если у свойства несколько разных пределов, сверка идёт по самому
+        строгому: «не выше» — по меньшему числу, «не ниже» — по большему.
+      </p>
+      <p>
+        «Вне предела» — значение вышло за распознанный предел того же свойства и единицы.
+        Когда предела нет, единицы не совпали или число не разобралось, ячейка получает
+        «не сверено», а не «в пределе»; строка без единой удачной сверки помечается
+        «нечего сверять».
       </p>
     </div>
   </div>
@@ -485,8 +529,9 @@
          на нём заменяет заголовок. -->
     <SectionHead
       level="1"
-      eyebrow={narrow ? '' : 'Корпус · объекты · измерения'}
-      title="Матрица по объектам и измерениям"
+      eyebrow={narrow ? '' : 'Корпус · технологии · измерения'}
+      title="Сравнение технологий"
+      lead="Технологии по измерениям — бок о бок: число, единица и цитата источника в каждой ячейке."
     />
 
     {#if allowed === null}
@@ -494,7 +539,7 @@
         <div class="cmp__skeleton">
           <span class="skeleton cmp__skeleton-line"></span>
           <span class="skeleton cmp__skeleton-block"></span>
-          <p class="micro muted">Уточняем доступ к сравнению — матрицу строим после этого.</p>
+          <p class="micro muted">Уточняем доступ к сравнению — результаты появятся после этого.</p>
         </div>
       </Panel>
     {:else if !allowed}
@@ -504,8 +549,8 @@
           <StatusPill status="off" label="нет доступа" />
         </div>
         <p class="lead small">
-          Матрица по объектам и измерениям открыта аккаунтам с доступом к корпусу —
-          запросите его у администратора сервиса.
+          Сравнение технологий открыто аккаунтам с доступом к корпусу — запросите его
+          у администратора сервиса.
         </p>
         <div class="row">
           <Button href="/research" variant="quiet">Рабочее пространство</Button>
@@ -524,47 +569,29 @@
 
           <div class="cmp__form">
             <div class="cmp__field">
-              <Field
-                label="Вопрос сравнения"
-                name="cmp-question"
-                bind:value={question}
-                placeholder="Какие технологии сопоставляем?"
-                error={submitted ? questionErr : ''}
-                hint="От 3 символов — короче не принять."
-                onenter={() => void runCompare()}
-              />
-            </div>
-
-            <div class="cmp__field">
               <p class="field__label">
-                Сущности
+                Технологии
                 <span class="muted">({entities.length})</span>
               </p>
-              <div class="cmp__picker">
-                <!-- Метка выбранной сущности и есть действие: нажатие убирает её
-                     из сравнения. Отдельной кнопки-крестика в 22 px нет. -->
-                {#each entities as name (name)}
-                  <Chip pressed onclick={() => toggleEntity(name)}>{entityLabel(name)}</Chip>
-                {/each}
-                <input
-                  class="input cmp__draft"
-                  aria-label="Добавить сущность: субъект утверждения и Enter"
-                  type="text"
-                  bind:value={entityDraft}
-                  onkeydown={onEntityKey}
-                  placeholder="субъект и Enter"
-                />
-                <Button variant="quiet" size="sm" onclick={commitEntity} disabled={!entityDraft.trim()}>
-                  Добавить
-                </Button>
-              </div>
-              {#if submitted && entitiesErr}
-                <p class="field__error">{entitiesErr}</p>
+              <!-- Здесь только итог выбора. Метка и есть действие: нажатие убирает
+                   технологию из сравнения, отдельной кнопки-крестика нет. -->
+              {#if entities.length}
+                <div class="cmp__picker">
+                  {#each entities as name (name)}
+                    <Chip pressed onclick={() => toggleEntity(name)}>{entityLabel(name)}</Chip>
+                  {/each}
+                </div>
               {:else}
-                <p class="field__hint">
-                  Достаточно одной сущности, можно несколько; нажатие на метку убирает её.
+                <p class="small muted cmp__none">Ни одна технология не отмечена.</p>
+              {/if}
+              {#if needsEntities}
+                <p class="field__error">
+                  Нужна хотя бы одна технология — отметьте её в списках корпуса.
                 </p>
               {/if}
+              <Button variant="link" size="sm" onclick={openCorpora}>
+                Отметить технологии
+              </Button>
             </div>
 
             <div class="cmp__field">
@@ -572,25 +599,29 @@
                 Измерения
                 <span class="muted">({dimensions.length}) · необязательно</span>
               </p>
-              <div class="cmp__picker">
-                {#each dimensions as name (name)}
-                  <Chip pressed onclick={() => toggleDimension(name)}>{dimensionLabel(name)}</Chip>
-                {/each}
-                <input
-                  class="input cmp__draft"
-                  aria-label="Добавить измерение: свойство наблюдения и Enter"
-                  type="text"
-                  bind:value={dimensionDraft}
-                  onkeydown={onDimensionKey}
-                  placeholder="свойство и Enter"
-                />
-                <Button variant="quiet" size="sm" onclick={commitDimension} disabled={!dimensionDraft.trim()}>
-                  Добавить
-                </Button>
-              </div>
-              <p class="field__hint">
-                Без измерений матрица идёт по всем свойствам наблюдений; нажатие на метку убирает её.
-              </p>
+              {#if dimensions.length}
+                <div class="cmp__picker">
+                  {#each dimensions as name (name)}
+                    <Chip pressed onclick={() => toggleDimension(name)}>{dimensionLabel(name)}</Chip>
+                  {/each}
+                </div>
+                <p class="field__hint">Нажатие на метку убирает её из сравнения.</p>
+              {:else}
+                <p class="small muted cmp__none">
+                  Без отметок сравниваем по всем измерениям наблюдений.
+                </p>
+              {/if}
+            </div>
+
+            <div class="cmp__field">
+              <Field
+                label="Вопрос сравнения — необязательно"
+                name="cmp-question"
+                bind:value={question}
+                placeholder="напр. какая технология держит соли по холодной шахтной воде"
+                hint="Одна строка контекста к результату: на числа она не влияет."
+                onenter={() => void runCompare()}
+              />
             </div>
           </div>
         </Panel>
@@ -598,7 +629,7 @@
         <section class="cmp__result" aria-label="Результат сравнения">
           <div class="panel__head">
             <h2 class="h3">Результат</h2>
-            <p class="micro muted">матрица строится по находкам корпуса</p>
+            <p class="micro muted">сравнение по находкам корпуса</p>
           </div>
           <p class="micro cmp__status" role="status" aria-live="polite">{resultStatus}</p>
 
@@ -640,14 +671,12 @@
           {:else if !matrix && !attempted}
             <Empty
               icon="compare"
-              title="До первого запроса матрицы нет"
-              body="Добавьте сущности — сопоставим их субъекты со свойствами наблюдений и покажем таблицу."
+              title="До первого сравнения результата нет"
+              body="Отметьте технологии в списках корпуса — покажем их числа по общим измерениям, с цитатой источника в каждой ячейке."
             >
               {#snippet action()}
                 <div class="row">
-                  {#if subjectNames.length}
-                    <Button variant="quiet" size="sm" onclick={takeSubjects}>Взять первые четыре субъекта</Button>
-                  {/if}
+                  <Button variant="quiet" size="sm" onclick={openCorpora}>Отметить технологии</Button>
                   <Button variant="ghost" size="sm" href="/graph">Посмотреть узлы на карте</Button>
                 </div>
               {/snippet}
@@ -656,15 +685,15 @@
             <Empty
               icon="filter"
               title="Указанных измерений в находках нет"
-              body="У выбранных субъектов нет этих измерений: снимите фильтр — и в таблице останутся все свойства наблюдений."
+              body="У отмеченных технологий этих измерений нет: снимите отметки — и останутся все свойства наблюдений."
             >
               {#snippet action()}
                 <div class="row">
                   <Button variant="quiet" size="sm" onclick={() => void runWithoutDimensions()}>
-                    Снять фильтр измерений
+                    Сравнить без отмеченных измерений
                   </Button>
                   <Button variant="ghost" size="sm" onclick={() => void loadCorpus()}>
-                    Перечитать свойства корпуса
+                    Перечитать измерения корпуса
                   </Button>
                 </div>
               {/snippet}
@@ -672,31 +701,27 @@
           {:else if matrix && matrix.rows.length === 0}
             <Empty
               icon="search"
-              title="Субъекты не найдены"
-              body="Ни одно утверждение корпуса не имеет субъекта, содержащего указанную строку."
+              title="Таких технологий в находках нет"
+              body="Ни одно утверждение корпуса не называет их целым словом: субъект ищется целиком, а не по фрагменту названия."
             >
               {#snippet action()}
-                <!-- Быстрый выбор субъекта есть только когда корпус его отдал:
-                     пустой ряд не должен оставлять лишнюю строку в пустом
-                     состоянии. -->
-                {#if subjectNames.length}
-                  <div class="cmp__chips">
-                    {#each subjectNames as name (name)}
-                      <Button variant="quiet" size="sm" onclick={() => void compareWithSubject(name)}>
-                        {entityLabel(name)}
-                      </Button>
-                    {/each}
-                  </div>
-                {/if}
+                <!-- Третьего способа выбрать технологию здесь нет: ряд быстрых кнопок
+                     дублировал бы списки корпуса. Ведём к ним. -->
+                <div class="row">
+                  <Button variant="quiet" size="sm" onclick={openCorpora}>Отметить технологии</Button>
+                  <Button variant="ghost" size="sm" href="/findings">Посмотреть находки</Button>
+                </div>
               {/snippet}
             </Empty>
           {:else if matrix}
             <Panel tone="sunk" class="cmp__band">
               <div class="panel__head">
-                <div>
-                  <p class="eyebrow"><Icon name="scale" size={16} /> вопрос сравнения</p>
-                  <p class="h4">{matrix.question}</p>
-                </div>
+                {#if questionEcho}
+                  <div>
+                    <p class="eyebrow"><Icon name="scale" size={16} /> вопрос сравнения</p>
+                    <p class="h4">{questionEcho}</p>
+                  </div>
+                {/if}
                 <p class="micro muted cmp__counts">
                   {countOf(matrix.rows.length, 'строка', 'строки', 'строк')} ·
                   {countOf(matrix.headers.length, 'измерение', 'измерения', 'измерений')}
@@ -744,7 +769,7 @@
                                 </p>
                                 {#if cell.evidence}<blockquote class="quote">{cell.evidence}</blockquote>{/if}
                               {:else}
-                                <span class="small muted">наблюдения нет</span>
+                                <span class="small muted">{COMPARE_CELL_LABELS.novalue}</span>
                               {/if}
                             </dd>
                           </div>
@@ -767,12 +792,12 @@
                 >
                   <table class="table cmp__table">
                     <caption class="cmp__caption">
-                      Сравнение {countOf(matrix.rows.length, 'объект', 'объекта', 'объектов')} по
+                      Сравнение {countOf(matrix.rows.length, 'технология', 'технологии', 'технологий')} по
                       {countOf(matrix.headers.length, 'измерению', 'измерениям', 'измерениям')}
                     </caption>
                     <thead>
                       <tr>
-                        <th scope="col">объект</th>
+                        <th scope="col">технология</th>
                         {#each matrix.headers as header (header)}
                           <th scope="col">{dimensionLabel(header)}</th>
                         {/each}
@@ -811,7 +836,7 @@
                                   {/if}
                                 </div>
                               {:else}
-                                <span class="small muted">наблюдения нет</span>
+                                <span class="small muted">{COMPARE_CELL_LABELS.novalue}</span>
                               {/if}
                             </td>
                           {/each}
@@ -825,34 +850,44 @@
 
             {#if declaredLimits.length}
               <Panel tone="sage">
-                <p class="small">
-                  Предел измеряется по самому наблюдению: если у наблюдения есть оператор
-                  «≤» или «≥», пределом считается его нормализованное число, если оператора
-                  нет — направление распознаётся по формулировке наблюдения («не выше»,
-                  «выше»). Это распознавание, а не поле корпуса: откуда взят каждый предел,
-                  подписано под меткой. «Вне предела» — значение вышло за распознанный предел
-                  того же свойства и единицы, «не сверено» — предела для измерения нет.
-                  Если у свойства в корпусе несколько разных пределов, сверка идёт по
-                  самому строгому: «не выше» — по меньшему числу, «не ниже» — по большему.
+                <p class="micro muted">
+                  Пределы, по которым сверяем значения. Как они распознаны и почему
+                  их может не быть — в «Как читать сравнение» под результатом.
                 </p>
                 <div class="cmp__limits">
                   {#each declaredLimits as [property, limit] (property)}
-                    <span class="tag">
+                    <!-- Откуда взят предел — подписью при самой метке: это
+                         распознавание из наблюдения, а не поле корпуса, и в строке
+                         оно только мешает читать число. -->
+                    <span class="tag" title={COMPARE_LIMIT_SOURCE[limit.from]}>
                       {dimensionLabel(property)} {OPERATOR_SYMBOL[limit.kind]}
                       <span class="num">{num(limit.at)}</span> {limit.unit}
-                      <span class="micro cmp__limit-from">
-                        {limit.from === 'operator' ? 'по оператору наблюдения' : 'по формулировке'}
-                      </span>
                     </span>
                   {/each}
                 </div>
               </Panel>
             {:else}
               <p class="micro muted cmp__nolimit">
-                Ни в одном наблюдении корпуса предел не распознаётся — ни оператором «≤»/«≥»,
-                ни формулировкой вида «не выше». Поэтому на этой таблице нет меток «в пределе»
-                и «вне предела»: строки помечены «нечего сверять», ячейки — «не сверено».
+                Ни в одном наблюдении предел не распознан, поэтому меток соответствия
+                здесь нет: строки помечены «нечего сверять», ячейки — «не сверено».
               </p>
+            {/if}
+
+            <!-- У сравнения есть конец: вывод по числам записывают в «Проверке
+                 решений», иначе сопоставление остаётся наблюдением без следа. -->
+            {#if matrix.rows.length > 0}
+              <Panel tone="lav">
+                <div class="cmp__close-row">
+                  <div class="stack">
+                    <h3 class="h4">Вывод по этим числам</h3>
+                    <p class="micro muted">
+                      Запишите его в «Проверке решений» — он попадёт в журнал отзывов
+                      вместе с вердиктом и комментарием.
+                    </p>
+                  </div>
+                  <Button href={feedbackHref} variant="action">Записать вывод</Button>
+                </div>
+              </Panel>
             {/if}
           {/if}
         </section>
@@ -862,16 +897,16 @@
              остаётся под условиями. Сам рельс ограничен высотой вьюпорта и
              прокручивается своей полосой (см. `.cmp__rail`). -->
         {#if !narrow}
-          <aside class="cmp__rail" aria-label="Списки корпуса" use:scrollRegion>
+          <aside id="cmp-corpora" class="cmp__rail" aria-label="Списки корпуса" use:scrollRegion>
             {@render corporaBlock()}
           </aside>
         {/if}
       </div>
 
       <!-- Узкий экран: списки корпуса — под результатом, чтобы условия и
-           матрица остались в первом вьюпорте. -->
+           сравнение остались в первом вьюпорте. -->
       {#if narrow}
-        <div class="acc cmp__corpora">
+        <div id="cmp-corpora" class="acc cmp__corpora">
           <button
             type="button"
             class="acc__head"
@@ -983,6 +1018,21 @@
     margin-bottom: var(--s4);
   }
 
+  /* Итог выбора в условиях сравнения: пустой отбор называется словами, а не
+     пустой коробкой с полем ввода — способа ввести вручную больше нет. */
+  .cmp__none {
+    margin: 0;
+  }
+
+  /* Закрывающий блок результата: заголовок, одна строка смысла и действие. */
+  .cmp__close-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+  }
+
   .cmp__picker {
     display: flex;
     align-items: center;
@@ -992,15 +1042,6 @@
     border: 1px solid var(--line);
     border-radius: var(--r-lg);
     background: var(--surface);
-  }
-
-  .cmp__draft {
-    flex: 1 1 180px;
-    min-width: 160px;
-    min-height: 44px;
-    border: 0;
-    background: var(--surface-sunk);
-    font-size: var(--t-small);
   }
 
   /* Метку сущности и измерения нажимают целиком: она же добавляет, она же
@@ -1015,16 +1056,6 @@
     min-height: 44px;
     line-height: var(--lh-dense);
     white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  /* Быстрые действия под пустым результатом — те же субъекты корпуса, но
-     обычными `.btn`: ряд переносится, а одно длинное имя (свободный текст
-     субъекта или сырой ключ без перевода) обязано переноситься внутри метки, а
-     не вылезать за центральный блок — иначе его резало бы краем `.empty`. */
-  .cmp__chips :global(.btn) {
-    min-width: 0;
-    max-width: 100%;
     overflow-wrap: anywhere;
   }
 
@@ -1212,12 +1243,6 @@
     margin-top: var(--s3);
   }
 
-  /* Откуда взят предел — подписью при самой метке: распознавание из
-     формулировки наблюдения, а не структурированное поле корпуса. */
-  .cmp__limit-from {
-    color: var(--ink-4);
-  }
-
   .cmp__nolimit {
     margin: 0;
     max-width: var(--maxw-measure);
@@ -1284,11 +1309,6 @@
   @media (max-width: 640px) {
     /* Мобильная композиция условий: поле ввода и кнопка в одну строку,
        панель без карточных полей — матрица начинается выше. */
-    .cmp__draft {
-      flex: 1 1 120px;
-      min-width: 0;
-    }
-
     .cmp__form-head :global(.btn) {
       flex: none;
     }

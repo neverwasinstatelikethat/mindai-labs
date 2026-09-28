@@ -9,6 +9,7 @@ GigaChat обслуживается цепочкой, упирающейся в 
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -16,12 +17,13 @@ import pytest
 from pydantic import ValidationError
 
 from scientific_tangle.config import Settings
-from scientific_tangle.domain.contracts import PlanningBundle
+from scientific_tangle.domain.contracts import IngestionBundle, PlanningBundle
 from scientific_tangle.services.agent_metrics import AgentMetricsRegistry
 from scientific_tangle.services.provider import (
     GigaChatProvider,
     ModelUnavailableError,
     _defect_summary,
+    _instance_shape,
 )
 
 ROOT_CERT = Path(__file__).resolve().parents[1] / "certs" / "russian-trusted-root-ca.crt"
@@ -100,9 +102,61 @@ def test_repair_hint_names_the_offending_fields() -> None:
 
     summary = _defect_summary(error.value.errors())
 
-    assert "intent: Field required" in summary
     assert "query_plan: Field required" in summary
     assert "action_plan: Field required" in summary
+
+
+def test_planning_survives_a_missing_intent() -> None:
+    """Без `intent` план принимается: поле — метаданное ответа, а не пропуск.
+
+    GigaChat дважды возвращал валидные query_plan и action_plan без классификации
+    назначения, и обязательность `intent` стоила новичку всего ответа.
+    """
+    bundle = PlanningBundle.model_validate(
+        {
+            "query_plan": {"question": "Какое извлечение меди даёт РЕАКОМ-М?"},
+            "action_plan": {
+                "rationale": "число берут из первоисточника, не из пересказа",
+                "actions": [
+                    {
+                        "id": "a1",
+                        "tool": "hybrid_search",
+                        "purpose": "найти число в источнике",
+                        "query": "РЕАКОМ-М извлечение меди",
+                    }
+                ],
+                "completion_criteria": ["есть цитата со страницей"],
+            },
+        }
+    )
+
+    assert bundle.intent is None
+
+
+def test_structured_prompt_shows_a_shape_not_a_schema() -> None:
+    """В промпте нет служебных слов схемы: модель пересказывает их в данные.
+
+    Живые прогоны GigaChat на PlanningBundle начинали ответ с `{"$defs": …}` и
+    подмешивали `"title": "Question", "type": "object"` внутрь экземпляра. Форма
+    ответа таких ключей не содержит — пересказывать нечего.
+    """
+    for schema in (PlanningBundle, IngestionBundle):
+        shape = _instance_shape(schema)
+        # Ключ `type` у данных есть (тип сущности), поэтому проверяются именно
+        # служебные формы: ключи схемы и значения-типы вместо плейсхолдеров.
+        for keyword in (
+            "$ref",
+            "$defs",
+            '"properties"',
+            '"required"',
+            '"enum"',
+            '"title"',
+            '"type": "object"',
+            '"type": "string"',
+            '"type": "array"',
+        ):
+            assert keyword not in shape, f"{schema.__name__}: {keyword}"
+        assert json.loads(shape), schema.__name__
 
 
 def test_repair_hint_is_capped_and_still_carries_paths() -> None:

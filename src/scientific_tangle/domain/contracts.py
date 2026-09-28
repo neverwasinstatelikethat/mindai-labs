@@ -200,7 +200,11 @@ class AgentActionPlan(BaseModel):
 
 
 class PlanningBundle(BaseModel):
-    intent: IntentClassification
+    # Назначение запроса — метаданное ответа, а не пропуск: ни маршрутизации, ни
+    # расчёта от него не зависит, и интерфейс умеет честить отсутствие. Живые прогоны
+    # GigaChat дважды вернули валидные query_plan и action_plan без `intent`, и
+    # обязательность этого поля стоила новичку всего ответа.
+    intent: IntentClassification | None = None
     query_plan: QueryPlan
     action_plan: AgentActionPlan
 

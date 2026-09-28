@@ -18,6 +18,8 @@
   import SectionHead from '$lib/ui/SectionHead.svelte';
   import { page } from '$app/state';
   import { session } from '$lib/sessionStore.svelte';
+  import { FAILURE_WORDS, RESEARCH_HEAD, RUN_FAILURES } from '$lib/terms';
+  import type { RunFailureKind } from '$lib/terms';
   import type { AgentEvent, AnswerPayload, CorpusStats } from '$lib/types';
 
   // Поток отдаёт шаг как есть; отсутствие поля — это отсутствие данных, а не
@@ -55,12 +57,18 @@
   }
 
   // Вопрос со входа в раздел (/research?q=…): читаем один раз при открытии
-  // экрана; лист подставляет его в поле и запускает проход сам.
+  // экрана; экран подставляет его в поле и запускает ответ сам.
   const seed = new URLSearchParams(page.url.search).get('q')?.trim() ?? '';
 
   let question = $state('');
   let answer = $state<AnswerPayload | null>(null);
   let running = $state(false);
+  // Новый вопрос не стирает прежний ответ: серверного перечня прошлых ответов
+  // нет — api.ts знает только query/stream, export по query_id и claimHistory.
+  // Молча потерять единственный собранный ответ значит потерять работу, поэтому
+  // прежний ответ сходит с экрана, только когда пришёл новый или когда человек
+  // убрал его сам кнопкой.
+  let delivered = false;
   let steps = $state<TrailStep[]>([]);
   let elapsedMs = $state(0);
   let failure = $state<RunFailure | null>(null);
@@ -101,7 +109,7 @@
     return message || fallback;
   }
 
-  // ── Проход: SSE поверх прокси /backend ───────────────────────────────────
+  // ── Сборка ответа: SSE поверх прокси /backend ────────────────────────────
 
   function stopTimer(): void {
     if (ticker) clearInterval(ticker);
@@ -109,6 +117,7 @@
   }
 
   function applyAnswer(payload: AnswerPayload): void {
+    delivered = true;
     answer = payload;
     question = payload.question;
     openClaimId = payload.findings[0]?.id ?? null;
@@ -121,15 +130,53 @@
   const OPS_DETAIL = /llm|gigachat|api[ _-]?key|эндпоинт|endpoint|backend|бэкенд|порт|docker|neo4j|elastic|in-memory|session|cookie|http\s?\d{3}|\b(4|5)\d{2}\b/i;
 
   function humanDetail(detail: string): string {
-    return OPS_DETAIL.test(detail) ? '' : detail.trim();
+    if (OPS_DETAIL.test(detail)) return '';
+    // Служебные имена процесса («рабочий процесс», «узел critic») читаются как
+    // журнал, а не как причина для аналитика: их меняет словарь показа.
+    return FAILURE_WORDS.reduce(
+      (value, [pattern, word]) => value.replace(pattern, word),
+      detail.trim(),
+    );
   }
 
-  // 429 приходит с телом: сколько прогонов идёт, каков предел и через сколько
-  // секунд попробовать. Числа показывает только те, что назвал сервис.
+  // 429 приходит с телом: сколько ответов собирается одновременно, каков предел
+  // и через сколько секунд попробовать. Числа показывает только те, что назвал
+  // сервис.
   interface Admission {
     active?: number;
     limit?: number;
     retryAfter?: number;
+  }
+
+  // Отказ собирает словарь `RUN_FAILURES`: шесть разных причин не должны
+  // звучать как одна («не дошёл» / «не отвечает» / «оборвался»). У каждой —
+  // своё название и свой следующий шаг, а не общий совет «повторите позже».
+  function failureOf(kind: RunFailureKind, asked: string, rawDetail = ''): RunFailure {
+    const text = RUN_FAILURES[kind];
+    const detail = humanDetail(rawDetail);
+    return {
+      label: text.label,
+      detail: detail ? `${text.detail} ${detail}` : text.detail,
+      recovery: text.recovery,
+      question: asked,
+      login: kind === 'expired',
+    };
+  }
+
+  // «LLM не настроен» (настройка сервиса), «модель занята» (отказ по лимиту
+  // запросов на её стороне) и «модель не ответила» (живой сбой провайдера)
+  // приходят одним 503 и одним кодом потока. Развести их нужно потому, что
+  // советы расходятся: без ключа повтор бесполезен, при лимите — помогает.
+  const MODEL_NOT_CONFIGURED = /не настроен|не задан|ключ|api[ _-]?key|not configured/i;
+  const MODEL_BUSY = /rate limit|too many requests|429|лимит запросов/i;
+
+  function modelFailure(rawDetail: string, asked: string): RunFailure {
+    const kind: RunFailureKind = MODEL_BUSY.test(rawDetail)
+      ? 'modelBusy'
+      : MODEL_NOT_CONFIGURED.test(rawDetail)
+        ? 'noModel'
+        : 'modelFailed';
+    return failureOf(kind, asked);
   }
 
   function failureFromResponse(
@@ -139,104 +186,44 @@
     asked: string,
     admission: Admission | null = null,
   ): RunFailure {
-    const detail = humanDetail(rawDetail);
-    if (unreachable) {
-      return {
-        label: 'Запрос не дошёл до сервиса',
-        detail: detail || 'Не удалось связаться с сервисом знаний.',
-        recovery: 'Проверьте соединение и повторите вопрос — набранный текст остаётся в поле.',
-        question: asked,
-      };
-    }
+    if (unreachable) return failureOf('unreachable', asked, rawDetail);
     if (status === 429) {
+      const text = RUN_FAILURES.busy;
       const busy =
         admission?.active != null && admission.limit != null
-          ? `Сейчас сервис ведёт ${admission.active} из ${admission.limit} прогонов.`
-          : 'Все прогоны заняты, и новый пока некуда поставить.';
+          ? `Сейчас сервис собирает ${admission.active} из ${admission.limit} возможных ответов.`
+          : text.detail;
       return {
-        label: 'Сервис занят: вопрос не начал обрабатываться',
+        label: text.label,
         detail: `${busy} Формулировка ни при чём — ничего менять не нужно.`,
         recovery:
           admission?.retryAfter != null
-            ? `Повторите примерно через ${admission.retryAfter} с: вопрос остаётся в поле.`
-            : 'Повторите через минуту: вопрос остаётся в поле.',
+            ? `Повторите примерно через ${admission.retryAfter} с: вопрос останется в поле.`
+            : text.recovery,
         question: asked,
       };
     }
-    if (status === 401) {
-      return {
-        label: 'Доступ истёк',
-        detail: detail || 'Вход был завершён или истёк, и запрос не запустился.',
-        recovery: 'Войдите заново и повторите вопрос.',
-        question: asked,
-        login: true,
-      };
-    }
-    if (status === 403) {
-      return {
-        label: 'Запрос недоступен',
-        detail: detail || 'Для этого аккаунта запрос к корпусу не разрешён.',
-        recovery:
-          'Находки корпуса и карта связей работают и без запроса: они собраны по уже извлечённым фактам.',
-        question: asked,
-      };
-    }
-    if (status === 503) {
-      return {
-        label: 'Сервис сейчас не отвечает',
-        detail: detail || 'Собирать ответ по этому запросу пока нечем.',
-        recovery: 'Повторите вопрос чуть позже или уточните формулировку.',
-        question: asked,
-      };
-    }
-    if (status === 422) {
-      return {
-        label: 'Вопрос не принят',
-        detail: detail || 'Формулировка не подошла: вопрос обязан быть не короче трёх символов.',
-        recovery: 'Уточните формулировку и повторите запрос.',
-        question: asked,
-      };
-    }
-    if (status >= 500) {
-      return {
-        label: 'Проход не завершился',
-        detail: detail || 'Рабочий процесс не дошёл до ответа.',
-        recovery: 'Повторите вопрос; если повтор снова даёт сбой — упростите формулировку.',
-        question: asked,
-      };
-    }
-    return {
-      label: 'Запрос отклонён',
-      detail: detail || 'Причину сервис не назвал.',
-      recovery: 'Проверьте формулировку вопроса и повторите запрос.',
-      question: asked,
-    };
+    if (status === 401) return failureOf('expired', asked, rawDetail);
+    if (status === 403) return failureOf('forbidden', asked, rawDetail);
+    // 503 на запросе — это ModelUnavailableError: модель не настроена либо она
+    // не ответила. Ни то, ни другое не значит «сервис вообще не отвечает».
+    if (status === 503) return modelFailure(rawDetail, asked);
+    if (status === 422) return failureOf('malformed', asked, rawDetail);
+    if (status >= 500) return failureOf('server', asked, rawDetail);
+    return failureOf('rejected', asked, rawDetail);
   }
 
   function failureFromStream(code: string | undefined, raw: string, asked: string): RunFailure {
-    const detail = humanDetail(raw);
-    if (code === 'model_unavailable') return failureFromResponse(503, raw, false, asked);
-    if (code === 'no_answer') {
-      return {
-        label: 'Ответ не пришёл',
-        detail: detail || 'Проход завершился без ответа.',
-        recovery: 'Уточните формулировку или повторите запрос: след прохода ниже показывает, где всё оборвалось.',
-        question: asked,
-      };
-    }
-    return {
-      label: 'Проход оборвался',
-      detail: detail || 'Рабочий процесс остановился на середине.',
-      recovery: 'Повторите запрос или упростите вопрос — лимиты видно в причине неполного ответа.',
-      question: asked,
-    };
+    if (code === 'model_unavailable') return modelFailure(raw, asked);
+    if (code === 'no_answer') return failureOf('noAnswer', asked, raw);
+    return failureOf('server', asked, raw);
   }
 
   async function run(asked: string): Promise<void> {
     if (running) return;
     question = asked;
     running = true;
-    answer = null;
+    delivered = false;
     steps = [];
     failure = null;
     notice = null;
@@ -279,12 +266,7 @@
         return;
       }
       if (!response.body) {
-        failure = {
-          label: 'Ответ не пришёл',
-          detail: 'Соединение открылось, но данных ответа не дало.',
-          recovery: 'Повторите запрос — набранный вопрос остаётся в поле.',
-          question: asked,
-        };
+        failure = failureOf('noBody', asked);
         return;
       }
 
@@ -318,29 +300,22 @@
         }
       }
 
-      if (!answer && !failure) {
-        failure = {
-          label: 'Ответ не пришёл',
-          detail: 'Шаги прохода были, а готового ответа — нет.',
-          recovery: 'Повторите запрос: возможно, исчерпан лимит одного вопроса. Тогда снимите часть условий.',
-          question: asked,
-        };
+      // Проверка по этому запросу: в `answer` мог лежать прежний ответ,
+      // который намеренно не стёрт.
+      if (!delivered && !failure) {
+        failure = failureOf('stepsNoAnswer', asked);
       }
     } catch (reason) {
+      // Остановка по кнопке и оборванное соединение — разные причины: одна
+      // говорит про действие человека, другая про канал, и совет у них свой.
       if (signal.aborted) {
         failure = {
-          label: 'Проход остановлен',
-          detail: `Вы остановили проход на ${seconds(elapsedMs)}: ответа в листе нет.`,
-          recovery: 'Повторите вопрос кнопкой ниже — незавершённый проход не сохраняется.',
+          ...RUN_FAILURES.stopped,
+          detail: `Вы остановили сборку ответа на ${seconds(elapsedMs)}: готового текста нет.`,
           question: asked,
         };
       } else {
-        failure = {
-          label: 'Сервис не отвечает',
-          detail: reasonText(reason, 'Не удалось связаться с сервисом знаний.'),
-          recovery: 'Проверьте соединение и повторите запрос.',
-          question: asked,
-        };
+        failure = failureOf('dropped', asked, reasonText(reason, ''));
       }
     } finally {
       stopTimer();
@@ -352,6 +327,19 @@
 
   function stop(): void {
     controller?.abort();
+  }
+
+  // Прежний ответ уходит с экрана только по явному действию человека: сервер не
+  // отдаёт список прошлых ответов, и second try чужой работы не вернёт.
+  function clearAnswer(): void {
+    answer = null;
+    question = '';
+    steps = [];
+    failure = null;
+    notice = null;
+    focusKey = null;
+    openClaimId = null;
+    elapsedMs = 0;
   }
 
   // ── Правки, отзывы, выгрузка, импорт, версии ────────────────────────────
@@ -382,7 +370,7 @@
       notice = {
         kind: 'ok',
         title: 'Правка принята',
-        detail: `Тезис получил${version != null ? ` версию ${version}` : ' новую версию'}; ${proposalLine}. Решение видно в разделе «Проверка решений» — правку не отменить отсюда.`,
+        detail: `Тезис получил${version != null ? ` версию ${version}` : ' новую версию'}; ${proposalLine}. Решение видно в разделе «Проверка решений» — отменить правку отсюда нельзя.`,
       };
       return true;
     } catch (reason) {
@@ -450,7 +438,7 @@
       notice = {
         kind: 'ok',
         title: 'Файл выгружен',
-        detail: `${filename} — ${num(Math.round(blob.size / 1024))} КиБ, тот же ответ, что на листе.`,
+        detail: `${filename} — ${num(Math.round(blob.size / 1024))} КиБ, тот же ответ, что на экране.`,
       };
       return true;
     } catch (reason) {
@@ -510,13 +498,13 @@
     }
   }
 
-  // ── Показания корпуса и эталонные вопросы при входе на экран ─────────────
+  // ── Показания корпуса и готовые вопросы при входе на экран ───────────────
 
   async function loadExamples(): Promise<void> {
     examplesState = 'loading';
     try {
       const gold = await api.goldCases();
-      // Три эталонных вопроса — подсказка, а не витрина: весь перечень остаётся
+      // Три готовых вопроса — подсказка, а не витрина: весь перечень остаётся
       // в разделе оценки.
       examples = gold.slice(0, 3).map((item) => item.question);
       examplesState = 'ready';
@@ -558,9 +546,9 @@
   <div class="wrap">
     <SectionHead
       level="1"
-      eyebrow="Рабочее пространство · запрос"
-      title="Проход по графу доказательств"
-      lead="Вопрос собирается в намерение, план, обход графа и ответ. Каждый тезис ответа остаётся привязан к цитате и локатору: страница, лист, диапазон ячеек, смещение символов."
+      eyebrow={RESEARCH_HEAD.eyebrow}
+      title={RESEARCH_HEAD.title}
+      lead={RESEARCH_HEAD.lead}
     />
 
     {#if !session.signedIn}
@@ -575,18 +563,18 @@
       </p>
     {:else if !canAsk}
       <div class="research__blocked">
-        <Notice tone="info" title="Запрос корпуса вам недоступен">
+        <Notice tone="info" title={RUN_FAILURES.forbidden.label}>
           <p>
-            Спрашивать граф доказательств может аккаунт с доступом к запросам. Находки корпуса и
-            карта связей работают и без него: они собраны по уже извлечённым фактам.
+            Спрашивать корпус может аккаунт с доступом к запросам. Находки корпуса и карта связей
+            работают и без него: они собраны по уже извлечённым фактам.
           </p>
         </Notice>
       </div>
     {/if}
   </div>
 
-  <!-- Рабочий лист и композер занимают всю ширину: читается мера колонки,
-       а не поля вокруг неё. -->
+  <!-- Ответ и композер занимают всю ширину: читается мера колонки, а не поля
+       вокруг неё. -->
   <div class="wrap wrap--bleed">
     <ChatPanel
       {answer}
@@ -605,6 +593,7 @@
       {notice}
       {seed}
       onask={(value) => void run(value)}
+      onclear={clearAnswer}
       onstop={stop}
       onselect={(id) => (openClaimId = id)}
       onfocus={(key) => (focusKey = key)}

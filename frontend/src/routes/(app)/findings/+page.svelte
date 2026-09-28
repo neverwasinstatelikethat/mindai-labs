@@ -3,10 +3,13 @@
   import { page } from '$app/state';
   import { tick } from 'svelte';
   import { ApiError, api } from '$lib/api';
+  import { navLabel } from '$lib/nav';
   import { countOf, num, pct, plural } from '$lib/format';
   import { observeReveals } from '$lib/reveal';
   import { session } from '$lib/sessionStore.svelte';
   import {
+    FINDINGS_ACTION,
+    FINDINGS_SCALE_SPREAD,
     OPERATOR_SYMBOL,
     PREDICATE_LABELS,
     PROPERTY_LABELS,
@@ -14,7 +17,7 @@
     STATUS_SUPERSEDED,
     SUBJECT_LABELS,
     describeScope,
-    knownTerm,
+    scaleNoteFor,
     termOf,
   } from '$lib/terms';
   import {
@@ -38,7 +41,7 @@
   import Sheet from '$lib/ui/Sheet.svelte';
   import StatusPill from '$lib/ui/StatusPill.svelte';
 
-  // ── Терминология среза ────────────────────────────────────────────────────
+  // ── Находки: отбор, список, импорт
   const PAGE_SIZE = 25;
 
   const STATUS_ORDER: FindingApiStatus[] = ['consensus', 'disputed', 'hypothesis'];
@@ -126,8 +129,8 @@
     return STATUS_SHORT[value];
   }
 
-  // Имя ключа онтологии для интерфейса: русское название, а служебный ключ —
-  // только подписью рядом с ним (`hasHumanName` отличает перевод от ключа).
+  // Имя ключа онтологии для интерфейса: русское название. Служебный ключ на
+  // экран не выходит — он в подсказке наведения или в «Служебных данных».
   function subjectName(key: string | null | undefined): string {
     return termOf(SUBJECT_LABELS, key);
   }
@@ -140,8 +143,14 @@
     return termOf(PROPERTY_LABELS, key);
   }
 
-  function hasHumanName(map: Record<string, string>, key: string | null | undefined): boolean {
-    return knownTerm(map, key) !== null;
+  // Служебное имя ключа остаётся подписью при русском названии: наведение или
+  // блок «Служебные данные», но не заголовок строки.
+  function propHint(key: string): string {
+    return `служебное имя показателя: ${key}`;
+  }
+
+  function docHint(id: string): string {
+    return `код документа: ${id}`;
   }
 
   function bandClass(status: FindingApiStatus): string {
@@ -181,8 +190,8 @@
     return '';
   });
 
-  // Указатель несёт несрезанный корпус: фасеты и рельс субъектов считаются по
-  // нему, поэтому фильтр не оставляет себя же без вариантов выбора.
+  // Полный список несёт весь корпус: фасеты и список субъектов считаются по
+  // нему, поэтому отбор не оставляет себя же без вариантов выбора.
   let index = $state<FindingListItem[]>([]);
   let rows = $state<FindingListItem[]>([]);
   let subjectDraft = $state('');
@@ -193,9 +202,16 @@
   let querying = $state(false);
   let failure = $state<Failure | null>(null);
   let shown = $state(PAGE_SIZE);
-  let density = $state<'full' | 'compact'>('full');
+  let filtersOpen = $state(false);
   let active = $state<string | null>(null);
   let histories = $state<Record<string, HistoryState>>({});
+
+  // Глубокая ссылка (`?document=` / `?claim=`) — единственный способ попасть на
+  // этот экран из ответа или с карты. Документ сервер не фильтрует, поэтому отбор
+  // по нему клиентский и живёт рядом с применёнными условиями.
+  let appliedDocument = $state('');
+  let linkNote = $state('');
+  let linkHandled = false;
 
   let importOpen = $state(false);
   let uploading = $state(false);
@@ -226,8 +242,8 @@
     });
   });
 
-  // Шкала свойства строится по нормализованным значениям всего указателя:
-  // ни один предел не берётся из головы, границы — реальные min/max корпуса.
+  // Шкала свойства строится по всем значениям корпуса: ни один предел не берётся
+  // из головы, границы — реальные min/max найденных чисел.
   const scales = $derived.by(() => {
     const map = new Map<string, Scale>();
     for (const finding of index) {
@@ -247,18 +263,37 @@
     return map;
   });
 
-  const visible = $derived(rows.slice(0, shown));
-  const filtered = $derived(Boolean(appliedSubject || appliedStatus));
+  const listed = $derived(
+    appliedDocument
+      ? rows.filter((finding) =>
+          finding.evidence.some((ev) => ev.document_id === appliedDocument),
+        )
+      : rows,
+  );
+
+  // Название источника для подписи фильтра берётся из самого доказательства,
+  // а не из адреса: в URL лежит служебный код, который показывать нечего.
+  const documentName = $derived.by(() => {
+    if (!appliedDocument) return '';
+    for (const source of [...rows, ...index]) {
+      const ev = source.evidence.find((e) => e.document_id === appliedDocument);
+      if (ev?.source_title) return ev.source_title;
+    }
+    return 'источник из адреса';
+  });
+
+  const visible = $derived(listed.slice(0, shown));
+  const filtered = $derived(Boolean(appliedSubject || appliedStatus || appliedDocument));
   const activeFinding = $derived(rows.find((finding) => finding.id === active) ?? null);
 
-  // Отказ опроса — состояние колонки, а не «пустой срез»: строка состояния обязана
-  // называть его, иначе сбой читается как законный пустой результат.
-  const sliceFailed = $derived(Boolean(failure) && !querying && phase === 'ready');
-  const sliceNote = $derived.by(() => {
-    if (querying) return 'опрос корпуса';
-    if (phase === 'loading') return 'читаем указатель…';
-    if (phase === 'failed' || failure) return 'срез не получен';
-    return `${countOf(rows.length, 'запись', 'записи', 'записей')} в срезе · ${index.length} в указателе`;
+  // Отказ опроса — состояние списка, а не «пустой результат»: строка состояния
+  // обязана называть его, иначе сбой читается как законная пустота.
+  const listFailed = $derived(Boolean(failure) && !querying && phase === 'ready');
+  const listNote = $derived.by(() => {
+    if (querying) return 'идёт отбор по корпусу';
+    if (phase === 'loading') return 'читаем находки…';
+    if (phase === 'failed' || failure) return 'находки не пришли';
+    return `${countOf(listed.length, 'находка', 'находки', 'находок')} · всего в корпусе ${index.length}`;
   });
 
   // Разбивка по классам консенсуса вместо декоративных точек: числа настоящие,
@@ -270,11 +305,12 @@
     }));
   }
 
-  // Текущий отбор одной строкой: её показывают и пустой срез, и отказ опроса.
+  // Текущий отбор одной строкой: её показывают и пустой список, и отказ опроса.
   const appliedEcho = $derived.by(() => {
     const parts: string[] = [];
     if (appliedSubject) parts.push(`субъект «${subjectName(appliedSubject)}»`);
     if (appliedStatus) parts.push(`класс «${STATUS_SHORT[appliedStatus]}»`);
+    if (appliedDocument) parts.push(`источник «${documentName}»`);
     return parts.join(' · ') || 'без отбора';
   });
 
@@ -290,9 +326,9 @@
 
     const values = normValues(obs);
     if (!scale || scale.max <= scale.min || values.length === 0) {
-      const note = !scale
-        ? 'Нормализованного значения нет — шкала не строится.'
-        : `Свойство «${propertyName(obs.property_name)}» имеет одно нормализованное значение во всём указателе — сравнивать пределы не с чем.`;
+      // Полосы нет, и экран называет причину: нет приведённого числа либо оно
+      // встречалось в корпусе одно.
+      const note = scaleNoteFor(propertyName(obs.property_name), Boolean(scale));
       return { raw, scale, band: null, limits: [], note };
     }
 
@@ -342,20 +378,78 @@
     }
   }
 
-  // Раскрытие интервала — это шторка с полным трассированием; при первом
-  // открытии цепочка версий запрашивается сразу, как это делал аккордеон.
-  function openInterval(id: string): void {
+  // «Открыть источник» — шторка с полным трассированием; при первом открытии
+  // цепочку версий запрашивают сразу, не заставляя искать её отдельной кнопкой.
+  // Открытие шторки снимает напоминание о ссылке: экран уже показал, что просили.
+  function openSource(id: string): void {
     active = id;
+    linkNote = '';
     if (!histories[id]) void loadHistory(id);
   }
 
-  function closeInterval(): void {
+  function closeSource(): void {
     active = null;
   }
 
+  // Находки стоят выше отбора и импорта: после применения условия или открытия
+  // формы возвращаем чтение к нужному блоку, иначе действие уводит вниз.
+  async function revealNode(selector: string): Promise<void> {
+    if (!browser) return;
+    await tick();
+    document.querySelector(selector)?.scrollIntoView({ block: 'start' });
+  }
+
+  function toggleFilters(): void {
+    filtersOpen = !filtersOpen;
+    if (filtersOpen) void revealNode('.findings__filters');
+  }
+
+  // Импорт больше не спорит с главным действием экрана в шапке: он открывается
+  // кнопкой — из пустого корпуса или из спокойной строки под списком.
+  function toggleImport(): void {
+    importOpen = !importOpen;
+    if (importOpen) void revealNode('.findings__import');
+  }
+
+  // Ссылка раскрывается только после прочтения списка: до ответа сервера нечего
+  // открывать и нечем фильтровать. Одна попытка на заход — повторное чтение
+  // находок после импорта не должно возвращать снятый отбор.
+  function applyDeepLink(): void {
+    if (linkHandled) return;
+    linkHandled = true;
+    const params = page.url.searchParams;
+    const document = params.get('document')?.trim() ?? '';
+    const claim = params.get('claim')?.trim() ?? '';
+    if (document) appliedDocument = document;
+    if (!claim) return;
+    if (index.some((finding) => finding.id === claim)) {
+      openSource(claim);
+    } else {
+      // Ссылка из устаревшего ответа либо из закрытого класса доступа: причина
+      // называется словами, а не молчаливой пустотой.
+      linkNote =
+        'Утверждение из ссылки не читается: возможно, его заменили новой версией или оно закрыто вашим доступом. Ниже — находки корпуса, где тот же факт ищется по субъекту.';
+    }
+  }
+
+  // После прочтения ссылки адрес перестаёт быть источником истины: сняли отбор —
+  // параметр уходит из строки, иначе обновлённая страница вернула бы убранное.
+  function dropLinkParams(): void {
+    if (!browser) return;
+    const url = new URL(page.url);
+    url.searchParams.delete('document');
+    url.searchParams.delete('claim');
+    window.history.replaceState(window.history.state, '', url);
+  }
+
+  function clearDocument(): void {
+    appliedDocument = '';
+    dropLinkParams();
+  }
+
   // Приёмка документа не должна стирать отбор аналитика: при preserveFilters
-  // черновики, применённые условия и глубина среза выживают, а строки
-  // перечитываются по прежним условиям — срез остаётся срезом.
+  // черновики, применённые условия и глубина показа выживают, а находки
+  // перечитываются по прежним условиям.
   async function loadIndex(preserveFilters = false): Promise<void> {
     phase = 'loading';
     failure = null;
@@ -375,6 +469,7 @@
       }
       active = null;
       phase = 'ready';
+      applyDeepLink();
     } catch (reason) {
       failure = classify(reason);
       phase = 'failed';
@@ -393,18 +488,20 @@
       phase = 'ready';
     } catch (reason) {
       // Строки прежнего отбора не остаются на экране под новым фильтром: их нет
-      // в ответе. Отказ владеет колонкой, а не превращается в «срез пуст».
+      // в ответе. Отказ владеет списком, а не превращается в «пусто».
       rows = [];
       failure = classify(reason);
       phase = index.length > 0 ? 'ready' : 'failed';
     } finally {
       querying = false;
+      filtersOpen = false;
+      await revealNode('.findings__list');
     }
   }
 
   // Повтор ровно тех же условий, а не «перечитать всё»: намерение аналитика
   // сохраняется.
-  function retrySlice(): void {
+  function retryList(): void {
     void runQuery(appliedSubject, appliedStatus);
   }
 
@@ -416,12 +513,20 @@
   function resetAll(): void {
     subjectDraft = '';
     statusDraft = '';
+    appliedDocument = '';
+    linkNote = '';
+    dropLinkParams();
     void runQuery('', '');
   }
 
   function clearStatus(): void {
     statusDraft = '';
     void runQuery(appliedSubject, '');
+  }
+
+  function clearSubject(): void {
+    subjectDraft = '';
+    void runQuery('', appliedStatus);
   }
 
   function pickFacet(value: FindingApiStatus): void {
@@ -443,7 +548,7 @@
     uploads = uploads.filter((item) => item.key !== key);
   }
 
-  // multipart-загрузка по одному файлу: у каждого — своя приёмка, поэтому
+  // multipart-загрузка по одному файлу: у каждого — свой ответ сервера, поэтому
   // частичный успех пачки виден как частичный успех, а не как «импорт упал».
   async function ingest(files: File[]): Promise<void> {
     if (files.length === 0) return;
@@ -486,7 +591,7 @@
     void ingest(Array.from(event.dataTransfer?.files ?? []));
   }
 
-  // Право и сам факт входа приходят с сервера: до /auth/me указатель не
+  // Право и сам факт входа приходят с сервера: до /auth/me находки не
   // запрашиваем, иначе экран показал бы «пусто» там, где ещё нет сессии.
   $effect(() => {
     const state = session.state;
@@ -506,7 +611,8 @@
   // reveal-наблюдателе: без повторного скана они остались бы невидимыми.
   $effect(() => {
     void phase;
-    void density;
+    void filtersOpen;
+    void importOpen;
     void blocked;
     if (browser) void tick().then(() => observeReveals());
   });
@@ -516,7 +622,7 @@
   <title>Находки корпуса — Научный Клубок</title>
   <meta
     name="description"
-    content="Интервальный указатель утверждений корпуса: числовые наблюдения с пределами, доказательства до страницы, листа и диапазона ячеек, версии утверждений."
+    content="Числа из документов корпуса: находка с доказательством до страницы, листа или диапазона ячеек, условиями применения и версиями утверждения."
   />
 </svelte:head>
 
@@ -524,24 +630,25 @@
   <div class="wrap">
     <SectionHead
       level="1"
-      eyebrow="Корпус · утверждения · доказательства"
+      eyebrow="Корпус · находки"
       title="Находки корпуса"
-      lead="Утверждение — интервал с кодом источника, условием применения и доказательством до страницы, листа и диапазона ячеек."
+      lead="Найдите число в документе и откройте его источник: цитату со страницей, листом или диапазоном ячеек."
     >
-      <div class="findings__head">
-        <p class="micro findings__count" role="status" aria-live="polite">{sliceNote}</p>
-        {#if canRead}
-          <Button
-            size="sm"
-            icon="upload"
-            expanded={importOpen}
-            onclick={() => (importOpen = !importOpen)}
-          >
-            {importOpen ? 'Свернуть импорт' : 'Пополнить корпус'}
-          </Button>
-        {/if}
-      </div>
+      <p class="micro findings__count" role="status" aria-live="polite">{listNote}</p>
     </SectionHead>
+
+    {#if linkNote}
+      <!-- Глубокая ссылка не доехала до утверждения: об этом говорится сразу,
+           а не оставляется пользователю догадываться по пустому экрану. -->
+      <Panel class="findings__state">
+        <Notice tone="warn" title="Ссылка ведёт на недоступное утверждение">
+          {linkNote}
+          <div class="row">
+            <Button variant="quiet" size="sm" onclick={() => (linkNote = '')}>Понятно, смотреть находки</Button>
+          </div>
+        </Notice>
+      </Panel>
+    {/if}
 
     {#if importOpen}
       <Panel tone="sunk" class="findings__import">
@@ -549,10 +656,7 @@
           <div class="panel__head">
             <div class="grow">
               <h2 class="h4">Новый источник</h2>
-              <p class="micro">
-                Файл проходит извлечение, нормализацию чисел и разметку утверждений; указатель
-                обновляется сразу после приёма.
-              </p>
+              <p class="micro">Пришлите документ — его находки появятся в этом же списке.</p>
             </div>
           </div>
 
@@ -577,17 +681,14 @@
             />
             <label class="dropzone__face" for="findings-file">
               <strong class="h4">
-                {uploading ? 'Обрабатываем документы…' : 'Выбрать файлы корпуса или перетащить сюда'}
+                {uploading ? 'Загружаем документы в корпус…' : 'Выбрать файлы корпуса или перетащить сюда'}
               </strong>
               <span class="micro code">{ACCEPT_NOTE}</span>
-              <span class="micro">
-                Каждый файл — отдельная приёмка: очередь, обработка, результат или причина отказа.
-              </span>
             </label>
           </div>
 
           {#if uploads.length > 0}
-            <ul class="uploads" aria-label="Приёмки загрузки">
+            <ul class="uploads" aria-label="Загруженные документы">
               {#each uploads as item (item.key)}
                 <li class="upload" data-state={item.state}>
                   <span class="upload__mark" aria-hidden="true">
@@ -607,20 +708,26 @@
                     {#if item.state === 'queued'}
                       <p class="micro">В очереди — ждёт своей загрузки.</p>
                     {:else if item.state === 'uploading'}
-                      <p class="micro">Читаем файл и размечаем утверждения…</p>
+                      <p class="micro">Отправляем документ в корпус…</p>
                     {:else if item.receipt}
                       <p class="micro upload__ok">
                         {item.receipt.status === 'duplicate'
                           ? 'Дубликат: документ уже в корпусе'
                           : 'Документ принят'}
-                        · <span class="micro muted">код документа</span>
-                        <code class="tech">{item.receipt.document_id}</code> · извлечено{' '}
+                        · извлечено{' '}
                         {countOf(item.receipt.extracted_claims, 'утверждение', 'утверждения', 'утверждений')}
-                        · контрольная сумма
-                        <code class="code">{item.receipt.checksum}</code>
                       </p>
+                      <details class="svc">
+                        <summary class="micro">Служебные данные</summary>
+                        <p class="micro svc__row">
+                          код документа <code class="code">{item.receipt.document_id}</code>
+                        </p>
+                        <p class="micro svc__row">
+                          контрольная сумма <code class="code">{item.receipt.checksum}</code>
+                        </p>
+                      </details>
                       {#if item.receipt.prompt_truncated}
-                        <!-- Хвост документа за бюджетом промпта — не «в корпусе
+                        <!-- Хвост документа за бюджетом разбора — не «в корпусе
                              такого нет»: число утверждений из неполного разбора
                              обязано быть помечено. -->
                         <p class="micro">
@@ -642,7 +749,7 @@
                     {/if}
                   </div>
                   <Button variant="link" onclick={() => dismissUpload(item.key)}>
-                    Скрыть приёмку
+                    Убрать из списка
                   </Button>
                 </li>
               {/each}
@@ -677,7 +784,7 @@
         >
           {#snippet action()}
             <div class="row">
-              <Button href="/dashboard" variant="quiet">Панель состояния</Button>
+              <Button href="/dashboard" variant="quiet">{navLabel('/dashboard')}</Button>
               <Button href="/account" variant="link">Что открыто моему аккаунту</Button>
             </div>
           {/snippet}
@@ -687,7 +794,7 @@
       <Panel class="findings__state">
         <div class="row" role="status">
           <span class="spinner"></span>
-          <p class="small">Читаем указатель корпуса…</p>
+          <p class="small">Читаем находки корпуса…</p>
         </div>
         <div class="stack" style="--gap: var(--s3)">
           {#each [0, 1, 2, 3] as line (line)}
@@ -707,313 +814,306 @@
         {:else}
           <div class="row">
             <Button variant="action" onclick={() => void loadIndex()}>Запросить заново</Button>
-            <Button href="/dashboard" variant="quiet">Панель состояния</Button>
+            <Button href="/dashboard" variant="quiet">{navLabel('/dashboard')}</Button>
           </div>
         {/if}
       </Panel>
     {:else}
-      <Panel raised class="reveal findings__filters">
-        <form class="filters" onsubmit={submitFilters}>
-          <div class="filters__grid">
-            <Field
-              label="Субъект · подстрока"
-              name="subject"
-              type="search"
-              placeholder="напр. обратный осмос"
-              hint="Подстроку сверяем с именем субъекта в корпусе; готовые субъекты — в списке «Субъекты указателя», там же служебное имя."
-              bind:value={subjectDraft}
-            />
-
-            <Select
-              label="Класс консенсуса"
-              name="status"
-              hint="Согласуется, оспаривается или гипотеза."
-              bind:value={statusDraft}
-              options={STATUS_OPTIONS}
-            />
-
-            <div class="field">
-              <span class="field__label" id="f-density">Отбор строки</span>
-              <div class="seg" role="group" aria-labelledby="f-density">
-                <button
-                  class="seg__item"
-                  type="button"
-                  aria-pressed={density === 'full'}
-                  onclick={() => (density = 'full')}
-                >
-                  Полный
-                </button>
-                <button
-                  class="seg__item"
-                  type="button"
-                  aria-pressed={density === 'compact'}
-                  onclick={() => (density = 'compact')}
-                >
-                  Компактный
-                </button>
-              </div>
-              <p class="field__hint">Как показывать срез; содержимое то же.</p>
-            </div>
+      <!-- Порядок один для всех состояний: сначала находки, под ними применённый
+           отбор и список субъектов. Панель фильтров над списком мешала увидеть
+           результат раньше, чем его выставили. -->
+      {#if querying}
+        <Panel class="findings__state">
+          <div class="row" role="status">
+            <span class="spinner"></span>
+            <p class="small">Ищем находки по отбору…</p>
           </div>
-
-          <div class="filters__go">
-            <Button type="submit" variant="action" busy={querying}>
-              {querying ? 'Опрос корпуса…' : 'Показать срез'}
-            </Button>
-            <Button variant="quiet" onclick={resetAll} disabled={querying || !filtered}>
-              Сбросить фильтры
-            </Button>
-            <p class="micro muted">
-              {#if filtered}
-                срез: {#if appliedSubject}
-                  «{subjectName(appliedSubject)}»
-                  {#if hasHumanName(SUBJECT_LABELS, appliedSubject)}
-                    <code class="code">{appliedSubject}</code>
-                  {/if}
-                {:else}
-                  без субъекта
-                {/if}
-                {#if appliedStatus} · {STATUS_SHORT[appliedStatus]}{/if}
-              {:else}
-                без отбора — весь указатель
-              {/if}
-            </p>
-          </div>
-
-          <div class="filters__facets">
-            {#each facets as facet (facet.key)}
-              <Chip
-                pressed={appliedStatus === facet.key}
-                disabled={querying}
-                onclick={() => pickFacet(facet.key)}
-              >
-                {facet.label} · <span class="num">{facet.count}</span>
-              </Chip>
+          <div class="stack" style="--gap: var(--s3)">
+            {#each [0, 1, 2] as line (line)}
+              <span class="skeleton findings__skel"></span>
             {/each}
-            <Chip pressed={!appliedStatus} disabled={querying || !appliedStatus} onclick={clearStatus}>
-              любой класс · <span class="num">{index.length}</span>
-            </Chip>
           </div>
-        </form>
-      </Panel>
-
-      <div class="split findings__split">
-        <div class="findings__main stack" style="--gap: var(--s4)">
-          {#if querying}
-            <Panel class="findings__state">
-              <div class="row" role="status">
-                <span class="spinner"></span>
-                <p class="small">Опрашиваем корпус по фильтру…</p>
-              </div>
-              <div class="stack" style="--gap: var(--s3)">
-                {#each [0, 1, 2] as line (line)}
-                  <span class="skeleton findings__skel"></span>
-                {/each}
-              </div>
-            </Panel>
-          {:else if sliceFailed}
-            <!-- Отказ владеет колонкой: под ним нет ни таблицы, ни «пустого среза»,
-                 иначе сбой прочитался бы как законный пустой результат. -->
-            <Panel class="findings__state">
-              <Notice tone="error" title="Срез не получен">{guidanceOf(failure)}</Notice>
-              {#if appliedSubject || appliedStatus}
-                <p class="micro muted">Отбор: {appliedEcho}.</p>
-              {/if}
-              {#if failure?.kind === 'session'}
-                <!-- Повтор опроса с неподтверждённым входом даст тот же отказ:
-                     двигает решение только повторный вход. -->
-                <div class="row">
-                  <Button href={LOGIN_HREF} variant="action">Войти заново</Button>
-                </div>
-              {:else if failure?.kind === 'forbidden'}
-                <!-- Повтор отказа по доступу даёт тот же отказ: здесь только то,
-                     что действительно двигает решение. -->
-                <div class="row">
-                  <Button href="/account" variant="quiet">Что открыто моему аккаунту</Button>
-                  <Button href="/dashboard" variant="ghost">Панель состояния</Button>
-                </div>
-              {:else}
-                <div class="row">
-                  <Button variant="action" onclick={retrySlice}>Повторить опрос</Button>
-                  {#if filtered}
-                    <Button variant="quiet" onclick={resetAll}>Снять отбор</Button>
-                  {/if}
-                  <Button variant="ghost" onclick={() => void loadIndex()}>Перечитать указатель</Button>
-                </div>
-              {/if}
-            </Panel>
-          {:else if rows.length === 0}
-            <Empty
-              icon="layers"
-              title={filtered ? 'Срез пуст' : 'Указатель пуст'}
-              body={filtered
-                ? `Ни одно утверждение корпуса не подходит под отбор (${appliedEcho}). Подстроку сверяем с именем субъекта в корпусе: снимите отбор или выберите субъект из списка.`
-                : 'Здесь появятся утверждения из документов: загрузите документ — и указатель наполнится сам.'}
-            >
-              {#snippet action()}
-                <div class="row">
-                  {#if filtered}
-                    <Button variant="action" onclick={resetAll}>Сбросить фильтры</Button>
-                  {/if}
-                  <Button variant="quiet" onclick={() => void loadIndex()}>Перечитать указатель</Button>
-                  <Button href="/research" variant="link">Задать вопрос корпусу</Button>
-                </div>
-              {/snippet}
-            </Empty>
-          {:else if density === 'compact'}
-            <div class="table-wrap">
-              <table class="table">
-                <caption class="findings__caption">
-                  Компактный срез: показано{' '}
-                  {countOf(visible.length, 'запись', 'записи', 'записей')} из {rows.length}
-                </caption>
-                <thead>
-                  <tr>
-                    <th>Утверждение</th>
-                    <th>Субъект</th>
-                    <th>Версия</th>
-                    <th>Класс консенсуса</th>
-                    <th>Класс данных</th>
-                    <th>Доказательств</th>
-                    <th>Наблюдений</th>
-                    <th>Интервал</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {#each visible as finding (finding.id)}
-                    <tr>
-                      <td class="findings__cell-statement">{finding.statement}</td>
-                      <td>{finding.subject ? subjectName(finding.subject) : 'субъект не размечен'}</td>
-                      <td class="num">{finding.version}</td>
-                      <td><StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} /></td>
-                      <td><span class="tag">{DATA_CLASS_LABELS[finding.data_class]}</span></td>
-                      <td class="num">{finding.evidence.length}</td>
-                      <td class="num">{finding.observations.length}</td>
-                      <td>
-                        <Button size="sm" variant="quiet" onclick={() => openInterval(finding.id)}>
-                          Раскрыть
-                        </Button>
-                      </td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
+        </Panel>
+      {:else if listFailed}
+        <!-- Отказ владеет списком: под ним нет ни карточек, ни «пусто», иначе
+             сбой прочитался бы как законный пустой результат. -->
+        <Panel class="findings__state">
+          <Notice tone="error" title="Находки не пришли">{guidanceOf(failure)}</Notice>
+          {#if filtered}
+            <p class="micro muted">Отбор: {appliedEcho}.</p>
+          {/if}
+          {#if failure?.kind === 'session'}
+            <!-- Повтор опроса с неподтверждённым входом даст тот же отказ:
+                 двигает решение только повторный вход. -->
+            <div class="row">
+              <Button href={LOGIN_HREF} variant="action">Войти заново</Button>
+            </div>
+          {:else if failure?.kind === 'forbidden'}
+            <!-- Повтор отказа по доступу даёт тот же отказ: здесь только то,
+                 что действительно двигает решение. -->
+            <div class="row">
+              <Button href="/account" variant="quiet">Что открыто моему аккаунту</Button>
+              <Button href="/dashboard" variant="ghost">{navLabel('/dashboard')}</Button>
             </div>
           {:else}
-            <div class="stack" style="--gap: var(--s4)">
-              {#each visible as finding (finding.id)}
-                <article class="card-note finding">
-                  <p class="micro finding__spo">
-                    {#if finding.subject || finding.predicate}
-                      <b>{finding.subject ? subjectName(finding.subject) : 'субъект не размечен'}</b>
-                      {#if finding.predicate}
-                        <span aria-hidden="true"> › </span><b>{predicateName(finding.predicate)}</b>
-                      {/if}
-                      <span aria-hidden="true"> · </span>
+            <div class="row">
+              <Button variant="action" onclick={retryList}>Повторить опрос</Button>
+              {#if filtered}
+                <Button variant="quiet" onclick={resetAll}>Снять отбор</Button>
+              {/if}
+              <Button variant="ghost" onclick={() => void loadIndex()}>{FINDINGS_ACTION.readAgain}</Button>
+            </div>
+          {/if}
+        </Panel>
+      {:else}
+        {#if listed.length > 0}
+          <div class="stack findings__list" style="--gap: var(--s4)">
+            {#each visible as finding (finding.id)}
+              <article
+                class="card-note finding"
+                title={finding.subject ? `служебное имя субъекта: ${finding.subject}` : undefined}
+              >
+                <p class="micro finding__spo">
+                  {#if finding.subject || finding.predicate}
+                    <b>{finding.subject ? subjectName(finding.subject) : 'субъект не размечен'}</b>
+                    {#if finding.predicate}
+                      <span aria-hidden="true"> › </span><b>{predicateName(finding.predicate)}</b>
                     {/if}
-                    версия <b class="num">{finding.version}</b>
+                    <span aria-hidden="true"> · </span>
+                  {/if}
+                  версия <b class="num">{finding.version}</b>
+                </p>
+                <h3 class="h4 finding__statement">{finding.statement}</h3>
+                <div class="finding__tags">
+                  <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
+                  <span class="tag">класс данных: {DATA_CLASS_LABELS[finding.data_class]}</span>
+                  <span class="micro">уверенность извлечения <span class="num">{pct(finding.confidence)}</span></span>
+                  <span class="micro">{countOf(finding.evidence.length, 'доказательство', 'доказательства', 'доказательств')}</span>
+                  <span class="micro">{countOf(finding.observations.length, 'наблюдение', 'наблюдения', 'наблюдений')}</span>
+                </div>
+                <div class="finding__foot">
+                  <p class="micro muted">
+                    {#if active === finding.id}
+                      открыто: источник и версии этого утверждения
+                    {:else if finding.evidence.length > 0}
+                      трассируется до источников:
+                      {countOf(finding.evidence.length, 'доказательство', 'доказательства', 'доказательств')}
+                    {:else}
+                      доказательств нет — как факт утверждение не считается
+                    {/if}
                   </p>
-                  <h3 class="h4 finding__statement">{finding.statement}</h3>
-                  <div class="finding__tags">
-                    <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
-                    <span class="tag">класс данных: {DATA_CLASS_LABELS[finding.data_class]}</span>
-                    <span class="micro">уверенность извлечения <span class="num">{pct(finding.confidence)}</span></span>
-                    <span class="micro">{countOf(finding.evidence.length, 'доказательство', 'доказательства', 'доказательств')}</span>
-                    <span class="micro">{countOf(finding.observations.length, 'наблюдение', 'наблюдения', 'наблюдений')}</span>
-                  </div>
-                  <div class="finding__foot">
-                    <p class="micro muted">
-                      {#if active === finding.id}
-                        интервал открыт в шторке
-                      {:else if finding.evidence.length > 0}
-                        трассируется до источников:
-                        {countOf(finding.evidence.length, 'доказательство', 'доказательства', 'доказательств')}
-                      {:else}
-                        доказательств нет — как факт утверждение не считается
-                      {/if}
-                    </p>
-                    <Button size="sm" variant="quiet" icon="quote" onclick={() => openInterval(finding.id)}>
-                      Раскрыть интервал
-                    </Button>
-                  </div>
-                </article>
-              {/each}
-            </div>
-          {/if}
+                  <Button size="sm" variant="quiet" icon="quote" onclick={() => openSource(finding.id)}>
+                    {FINDINGS_ACTION.openSource}
+                  </Button>
+                </div>
+              </article>
+            {/each}
+          </div>
 
-          {#if !querying && rows.length > 0}
-            <div class="pager">
-              <p class="micro">
-                показано {countOf(visible.length, 'запись', 'записи', 'записей')} из
-                {rows.length} {filtered ? 'в срезе' : 'в указателе'}
-              </p>
+          <div class="pager">
+            <p class="micro">
+              показано {countOf(visible.length, 'находка', 'находки', 'находок')} из
+              {listed.length} {filtered ? 'по этому отбору' : 'в корпусе'}
+            </p>
+            <div class="row">
+              {#if listed.length > shown}
+                <Button variant="quiet" size="sm" onclick={() => (shown += PAGE_SIZE)}>
+                  Показать ещё <span class="num">{Math.min(PAGE_SIZE, listed.length - shown)}</span>
+                </Button>
+              {:else if shown > PAGE_SIZE}
+                <Button variant="ghost" size="sm" onclick={() => (shown = PAGE_SIZE)}>
+                  Только первые <span class="num">{PAGE_SIZE}</span>
+                </Button>
+              {/if}
+            </div>
+          </div>
+
+          <!-- Импорт ушёл из шапки: на непустом корпусе это фоновая работа, а не
+               второе лицо экрана. -->
+          <div class="row findings__more">
+            <Button variant="ghost" size="sm" icon="upload" expanded={importOpen} onclick={toggleImport}>
+              {importOpen ? FINDINGS_ACTION.hideImport : FINDINGS_ACTION.importDocs}
+            </Button>
+          </div>
+        {:else if filtered}
+          <Empty
+            icon="filter"
+            title="Под этот отбор находок нет"
+            body={`Ни одна находка не подошла под отбор (${appliedEcho}). Имя субъекта достаточно начать писать частями — готовые имена лежат списком под находками.`}
+          >
+            {#snippet action()}
               <div class="row">
-                {#if rows.length > shown}
-                  <Button variant="quiet" size="sm" onclick={() => (shown += PAGE_SIZE)}>
-                    Показать ещё <span class="num">{Math.min(PAGE_SIZE, rows.length - shown)}</span>
-                  </Button>
-                {:else if shown > PAGE_SIZE}
-                  <Button variant="ghost" size="sm" onclick={() => (shown = PAGE_SIZE)}>
-                    Только первые <span class="num">{PAGE_SIZE}</span>
-                  </Button>
-                {/if}
+                <Button variant="action" onclick={resetAll}>{FINDINGS_ACTION.resetFilter}</Button>
+                <Button variant="quiet" onclick={() => void loadIndex()}>{FINDINGS_ACTION.readAgain}</Button>
               </div>
-            </div>
-          {/if}
-        </div>
+            {/snippet}
+          </Empty>
+        {:else if index.length === 0}
+          <!-- Пустой корпус честен и остаётся единственным, что выше действий:
+               у экрана тогда ровно одно главное действие. -->
+          <Empty
+            icon="layers"
+            title="В корпусе пока нет находок"
+            body="Сюда попадают утверждения из документов: число, условие применения и доказательство до страницы, листа или диапазона ячеек. Пришлите первый документ."
+          >
+            {#snippet action()}
+              <div class="row">
+                <Button variant="action" icon="upload" expanded={importOpen} onclick={toggleImport}>
+                  {FINDINGS_ACTION.importDocs}
+                </Button>
+              </div>
+            {/snippet}
+          </Empty>
+        {:else}
+          <!-- Находки в корпусе есть, а список пуст: это сбой чтения, а не
+               пустой корпус — экран обязан различать эти два факта. -->
+          <Empty
+            icon="alert"
+            title="Список пуст, хотя корпус не пуст"
+            body={`В корпусе числится ${countOf(index.length, 'находка', 'находки', 'находок')}, но запрос вернул пустой список. Перечитайте находки; если повтор не поможет — это сбой сервиса, а не пустой корпус.`}
+          >
+            {#snippet action()}
+              <div class="row">
+                <Button variant="action" onclick={() => void loadIndex()}>{FINDINGS_ACTION.readAgain}</Button>
+                <Button href="/dashboard" variant="quiet">{navLabel('/dashboard')}</Button>
+              </div>
+            {/snippet}
+          </Empty>
+        {/if}
 
-        <aside class="findings__rail">
-          <Panel>
+        {#if filtered || listed.length > 0}
+          <!-- Применённый отбор — строкой под результатом: видно, что список
+               отсеял, и есть куда вернуться за изменением. -->
+          <div class="findings__applied reveal">
+            <p class="micro findings__applied-title"><Icon name="filter" size={14} /> Отбор</p>
+            <div class="row">
+              {#if appliedSubject}
+                <Chip pressed onclick={clearSubject}>субъект «{subjectName(appliedSubject)}» · снять</Chip>
+              {/if}
+              {#if appliedStatus}
+                <Chip pressed onclick={clearStatus}>класс «{STATUS_SHORT[appliedStatus]}» · снять</Chip>
+              {/if}
+              {#if appliedDocument}
+                <!-- Фильтр пришёл из адреса («все находки этого источника»):
+                     называется человеческим именем файла, код остаётся в подсказке. -->
+                <Chip pressed title={docHint(appliedDocument)} onclick={clearDocument}>
+                  источник «{documentName}» · снять
+                </Chip>
+              {/if}
+              {#if !filtered}
+                <span class="micro muted">без отбора — показаны все находки корпуса</span>
+              {/if}
+            </div>
+            <Button size="sm" variant="quiet" expanded={filtersOpen} onclick={toggleFilters}>
+              {filtersOpen ? FINDINGS_ACTION.hideFilter : FINDINGS_ACTION.changeFilter}
+            </Button>
+          </div>
+
+          {#if filtersOpen}
+            <Panel raised class="findings__filters reveal">
+              <form class="filters" onsubmit={submitFilters}>
+                <div class="filters__grid">
+                  <Field
+                    label="Субъект"
+                    name="subject"
+                    type="search"
+                    placeholder="напр. обратный осмос"
+                    hint="Достаточно части имени субъекта; готовые имена — списком под находками."
+                    bind:value={subjectDraft}
+                  />
+
+                  <Select
+                    label="Класс консенсуса"
+                    name="status"
+                    hint="Согласуется, оспаривается или гипотеза."
+                    bind:value={statusDraft}
+                    options={STATUS_OPTIONS}
+                  />
+                </div>
+
+                <div class="filters__go">
+                  <Button type="submit" variant="action" busy={querying}>
+                    {querying ? 'Ищем по корпусу…' : FINDINGS_ACTION.applyFilter}
+                  </Button>
+                  <Button variant="quiet" onclick={resetAll} disabled={querying || !filtered}>
+                    {FINDINGS_ACTION.resetFilter}
+                  </Button>
+                  <p class="micro muted">
+                    {#if filtered}
+                      по отбору {countOf(rows.length, 'находка', 'находки', 'находок')} · {appliedEcho}
+                    {:else}
+                      весь корпус — {countOf(index.length, 'находка', 'находки', 'находок')}
+                    {/if}
+                  </p>
+                </div>
+
+                <div class="filters__facets">
+                  {#each facets as facet (facet.key)}
+                    <Chip
+                      pressed={appliedStatus === facet.key}
+                      disabled={querying}
+                      onclick={() => pickFacet(facet.key)}
+                    >
+                      {facet.label} · <span class="num">{facet.count}</span>
+                    </Chip>
+                  {/each}
+                  <Chip
+                    pressed={!appliedStatus}
+                    disabled={querying || !appliedStatus}
+                    onclick={clearStatus}
+                  >
+                    {FINDINGS_ACTION.anyStatus} · <span class="num">{index.length}</span>
+                  </Chip>
+                </div>
+              </form>
+            </Panel>
+          {/if}
+        {/if}
+
+        {#if subjectIndex.length > 0}
+          <Panel tag="aside" class="findings__subjects reveal">
             <div class="panel__head">
               <div class="grow">
-                <h2 class="h4">Субъекты указателя</h2>
+                <h2 class="h4">Субъекты корпуса</h2>
                 <p class="micro muted">Отбор считается по всему корпусу, а не по строкам на экране.</p>
               </div>
               <p class="micro">
                 <span class="num">{index.length}</span>
-                {plural(index.length, 'утверждение', 'утверждения', 'утверждений')} ·
+                {plural(index.length, 'находка', 'находки', 'находок')} ·
                 <span class="num">{subjectIndex.length}</span>
                 {plural(subjectIndex.length, 'субъект', 'субъекта', 'субъектов')}
               </p>
             </div>
-            {#if subjectIndex.length === 0}
-              <p class="micro">
-                Субъектов в указателе нет: корпуса ещё нет или утверждения не размечены по субъектам.
-              </p>
-            {:else}
-              <div class="subjects">
-                {#each subjectIndex as [name, group] (name)}
-                  <button
-                    class="subject"
-                    type="button"
-                    aria-current={appliedSubject === name ? 'true' : undefined}
-                    disabled={querying}
-                    onclick={() => pickSubject(name)}
-                  >
-                    <span class="grow">
-                      <span class="subject__label">{name ? subjectName(name) : 'субъект не размечен'}</span>
-                      {#if hasHumanName(SUBJECT_LABELS, name)}
-                        <code class="code subject__key">{name}</code>
-                      {/if}
-                      <span class="micro muted">
-                        <span class="num">{group.length}</span>
-                        {plural(group.length, 'утверждение', 'утверждения', 'утверждений')}
-                      </span>
-                      <span class="subject__status">
-                        {#each statusCounts(group) as status (status.label)}
-                          <span class="micro">
-                            {status.label} <span class="num">{status.count}</span>
-                          </span>
-                        {/each}
-                      </span>
+            <div class="subjects">
+              {#each subjectIndex as [name, group] (name)}
+                <button
+                  class="subject"
+                  type="button"
+                  aria-current={appliedSubject === name ? 'true' : undefined}
+                  title={name ? `служебное имя: ${name}` : undefined}
+                  disabled={querying}
+                  onclick={() => pickSubject(name)}
+                >
+                  <span class="grow">
+                    <span class="subject__label">{name ? subjectName(name) : 'субъект не размечен'}</span>
+                    <span class="micro muted">
+                      <span class="num">{group.length}</span>
+                      {plural(group.length, 'находка', 'находки', 'находок')}
                     </span>
-                  </button>
-                {/each}
-              </div>
-            {/if}
+                    <span class="subject__status">
+                      {#each statusCounts(group) as status (status.label)}
+                        <span class="micro">
+                          {status.label} <span class="num">{status.count}</span>
+                        </span>
+                      {/each}
+                    </span>
+                  </span>
+                </button>
+              {/each}
+            </div>
           </Panel>
-        </aside>
-      </div>
+        {/if}
+      {/if}
     {/if}
   </div>
 </div>
@@ -1025,15 +1125,10 @@
   <h3 class="h4">{finding.statement}</h3>
 
   <dl class="kv">
-    <dt>Код утверждения</dt>
-    <dd><code class="code">{finding.id}</code></dd>
     <dt>Субъект</dt>
     <dd>
       {#if finding.subject}
         {subjectName(finding.subject)}
-        {#if hasHumanName(SUBJECT_LABELS, finding.subject)}
-          <code class="code">{finding.subject}</code>
-        {/if}
       {:else}
         субъект не размечен
       {/if}
@@ -1042,9 +1137,6 @@
     <dd>
       {#if finding.predicate}
         {predicateName(finding.predicate)}
-        {#if hasHumanName(PREDICATE_LABELS, finding.predicate)}
-          <code class="code">{finding.predicate}</code>
-        {/if}
       {:else}
         предикат не размечен
       {/if}
@@ -1058,6 +1150,19 @@
     <dt>Уверенность извлечения</dt>
     <dd class="num">{pct(finding.confidence)}</dd>
   </dl>
+
+  <!-- Идентификаторы не решают, кому верить, но нужны, когда сверяешь запись с
+       сервером: они под раскрытием, русские имена — на виду. -->
+  <details class="svc">
+    <summary class="micro">Служебные данные</summary>
+    <p class="micro svc__row">код утверждения <code class="code">{finding.id}</code></p>
+    {#if finding.subject}
+      <p class="micro svc__row">субъект <code class="code">{finding.subject}</code></p>
+    {/if}
+    {#if finding.predicate}
+      <p class="micro svc__row">предикат <code class="code">{finding.predicate}</code></p>
+    {/if}
+  </details>
 
   {#if describeScope(finding.scope).length > 0}
     <section class="interval__block">
@@ -1080,11 +1185,8 @@
         {@const m = measureOf(obs)}
         <div class="measure">
           <div class="measure__caption">
-            <span class="measure__prop">
+            <span class="measure__prop" title={propHint(obs.property_name)}>
               {propertyName(obs.property_name)}
-              {#if hasHumanName(PROPERTY_LABELS, obs.property_name)}
-                <code class="code measure__key">{obs.property_name}</code>
-              {/if}
             </span>
             <span>
               <span class="measure__value">{m.raw}</span>
@@ -1110,7 +1212,7 @@
             <p class="micro measure__scale">
               <span class="num">{num(m.scale.min)}</span>
               <span>
-                шкала по нормализованным значениям · {obs.normalized_unit} · значений
+                {FINDINGS_SCALE_SPREAD} · {obs.normalized_unit} · значений
                 <span class="num">{m.scale.count}</span>
               </span>
               <span class="num">{num(m.scale.max)}</span>
@@ -1123,7 +1225,7 @@
       {/each}
     {:else}
       <p class="micro">
-        Числовых наблюдений нет — сравнивать число с пределом по этому интервалу нечего.
+        Числовых наблюдений нет — сравнивать число с пределом по этому утверждению нечего.
       </p>
     {/if}
   </section>
@@ -1134,7 +1236,7 @@
       {#each finding.evidence as ev, position (`${finding.id}-ev-${position}`)}
         <figure class="evidence">
           <blockquote class="quote">{ev.quote}</blockquote>
-          <figcaption class="evidence__loc">
+          <figcaption class="evidence__loc" title={docHint(ev.document_id)}>
             <b class="small">{ev.source_title}</b>
             <span class="locator"><Icon name="pin" size={14} /> {locator(ev)}</span>
             {#if ev.page != null && (ev.sheet || ev.cell_range)}
@@ -1145,14 +1247,13 @@
                 симв. <span class="num">{ev.char_start}</span>–<span class="num">{ev.char_end ?? '—'}</span>
               </span>
             {/if}
-            <code class="code">{ev.document_id}</code>
           </figcaption>
         </figure>
       {/each}
     {:else}
       <Notice tone="warn" title="Доказательств нет">
         Утверждение не трассируется до источника, как факт оно не считается. Оформите правку в
-        разделе «Проверка решений» или дополните корпус документом, где этот показатель есть.
+        разделе «Оценка ответов» или дополните корпус документом, где этот показатель есть.
       </Notice>
     {/if}
   </section>
@@ -1183,8 +1284,8 @@
       <!-- Пустая цепочка — отдельный факт, а не «версия одна»: иначе ноль
            прочитался бы как подтверждённое отсутствие замен. -->
       <p class="micro">
-        Версий этого утверждения не найдено: цепочка версий пустая, хотя само утверждение
-        в указателе есть.
+        Версий этого утверждения не найдено: цепочка версий пустая, хотя само
+        утверждение в корпусе есть.
       </p>
     {:else if chain.versions.length === 1}
       <p class="micro">
@@ -1195,16 +1296,14 @@
       <div class="table-wrap">
         <table class="table">
           <caption class="findings__caption">
-            Версий <span class="num">{chain.versions.length}</span> · корень
-            <code class="code">{chain.claim_id}</code>
+            Версий <span class="num">{chain.versions.length}</span>
           </caption>
           <thead>
             <tr>
               <th>вер.</th>
               <th>утверждение</th>
               <th>класс консенсуса</th>
-              <th>проверил (код аккаунта)</th>
-              <th>заменено на (код утверждения)</th>
+              <th>проверка</th>
             </tr>
           </thead>
           <tbody>
@@ -1225,7 +1324,7 @@
                 </td>
                 <td>
                   {#if version.reviewer_id}
-                    <code class="code">{version.reviewer_id}</code>
+                    экспертом
                     {#if version.review_date}
                       <p class="micro">
                         <time datetime={version.review_date}>{ruDate(version.review_date)}</time>
@@ -1235,31 +1334,40 @@
                     извлечено из документа
                   {/if}
                 </td>
-                <td>
-                  {#if version.superseded_by}
-                    <code class="code">{version.superseded_by}</code>
-                  {:else}
-                    —
-                  {/if}
-                </td>
               </tr>
             {/each}
           </tbody>
         </table>
       </div>
+      <details class="svc">
+        <summary class="micro">Служебные данные версий</summary>
+        <p class="micro svc__row">корень цепочки <code class="code">{chain.claim_id}</code></p>
+        {#each chain.versions as version (version.finding_id)}
+          <p class="micro svc__row">
+            версия <span class="num">{version.version}</span> · код утверждения
+            <code class="code">{version.finding_id}</code>
+            {#if version.reviewer_id}
+              · проверил <code class="code">{version.reviewer_id}</code>
+            {/if}
+            {#if version.superseded_by}
+              · заменено на <code class="code">{version.superseded_by}</code>
+            {/if}
+          </p>
+        {/each}
+      </details>
     {/if}
   </section>
 {/snippet}
 
 {#if activeFinding}
   <Sheet
-    title="Интервал утверждения"
+    title="Источник утверждения"
     description="Дословная цитата, локатор первоисточника и цепочка версий этого утверждения."
     width="840px"
-    onclose={closeInterval}
+    onclose={closeSource}
   >
     {#snippet footer()}
-      <Button variant="quiet" onclick={closeInterval}>Закрыть интервал</Button>
+      <Button variant="quiet" onclick={closeSource}>Закрыть</Button>
     {/snippet}
 
     {@render interval(activeFinding)}
@@ -1270,13 +1378,6 @@
   /* (app)-layout уже отступил на высоту pill-навигации: верх не удваиваем. */
   .page.findings {
     padding-top: var(--s5);
-  }
-
-  .findings__head {
-    display: flex;
-    align-items: center;
-    gap: var(--s4);
-    flex-wrap: wrap;
   }
 
   .findings__count {
@@ -1301,7 +1402,7 @@
     border-radius: var(--r-lg);
   }
 
-  /* ── Импорт: drop-zone и пофайловые приёмки ────────────────────────────── */
+  /* ── Импорт: drop-zone и список принятых документов ────────────────────── */
 
   .dropzone {
     position: relative;
@@ -1402,10 +1503,36 @@
     color: var(--disputed);
   }
 
-  /* ── Фильтры ───────────────────────────────────────────────────────────── */
+  /* ── Применённый отбор и форма отбора под списком ───────────────────── */
+
+  .findings__applied {
+    margin-top: var(--s6);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+    padding: var(--s4);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-lg);
+    background: var(--surface-sunk);
+  }
+
+  .findings__applied-title {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    color: var(--ink-3);
+    font-weight: 600;
+  }
+
+  .findings__applied > .row {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
 
   .findings__filters {
-    margin-bottom: var(--s6);
+    margin-top: var(--s4);
   }
 
   .filters {
@@ -1434,20 +1561,27 @@
     border-top: 1px solid var(--line-soft);
   }
 
-  /* ── Рельс субъектов и список ──────────────────────────────────────────── */
+  /* ── Список находок и перечень субъектов под ним ───────────────────── */
 
-  .findings__split {
-    align-items: start;
-    grid-template-columns: minmax(0, 1fr) minmax(248px, 304px);
+  /* К списку и к форме отбора возвращают действие «Показать находки» и
+     «Изменить отбор»: отступ учитываем, иначе строка уходит под навигацию. */
+  .findings__list,
+  .findings__filters,
+  .findings__subjects {
+    scroll-margin-top: calc(var(--topbar-h) + var(--s4));
   }
 
-  .findings__rail {
-    position: sticky;
-    top: calc(var(--topbar-h) + var(--s4));
+  .findings__subjects {
+    margin-top: var(--s6);
+  }
+
+  .findings__more {
+    justify-content: flex-start;
+    margin-top: var(--s2);
   }
 
   /* Список субъектов растёт вместе с панелью: единственным скроллом остаётся
-     страница, второй прокрутки внутри sticky-рельса не заводим. */
+     страница, второй прокрутки внутри панели не заводим. */
   .subjects {
     display: flex;
     flex-direction: column;
@@ -1497,13 +1631,6 @@
   .subject__label {
     font-size: var(--t-small);
     line-height: var(--lh-dense);
-  }
-
-  /* Служебное имя субъекта — подписью под русским именем: по нему ищет сервер. */
-  .subject__key {
-    font-size: var(--t-micro);
-    color: var(--ink-4);
-    overflow-wrap: anywhere;
   }
 
   .subject__status {
@@ -1559,19 +1686,6 @@
     text-align: left;
   }
 
-  .findings__cell-statement {
-    min-width: 22ch;
-    /* Находка чанка — это целый фрагмент документа (до 4000 знаков): без
-       ограничения высоты одна строка таблицы растягивается на несколько экранов.
-       Полный текст остаётся доступным в карточке находки. */
-    max-width: 48ch;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 4;
-    line-clamp: 4;
-    overflow: hidden;
-  }
-
   .pager {
     display: flex;
     align-items: center;
@@ -1586,7 +1700,7 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* ── Шторка интервала ───────────────────────────────────────────────────── */
+  /* ── Шторка источника утверждения ───────────────────────────────────────── */
 
   .interval__block {
     display: flex;
@@ -1632,14 +1746,6 @@
     font-size: var(--t-small);
     font-weight: 600;
     color: var(--ink);
-  }
-
-  /* Служебное имя свойства — подписью: русское имя остаётся заголовком строки. */
-  .measure__key {
-    font-size: var(--t-micro);
-    font-weight: 400;
-    color: var(--ink-4);
-    overflow-wrap: anywhere;
   }
 
   .measure__value {
@@ -1706,13 +1812,38 @@
     flex-wrap: wrap;
   }
 
-  /* Длинные идентификаторы (код утверждения, код документа, контрольная сумма
-     приёмки) печатаем целиком: перенос вместо обрезки, иначе полное значение
-     негде прочесть. */
-  .evidence__loc .code,
-  .upload__ok .code,
+  /* Служебные данные: код утверждения, код документа и контрольную сумму
+     печатаем целиком — перенос вместо обрезки, иначе полное значение негде
+     прочесть. */
+  .svc .code,
   .kv dd {
     overflow-wrap: anywhere;
+  }
+
+  /* Коды не спорят с содержимым находки: они под раскрытием и в третьестепенном
+     цвете. */
+  .svc {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    padding: var(--s3) var(--s4);
+    border: 1px dashed var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface-sunk);
+  }
+
+  .svc summary {
+    color: var(--ink-3);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .svc .code {
+    color: var(--ink-4);
+  }
+
+  .svc__row {
+    color: var(--ink-3);
   }
 
   .history__head {
@@ -1727,14 +1858,13 @@
     background: var(--superseded-wash);
   }
 
-  @media (max-width: 900px) {
-    .findings__split {
-      grid-template-columns: minmax(0, 1fr);
-    }
-
-    .findings__rail {
-      position: static;
-      order: 2;
+  @media (max-width: 640px) {
+    /* Строка отбора на мобильном не толкается: чипы и действие «Изменить отбор»
+       встают друг под друга. */
+    .findings__applied {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: var(--s3);
     }
   }
 </style>

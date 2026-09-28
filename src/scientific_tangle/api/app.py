@@ -112,6 +112,10 @@ logging.basicConfig(level=logging.INFO)
 NOTIFICATION_FEED_LIMIT = 20
 AUDIT_LIMIT_DEFAULT = 200
 AUDIT_LIMIT_MAX = 1000
+# Профиль читает журнал своего аккаунта экраном, а не выгрузкой: сотни строк
+# человеку не нужны, а большой лимит только зря гоняет состояние через прокси.
+ME_ACTIVITY_LIMIT_DEFAULT = 40
+ME_ACTIVITY_LIMIT_MAX = 200
 _WORKFLOW_LOCK = threading.Lock()
 # Только против параллельного холодного старта витрины (см. /demo).
 _DEMO_LOCK = asyncio.Lock()
@@ -1592,6 +1596,34 @@ async def get_expert_decisions(
     """
     deps = dependencies(request)
     return await deps.state.recent_decisions(limit=limit, actor_id=account.id)
+
+
+@app.get("/api/v1/me/activity", tags=["acl"], response_model=list[ActivityEntry])
+async def get_my_activity(
+    account: CurrentAccount,
+    request: Request,
+    limit: Annotated[int, Query(ge=1, le=ME_ACTIVITY_LIMIT_MAX)] = ME_ACTIVITY_LIMIT_DEFAULT,
+) -> list[ActivityEntry]:
+    """Журнал действий собственного аккаунта — он же «что я здесь делал».
+
+    ``/audit`` закрыт правом ``audit:read`` и отдаёт акты всех, поэтому для
+    профиля он непригоден; ``actor_id`` берут только из серверной сессии, никогда
+    из запрос. Ответ — проекция ``ActivityEntry`` без ``metadata``: в метаданных
+    лежат фрагменты вопросов и служебные ссылки, которым не место в списке
+    профиля.
+    """
+    deps = dependencies(request)
+    events = await deps.state.recent_audit(limit=limit, actor_id=account.id)
+    return [
+        ActivityEntry(
+            action=event.action,
+            actor_id=event.actor_id,
+            object_id=event.object_id,
+            outcome=event.outcome,
+            created_at=event.created_at,
+        )
+        for event in events
+    ]
 
 
 @app.post("/api/v1/compare", tags=["comparison"], response_model=ComparisonTable)

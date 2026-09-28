@@ -28,7 +28,6 @@
   let seg = $state<HTMLDivElement | undefined>();
   let accountBox = $state<HTMLDivElement | undefined>();
   let accountBtn = $state<HTMLButtonElement | undefined>();
-  let dirs = $state<Record<string, number>>({});
 
   const current = $derived(page.url.pathname);
 
@@ -97,7 +96,9 @@
     }
 
     const scroller = document.querySelector<HTMLElement>('.app-body');
-    const readTop = () => (scroller ? scroller.scrollTop : window.scrollY);
+    // Прокрутку ведёт документ; контейнер учитывается на случай холста со
+    // собственным скроллом.
+    const readTop = () => Math.max(window.scrollY, scroller ? scroller.scrollTop : 0);
     const onScroll = () => {
       dock = readTop() > 24;
     };
@@ -115,15 +116,6 @@
       window.removeEventListener('resize', remeasure);
     };
   });
-
-  // Бегущая строка въезжает с той стороны, с которой подвели курсор.
-  function sense(event: PointerEvent, href: string) {
-    const row =
-      event.target instanceof Element ? event.target.closest<HTMLElement>('.flow__item') : null;
-    if (!row) return;
-    const box = row.getBoundingClientRect();
-    dirs[href] = event.clientY > box.top + box.height / 2 ? -1 : 1;
-  }
 
   // Раскрытие аккаунта — обычное раскрытие (кнопка + список), а не ARIA-меню:
   // Tab сам обходит пункты, Escape закрывает и возвращает фокус кнопке.
@@ -174,7 +166,12 @@
       <div class="seg" bind:this={seg}>
         <span class="seg__ind" aria-hidden="true"></span>
         {#each links as link (link.href)}
-          <a class="seg__item" href={link.href} aria-current={isCurrent(link.href) ? 'page' : undefined}>
+          <a
+            class="seg__item"
+            href={link.href}
+            aria-current={isCurrent(link.href) ? 'page' : undefined}
+            title={link.gloss}
+          >
             {link.label}
           </a>
         {/each}
@@ -186,7 +183,10 @@
 
   <div class="pill-nav__end">
     {#if links.length > 0}
-      <button class="icon-btn pill-nav__burger" type="button" aria-expanded={sectionsOpen} aria-label="Разделы" onclick={() => (sectionsOpen = true)}>
+      <!-- «Разделы» доступен на любой ширине: это единственное место, где целиком
+           видно, что делает каждый раздел, — прятать его за спиной у того, кто
+           впервые открыл продукт на широком экране, нельзя. -->
+      <button class="icon-btn pill-nav__burger" type="button" aria-expanded={sectionsOpen} aria-label="Все разделы и что они делают" onclick={() => (sectionsOpen = true)}>
         <Icon name="menu" size={19} />
       </button>
     {/if}
@@ -246,21 +246,15 @@
         <a
           class="flow__item"
           href={link.href}
-          style="--flow-dir:{dirs[link.href] ?? 1}"
           aria-current={isCurrent(link.href) ? 'page' : undefined}
-          onpointerenter={(event) => sense(event, link.href)}
           onclick={() => (sectionsOpen = false)}
         >
           <span class="flow__icon"><Icon name={link.icon} size={19} /></span>
           <span class="flow__rows">
             <span class="flow__label">{link.label}</span>
-            <span class="flow__marquee">
-              <span class="flow__strip">
-                {#each [0, 1] as half (half)}
-                  <span class="flow__chunk">{link.label} — {link.gloss ?? 'рабочий раздел'}</span>
-                {/each}
-              </span>
-            </span>
+            <!-- Пояснение читается сразу: бегущая строка прятала единственный
+                 ответ на вопрос «а это для чего». -->
+            <span class="flow__gloss">{link.gloss ?? 'рабочий раздел'}</span>
           </span>
           <span class="flow__arrow"><Icon name="chevronRight" size={17} /></span>
         </a>
@@ -289,25 +283,9 @@
     white-space: nowrap;
   }
 
-  .flow__strip {
-    display: flex;
-    width: max-content;
-  }
-
-  .flow__chunk {
-    padding-inline-end: var(--s8);
-    white-space: nowrap;
-  }
-
-  /* Порог совпадает с переносом полосы в app.css: бургер появляется ровно там,
-     где разделы уходят во вторую строку (≤1119px). */
-  @media (min-width: 1120px) {
-    .pill-nav__burger {
-      display: none;
-    }
-  }
-
-  @media (max-width: 700px) {
+  /* «Разделы» не прячется на широком экране: шторка — единственное место, где
+     целиком видно назначение каждого раздела. */
+  @media (max-width: 640px) {
     .account__name {
       display: none;
     }

@@ -65,8 +65,13 @@ FINDING_INDEX = "mindai-findings-v2"
 CHUNK_INDEX = "mindai-chunks-v2"
 GRAPH_CACHE_TTL_SECONDS = 30.0
 GRAPH_NODE_LIMIT = 600
+# Анализатор живёт под ключом `analysis`: без него Elasticsearch читает настройки
+# как `index.analyzer.ru.type` и отклоняет создание индекса с
+# illegal_argument_exception — на memory-бэкенде это не видно вообще.
 RUS_ANALYSIS = {
-    "analyzer": {"ru": {"type": "russian", "stopwords": "_russian_"}},
+    "analysis": {
+        "analyzer": {"ru": {"type": "russian", "stopwords": "_russian_"}},
+    },
 }
 
 

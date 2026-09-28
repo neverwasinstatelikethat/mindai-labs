@@ -418,6 +418,14 @@ export interface ActivityEntry {
   created_at: string;
 }
 
+// Зеркало intelligence.AuditEvent (журнал всех аккаунтов, `/audit` под правом
+// `audit:read`). `metadata` в контракте есть, но в модель не взят намеренно: в
+// нём формулировки вопросов, а экрану журнала они не нужны.
+export interface AuditEntry extends ActivityEntry {
+  id: string;
+  correlation_id: string;
+}
+
 export interface DashboardData {
   documents: number;
   claims: number;

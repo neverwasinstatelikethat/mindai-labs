@@ -52,17 +52,96 @@ def _clean_json(content: str) -> str:
     return value.strip()
 
 
+# Потолок раскрытия `$ref`: считается только по развёрнутым указателям, а не по
+# глубине вложенности — иначе нерекурсивная, но глубокая схема обрезалась бы с
+# живым `$ref` внутри. Цикл может возникнуть лишь через указатель, поэтому
+# счётчик указателей — достаточная защита.
+_MAX_SCHEMA_EXPANSIONS = 12
+
+
+def _resolve_ref(root: dict[str, object], ref: str) -> object:
+    """Только локальные указатели `#/$defs/…`; `$defs` — единственный источник."""
+    if not ref.startswith("#/"):
+        return None
+    target: object = root
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(target, dict) or part not in target:
+            return None
+        target = target[part]
+    return target
+
+
+def _inline_refs(node: object, root: dict[str, object], expansions: int) -> object:
+    """Ставит содержимое `$ref` на место указателя.
+
+    GigaChat отвечает на structured-output дословным куском промпта чаще, чем
+    экземпляром схемы: в логе живого прогона ответ начинался с `{"$defs": …}` —
+    модель пересказала обёртку, которую ей показали. Без `$defs` в поле зрения
+    пересказывать этот ключ нечего, а вложенная форма становится видимой сразу.
+    """
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str) and expansions < _MAX_SCHEMA_EXPANSIONS:
+            target = _resolve_ref(root, ref)
+            if isinstance(target, dict):
+                extra = {k: v for k, v in node.items() if k != "$ref"}
+                return _inline_refs({**target, **extra}, root, expansions + 1)
+        return {k: _inline_refs(v, root, expansions) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_inline_refs(v, root, expansions) for v in node]
+    return node
+
+
+def _shape_of(node: object) -> object:
+    """Форма экземпляра из узла схемы: остаются только ключи данных.
+
+    Всё, что лежит в угловых скобках, модель обязана заменить — ни одно
+    значение не похоже на готовый ответ. Числа и булевы намеренно не `0`/`true`:
+    продукт сверяет числа, и молча скопированное нулевое значение хуже, чем
+    громко неверный тип.
+    """
+    if not isinstance(node, dict):
+        return "<текст>"
+    if "enum" in node:
+        return "<" + "|".join(str(item) for item in node["enum"]) + ">"
+    for branch in node.get("anyOf") or node.get("oneOf") or []:
+        if isinstance(branch, dict) and branch.get("type") != "null":
+            return _shape_of(branch)
+    types = node.get("type")
+    kind = types[0] if isinstance(types, list) and types else types
+    properties = node.get("properties")
+    if kind == "object" or isinstance(properties, dict):
+        return {key: _shape_of(value) for key, value in (properties or {}).items()}
+    if kind == "array":
+        return [_shape_of(node.get("items") or {})]
+    if kind == "boolean":
+        return "<true|false>"
+    if kind in {"integer", "number"}:
+        return "<число>"
+    return "<текст>"
+
+
 @lru_cache(maxsize=64)
-def _schema_json(schema: type[BaseModel]) -> str:
-    return json.dumps(schema.model_json_schema(), ensure_ascii=False)
+def _instance_shape(schema: type[BaseModel]) -> str:
+    document = schema.model_json_schema()
+    return json.dumps(_shape_of(_inline_refs(document, document, 0)), ensure_ascii=False)
 
 
 def build_instance_instruction(system: str, schema: type[BaseModel]) -> str:
-    """Системный промпт structured-output для моделей без response_format."""
+    """Системный промпт structured-output для моделей без response_format.
+
+    JSON Schema в промпте GigaChat пересказывает дословно: в логе живого прогона
+    ответ начинался с `{"$defs": …}`, а потом подмешивал `"title": "Question",
+    "type": "object"` в данные. Служебных слов схемы в форме экземпляра просто
+    нет — пересказывать нечего, а вложенность видна в одном месте.
+    """
     return (
-        f"{system}\n\nВерни один JSON-объект — экземпляр {schema.__name__}. "
-        "Не возвращай описание или JSON Schema. Все required поля обязательны.\n"
-        f"JSON Schema:\n{_schema_json(schema)}"
+        f"{system}\n\nВерни один JSON-объект — экземпляр {schema.__name__} по форме ниже. "
+        "Ключи оставь как в форме и верни их все, включая вложенные: модельный ответ "
+        "только с первым ключом считается неполным и отклоняется. Каждое значение в "
+        "угловых скобках замени настоящим. Описание схемы или JSON Schema не возвращай.\n"
+        f"Форма ответа:\n{_instance_shape(schema)}"
     )
 
 
