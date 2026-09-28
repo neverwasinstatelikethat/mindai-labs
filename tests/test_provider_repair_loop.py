@@ -11,9 +11,10 @@ from typing import Any
 
 import httpx
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from scientific_tangle.config import Settings
+from scientific_tangle.domain.contracts import CritiqueResult, ReasoningResult
 from scientific_tangle.services import provider as provider_module
 from scientific_tangle.services.provider import GigaChatProvider, ModelUnavailableError
 
@@ -222,3 +223,38 @@ async def test_transport_timeout_is_counted_as_timeout_not_garbage_answer() -> N
     assert len(prompts) == 1, "таймаут не должен запускать repair-цикл"
     assert subject._metrics.timeouts == ["Answer"]  # type: ignore[attr-defined]
     assert subject._metrics.llm_calls[-1]["success"] is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_without_lists_is_not_a_schema_violation() -> None:
+    """Ответ «противоречий не нашёл» не имеет права терять прогон.
+
+    Требовательные списки в ``ReasoningResult`` роняли валидацию иначе полного
+    ответа: модель возвращала ``null`` или не перечисляла ключ, прогон уходил в
+    repair и останавливался на потолке — холодный ``GET /demo`` терял ответ
+    целиком (находка ревью бэкенда, 2026-09-28).
+    """
+    subject, prompts = _provider(
+        [
+            _completion('{"summary": "Плотность 1,8 г/см³.", "conflicts": null}'),
+        ]
+    )
+
+    result = await subject.complete_model("система", "вопрос", ReasoningResult)
+
+    assert len(prompts) == 1, "полный ответ не должен попадать в repair-цикл"
+    assert result.summary == "Плотность 1,8 г/см³."
+    assert (result.finding_ids, result.conflicts, result.knowledge_gaps) == ([], [], [])
+
+
+@pytest.mark.asyncio
+async def test_critique_without_issues_keeps_its_verdict_and_needs_no_repair() -> None:
+    """Отсутствие замечаний — это «одобрено без правок», а вердикт остаётся обязательным."""
+    subject, prompts = _provider([_completion('{"approved": true, "issues": null}')])
+
+    result = await subject.complete_model("система", "вопрос", CritiqueResult)
+
+    assert len(prompts) == 1
+    assert (result.approved, result.issues, result.revision_instructions) == (True, [], [])
+    with pytest.raises(ValidationError, match="approved"):
+        CritiqueResult.model_validate({"issues": []})

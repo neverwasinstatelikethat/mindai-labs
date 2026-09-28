@@ -3,10 +3,10 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, get_origin
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import EvidenceLocator, NumericObservation, QueryPlan
@@ -349,18 +349,51 @@ class IngestionBundle(BaseModel):
     resolutions: list[EntityResolutionProposal] = Field(default_factory=list)
 
 
+def _null_lists_as_empty(cls: type[BaseModel], values: object) -> object:
+    """``null`` в поле-списке читается как пустой список, а не как ошибка модели.
+
+    GigaChat возвращает «противоречий нет» как `"conflicts": null`, и
+    требовательный список ронял валидацию иначе полного ответа: прогон уходил в
+    schema-repair и отдавал 503 там, где не хватало только формы. Так холодный
+    `GET /demo` терял ответ целиком — зафиксировано живым прогоном.
+    """
+    if not isinstance(values, dict):
+        return values
+    list_fields = {
+        name for name, info in cls.model_fields.items() if get_origin(info.annotation) is list
+    }
+    return {
+        name: ([] if name in list_fields and value is None else value)
+        for name, value in values.items()
+    }
+
+
 class ReasoningResult(BaseModel):
     summary: str
-    finding_ids: list[str]
-    conflicts: list[str]
-    knowledge_gaps: list[str]
-    recommendations: list[str]
+    # Пустой список — это «не найдено», а не «модель сломалась»: ответ без
+    # цитат и без перечня пробелов честен, и штрафовать его за форму нельзя.
+    finding_ids: list[str] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
+    knowledge_gaps: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerate_null_lists(cls, values: object) -> object:
+        return _null_lists_as_empty(cls, values)
 
 
 class CritiqueResult(BaseModel):
+    # `approved` остаётся обязательным: отсутствие вердикта нельзя молча
+    # превращать в отказ — иначе черновик без замечаний уходил бы на ревизию.
     approved: bool
-    issues: list[str]
-    revision_instructions: list[str]
+    issues: list[str] = Field(default_factory=list)
+    revision_instructions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerate_null_lists(cls, values: object) -> object:
+        return _null_lists_as_empty(cls, values)
 
 
 class EvolutionDraft(BaseModel):
