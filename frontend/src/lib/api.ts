@@ -71,8 +71,23 @@ async function requestRaw(path: string, init?: RequestInit): Promise<Response> {
   return response;
 }
 
+// /health/ready отвечает 503, когда модели нет, и тело при этом остаётся честным
+// SystemStatus. Бросать на любом не-2xx здесь значит терять различие, ради которого
+// экран держит два состояния: «сервис отвечает ограниченно» и «показания не пришли».
+async function requestStatus(): Promise<SystemStatus> {
+  const response = await fetch(`${API_URL}/health/ready`, { credentials: 'include' });
+  const body = (await response.json().catch(() => null)) as SystemStatus | null;
+  if (body && typeof body.status === 'string' && typeof body.model_mode === 'string') {
+    return body;
+  }
+  if (response.ok) {
+    throw new ApiError('Ответ о состоянии сервиса прочитан неверно', response.status);
+  }
+  throw await failure(response);
+}
+
 export const api = {
-  status: () => request<SystemStatus>('/health/ready'),
+  status: () => requestStatus(),
 
   // ── Сессия ──────────────────────────────────────────────────────
   me: () => request<AccountInfo>('/api/v1/auth/me'),
