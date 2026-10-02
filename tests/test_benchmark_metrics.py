@@ -925,3 +925,40 @@ def test_load_baseline_rejects_foreign_shape(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         bench.load_baseline(missing)
 
+
+def test_cli_distinguishes_bad_flag_from_missing_corpus(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Неверно собранная команда и отсутствующий корпус читаются разными кодами.
+
+    argparse при своей ошибке выходит с кодом 2, а 2 в этом CLI значит «измерение
+    не выполнено». CI на опечатке в имени флага советовал проверять монтирование
+    /data/sources, то есть уводил разбор не туда: диагноз «нет корпуса» дешевле
+    настоящего отказа, и его никто не перепроверял.
+    """
+    assert bench.main(["--no-such-flag"]) == bench.EXIT_USAGE
+    assert "usage:" in capsys.readouterr().err
+
+    empty_corpus = tmp_path / "корпус"
+    empty_corpus.mkdir()
+    absent_manifest = tmp_path / "манифест-не-существует.json"
+    assert (
+        bench.main(
+            ["--source-root", str(empty_corpus), "--manifest", str(absent_manifest)]
+        )
+        == bench.EXIT_NOT_MEASURED
+    )
+
+
+def test_cli_help_reports_all_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
+    """Справка не попадает в ветку ошибки разбора: SystemExit(0) остаётся успехом.
+
+    Список кодов в описании должен совпадать с тем, что разбирает CI, иначе job
+    будет трактовать код, которого человек из справки не знает.
+    """
+    assert bench.main(["--help"]) == bench.EXIT_OK
+    printed = capsys.readouterr().out
+    assert "3 — команда собрана неверно" in printed
+    assert "2 — измерение не выполнено" in printed
+
