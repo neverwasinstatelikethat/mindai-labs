@@ -41,23 +41,78 @@ compose:
   script:
     - docker compose config --quiet
 
-# Единственный автоматический гейт качества измерений: retrieval-бенчмарк с
-# порогами приёмки (recall@10 >= 0.90, p95 <= 3 c, гибрид сильнее лексического
-# базового по MRR) и регрессионным контролем по эталону.
+# Живые хранилища: окна списков, регистр кириллицы в фильтре субъекта и перенос
+# schema-версии в docs проверяются только против настоящих Neo4j и Elasticsearch.
+# Офлайн-тесты с подставным драйвером подтверждают вызванный Cypher, но не
+# поведение индексов и заголовков окна, поэтому без этого job'а девять живых
+# проверок навсегда остаются «skip» и никто не видит, что они вообще существует.
 #
-# Корпус «Источники информации/» вне Git, поэтому обычный раннер его не видит и
-# получает код 2 — «ИЗМЕРЕНИЕ НЕ ВЫПОЛНЕНО». Этот путь намеренно не роняет пайплайн
-# и не печатает отчёт о метриках: пропуск назван пропуском, а не успехом. Раннер с
-# смонтированным корпусом проходит тот же код полностью: код 1 валит пайплайн.
-benchmark:
+# Исполнитель ищется по тегу live-stores: на нём уже стоят docker и python, а
+# скрипт поднимает одноразовый контур на своих томах и сносит его вместе с
+# томами по trap. Тома рабочего контура аналитиков job не трогает и пересборку
+# приложения не делает.
+#
+# Автоматически job не стартует на сборке merge-запроса: два контейнера на каждую
+# правку README были бы платой слишком большой. Плановая сборка запускает его
+# сама, вне расписания он остаётся ручной кнопкой, и отсутствие запуска видно
+# отдельной строкой пайплайна, а не зелёным молчанием.
+live-stores:
+  stage: quality
+  tags:
+    - live-stores
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: on_success
+    - when: manual
+      allow_failure: true
+  script:
+    - bash tests/live-tests.sh
+
+# Гейт качества измерений состоит из двух job'ов, и ни один не зелёный «по умолчанию»:
+#
+#   1. ``benchmark:measure`` — сам прогон retrieval-бенчмарка с порогами приёмки
+#      (recall@10 >= 0.90, p95 <= 3 c, гибрид сильнее лексического базового по MRR).
+#      Корпус «Источники информации/» вне Git, поэтому job запускается только на
+#      раннере, объявившем корпус (``BENCHMARK_CORPUS: "ready"``). На таком раннере
+#      код 2 («ИЗМЕРЕНИЕ НЕ ВЫПОЛНЕНО») роняет пайплайн: обещали измерение — получите
+#      измерение, а не зелёную строчку. Вне корпуса job даже не создаётся (rules:
+#      when: never), и в отчёте пайплайна это видно как отсутствие проверки.
+#
+#   2. ``benchmark:baseline-gate`` — всегда запускаемый контроль эталона. Эталон —
+#      JSON принятого прогона с корпуса (артефакт job'а ``benchmark:measure`` или
+#      файл ``ops/benchmark/baseline.json`` в репозитории), который обновляется
+#      командой
+#      ``python -m scientific_tangle.evaluation.run_benchmark --write-baseline ops/benchmark/baseline.json``
+#      на раннере с корпусом и принимается отдельным MR. Пока эталон не
+#      установлен, job печатает «ЭТАЛОН НЕ УСТАНОВЛЕН» и инструкцию, как его
+#      получить: раньше при пустом ``BENCHMARK_BASELINE`` регрессионного контроля
+#      не было, а job всё равно считался пройденным — гейт качества молчал.
+#
+#      Видимость сигнала отделена от блокировки: на сборке merge-запроса job
+#      жёлтый (``allow_failure: true``), потому что корпуса в Git нет и числа
+#      «на глаз» гейт не принимает, а красная строка на каждом MR быстро
+#      приучает человека жать «retry». Плановая ночная сборка
+#      (``CI_PIPELINE_SOURCE == "schedule"``) тем же job'ом падает: пока эталон
+#      не установлен, об этом напоминает красный pipeline раз в сутки.
+#
+# Чисел эталона в репозитории нет, и придумывать их нечем: на этой машине корпуса
+# нет, прогон даёт код 2. Поэтому здесь только механизм с явной отметкой
+# «эталон не установлен».
+benchmark:measure:
   stage: benchmark
   before_script:
     - python -m pip install --cache-dir .cache/pip -e ".[dev]"
   variables:
-    # Путь к JSON эталонного прогона (артефакт раннера с корпусом). Пусто — значит
-    # регрессионный контроль не выполняется, и в отчёте это сказано явно.
-    BENCHMARK_BASELINE: ""
     BENCHMARK_JSON: "reports/benchmark.json"
+    # Путь к JSON эталонного прогона (артефакт раннера с корпусом). Пусто — значит
+    # регрессионный контроль не выполняется, и в отчёте это сказано явно; сам
+    # прогон на корпусе без эталона всё равно обязан пройти пороги приёмки.
+    BENCHMARK_BASELINE: ""
+  rules:
+    # Только раннер с полным корпусом. Пропуск виден в пайплайне, а не замаскирован
+    # под «зелёный».
+    - if: $BENCHMARK_CORPUS == "ready"
+      when: on_success
   script:
     - |
       set +e
@@ -79,8 +134,11 @@ benchmark:
           exit 1
           ;;
         2)
-          echo "Бенчмарк: ИЗМЕРЕНИЕ НЕ ВЫПОЛНЕНО — этот раннер без корпуса."
-          echo "Прогон пропущен явно; метрики качества не подтверждались."
+          # Job объявил корпус готовым, а измерение не состоялось: это отказ контура,
+          # а не пропуск. Молча зелёным он оставаться не вправе.
+          echo "Бенчмарк: ИЗМЕРЕНИЕ НЕ ВЫПОЛНЕНО на раннере с BENCHMARK_CORPUS=ready."
+          echo "Проверьте монтирование /data/sources и полноту «Источники информации/»."
+          exit 1
           ;;
         *)
           echo "Бенчмарк: неожиданный код выхода ${code}."
@@ -92,6 +150,58 @@ benchmark:
     expire_in: 30 days
     paths:
       - reports/benchmark.json
+  allow_failure: false
+
+benchmark:baseline-gate:
+  stage: benchmark
+  before_script:
+    - python -m pip install --cache-dir .cache/pip -e ".[dev]"
+  variables:
+    # Эталонный прогон: артефакт `benchmark:measure` (--write-baseline), сохранённый
+    # в репозиторий или доступный по URL. Пустой файл = гейт не пройден.
+    BENCHMARK_BASELINE_FILE: "ops/benchmark/baseline.json"
+  rules:
+    # Плановая сборка: без эталона пайплайн падает красным.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      allow_failure: false
+    # Сборка merge-запроса: тот же текст, но жёлтым.
+    - when: always
+      allow_failure: true
+  script:
+    - |
+      if [ ! -s "${BENCHMARK_BASELINE_FILE}" ]; then
+        echo "ЭТАЛОН НЕ УСТАНОВЛЕН: ${BENCHMARK_BASELINE_FILE} отсутствует или пуст."
+        echo "Чисел «на глаз» в гейте не бывает — их берёт только прогон с полным корпусом."
+        echo "Как установить:"
+        echo "  1) на раннере с BENCHMARK_CORPUS=ready:"
+        echo "     python -m scientific_tangle.evaluation.run_benchmark \\"
+        echo "       --write-baseline ${BENCHMARK_BASELINE_FILE}"
+        echo "  2) положить файл в репозиторий отдельным MR (проверка: accepted=true,"
+        echo "     corpus.documents равен числу строк preload_manifest.json)."
+        echo "  3) после этого регрессия относительно эталона проверяется job'ом"
+        echo "     benchmark:measure (--baseline \${BENCHMARK_BASELINE})."
+        exit 1
+      fi
+      python - <<'PY'
+      import json
+      import os
+
+      path = os.environ["BENCHMARK_BASELINE_FILE"]
+      with open(path, encoding="utf-8") as handle:
+          baseline = json.load(handle)
+      # Гейт понимает только прогон той же формы, что пишет CLI: чужой JSON —
+      # это «сравнить не с чем», а не «падений нет».
+      assert baseline.get("version") == 1, f"{path}: ожидался прогон версии 1"
+      assert baseline.get("accepted") is True, f"{path}: эталоном может быть только принятый прогон"
+      headline = baseline.get("headline") or {}
+      assert headline, f"{path}: нет карты headline — сравнивать нечего"
+      corpus = baseline.get("corpus") or {}
+      print(
+          "Эталон установлен: "
+          f"{corpus.get('documents')} документов, {corpus.get('gold_cases')} кейсов, "
+          f"recall@10={headline.get('hybrid_recall@10')}"
+      )
+      PY
   allow_failure: false
 
 sast:
