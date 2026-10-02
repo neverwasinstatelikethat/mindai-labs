@@ -35,6 +35,7 @@ from scientific_tangle.services.research_intelligence import (
     comparable_groups,
     to_research_claims,
 )
+from scientific_tangle.services.retrieval_semantics import AbortCheck
 
 DOC_ID = UUID(int=11)
 # Потолок глубины обхода задаёт схема ToolAction/RetrievalPlan (le=4).
@@ -53,6 +54,8 @@ class _StubKnowledge:
         query_plan: QueryPlan,
         retrieval_plan: object,
         allowed_data_classes: object = None,
+        *,
+        abort: AbortCheck | None = None,
     ) -> RetrievalContext:
         self.plans.append(list(getattr(retrieval_plan, "relation_types", [])))
         return RetrievalContext(
@@ -79,6 +82,8 @@ class _PerQueryKnowledge:
         query_plan: QueryPlan,
         retrieval_plan: object,
         allowed_data_classes: object = None,
+        *,
+        abort: AbortCheck | None = None,
     ) -> RetrievalContext:
         query = str(getattr(retrieval_plan, "lexical_query", ""))
         entities = tuple(getattr(retrieval_plan, "entity_names", ()))

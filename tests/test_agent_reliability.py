@@ -9,18 +9,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
+from scientific_tangle.agents.tools import ResearchToolExecutor, RunBudget
 from scientific_tangle.agents.workflow import (
     _CONFIDENCE_PENALTY,
+    _DEGRADABLE,
     _UNTRACED_CONFIDENCE_CAP,
     ResearchWorkflow,
+    _degradation_code,
+    _describe_failure,
     _language_mismatch,
     _numbers,
     _unit_conflicts,
@@ -31,14 +38,22 @@ from scientific_tangle.domain.contracts import (
     AgentControlDecision,
     CritiqueResult,
     Finding,
+    GraphSnapshot,
     PlanningBundle,
     QueryRequest,
     ReasoningResult,
 )
 from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import EvidenceLocator, NumericObservation
+from scientific_tangle.services.admission import (
+    MIN_RETRY_AFTER_SECONDS,
+    AdmissionRefusedError,
+    AgentRunAdmission,
+    agent_run_limit,
+)
 from scientific_tangle.services.agent_metrics import AgentMetricsRegistry
 from scientific_tangle.services.governance import AccessPolicyEngine
+from scientific_tangle.services.knowledge import InMemoryKnowledgeBase
 from scientific_tangle.services.provider import ModelUnavailableError
 from tests.fakes import ScriptedProvider
 from tests.test_workflow import planning_bundle
@@ -221,12 +236,50 @@ async def test_failed_node_degrades_with_explicit_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_provider_surfaces_as_unavailable_not_empty_answer() -> None:
-    """Недоступная модель — 503-исключение, а не «успешный» пустой ответ."""
-    provider = RepeatProvider({PlanningBundle: planning_bundle()})
+async def test_missing_provider_at_planning_surfaces_as_unavailable_not_empty_answer() -> None:
+    """Недоступная модель до первого доказательства — 503, а не «успешный» пустой ответ.
+
+    Терпеть здесь нечего: собрано ни одного факта, и «неполный ответ» был бы
+    выдумкой, а не деградацией.
+    """
+    provider = RepeatProvider({AgentControlDecision: ENOUGH})
 
     with pytest.raises(ModelUnavailableError):
         await ResearchWorkflow(provider=provider).run(QueryRequest(question=QUESTION))
+
+
+@pytest.mark.asyncio
+async def test_late_model_failure_keeps_findings_and_returns_degraded_answer() -> None:
+    """Отказ модели на позднем узле обязан сохранить находки, а не отдать 503.
+
+    «Сервис занят» после потолка очереди провайдера приходил, когда retrieval уже
+    сделал свою работу: ответ терял и доказательства, и trace. Дальше идёт тот же
+    ``_degraded``-механизм, что и по дедлайну, а internals провайдера режутся.
+    """
+    async def refuse() -> ReasoningResult:
+        raise ModelUnavailableError(
+            "402 https://gigachat.internal/api/v1: b'{\"status\":402}', Headers(...)"
+        )
+
+    provider = RepeatProvider(
+        {
+            PlanningBundle: planning_bundle(),
+            AgentControlDecision: ENOUGH,
+            ReasoningResult: refuse,
+        }
+    )
+
+    answer = await ResearchWorkflow(provider=provider).run(QueryRequest(question=QUESTION))
+
+    assert answer.findings, "отказ модели не имеет права выбрасывать уже собранное"
+    assert answer.tool_observations
+    assert any("модель недоступна на узле reasoner" in item for item in answer.degradation_reasons)
+    assert any(
+        "тариф провайдера не оплачен (HTTP 402)" in item
+        for item in answer.degradation_reasons
+    )
+    assert "Headers" not in " ".join(answer.degradation_reasons)
+    assert [event.status for event in answer.trace][-1] == "failed"
 
 
 @pytest.mark.asyncio
@@ -310,19 +363,60 @@ async def test_stream_degradation_keeps_the_evidence_run_would_keep() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tight_budget_drops_evidence_but_keeps_the_draft_and_says_so() -> None:
-    """Перенасыщение бюджета не смеет быть молчаливым и не смеет съедать черновик."""
-    provider = ScriptedProvider(planning_bundle(), ENOUGH, reasoning("Черновик ответа."), OK)
+async def test_synthesis_is_not_paid_for_when_evidence_does_not_fit() -> None:
+    """Доказательства не влезли — синтез не вызывается: три обращения за вымыслом.
+
+    Раньше при перенасыщении бюджета FINDINGS отбрасывались целиком, а
+    Reasoner/Critic/Improver всё равно шли и обязаны были выдумывать ``finding_ids``.
+    Теперь деградация называется честно, а уже найденное доказательство сохраняется.
+    """
+    provider = RepeatProvider(
+        {
+            PlanningBundle: planning_bundle(),
+            AgentControlDecision: ENOUGH,
+        }
+    )
     settings = Settings(knowledge_backend="memory", context_token_budget=500)
 
     answer = await ResearchWorkflow(provider=provider, settings=settings).run(
         QueryRequest(question=QUESTION)
     )
 
-    critic_prompt = provider.prompt_for("CritiqueResult")
-    assert "DRAFT" in critic_prompt and "Черновик ответа." in critic_prompt
-    critic_notes = [item for item in answer.degradation_reasons if "Узел Critic" in item]
-    assert critic_notes and "FINDINGS" in critic_notes[0], "потеря контекста обязана быть видна"
+    assert "ReasoningResult" not in provider.calls, "синтез вслепую запрещён"
+    notes = " ".join(answer.degradation_reasons)
+    assert "не поместились в бюджет контекста" in notes
+    assert "модель недоступна" not in notes, "причина — бюджет, а не отказ провайдера"
+    assert answer.findings, "деградация обязана сохранить то, что retrieval уже нашёл"
+
+
+@pytest.mark.asyncio
+async def test_reasoner_prompt_keeps_at_least_one_finding_or_the_run_degrades() -> None:
+    """Детерминированное сжатие доказательной базы не смеет быть молчаливым.
+
+    Половина инварианта: если синтез вызван — в промпте есть хотя бы одно real
+    доказательство и названо число отброшенного. Вторая половина покрыта предыдущим
+    тестом: не влезает ни одного — обращения к модели не происходит вовсе.
+    """
+    provider = ScriptedProvider(
+        planning_bundle(),
+        ENOUGH,
+        reasoning("Обратный осмос даёт 95–99% задержания солей."),
+        OK,
+    )
+    settings = Settings(knowledge_backend="memory", context_token_budget=3400)
+
+    answer = await ResearchWorkflow(provider=provider, settings=settings).run(
+        QueryRequest(question=QUESTION)
+    )
+
+    if "ReasoningResult" in provider.calls:
+        prompt = provider.prompt_for("ReasoningResult")
+        assert "finding-ro" in prompt.split("FINDINGS")[1], "секция FINDINGS не вправе быть пустой"
+        assert all("исключены секции FINDINGS" not in item for item in answer.degradation_reasons)
+    else:
+        assert any(
+            "не поместились в бюджет контекста" in item for item in answer.degradation_reasons
+        )
 
 
 @pytest.mark.asyncio
@@ -812,3 +906,341 @@ async def test_deadline_degradation_is_counted_with_a_bounded_reason_code() -> N
 
     assert any("бюджет времени" in item for item in answer.degradation_reasons)
     assert registry.snapshot().degradations_by_reason.get("timeout") == 1
+
+
+# ── D1: доля бюджета узла ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_slow_planning_node_cannot_burn_the_whole_deadline() -> None:
+    """Один узел не выжигает бюджет прогона: он ограничен своей долей остатка.
+
+    Провайдер делит весь ``agent_deadline_seconds`` на попытки одного обращения, и
+    зависший planning-узел съедал бы 300 с, не оставив времени остальным. Снаружи
+    узел ограничен ``asyncio.timeout`` — деградация наступает раньше дедлайна и
+    называет узел, а не «время вышло».
+    """
+    async def slow() -> PlanningBundle:
+        await asyncio.sleep(30)
+        return planning_bundle()
+
+    registry = AgentMetricsRegistry()
+    provider = RepeatProvider({PlanningBundle: slow})
+    settings = Settings(knowledge_backend="memory", agent_deadline_seconds=4.0)
+    workflow = ResearchWorkflow(provider=provider, settings=settings, metrics=registry)
+
+    started = monotonic()
+    answer = await workflow.run(QueryRequest(question=QUESTION))
+    elapsed = monotonic() - started
+
+    assert 2.5 <= elapsed < 3.9, f"узел должен быть обрезан своей долей, а не дедлайном: {elapsed}"
+    notes = " ".join(answer.degradation_reasons)
+    assert "превысил свою долю бюджета" in notes and "planning_agent" in notes
+    assert "превышен бюджет времени исследования" not in notes
+    assert registry.snapshot().degradations_by_reason.get("node_budget:planning_agent") == 1
+
+
+# ── D3: приём, согласованный со способностью модели ──────────────────────────
+
+
+def _llm_settings(**overrides: object) -> Settings:
+    material = {
+        "_env_file": None,
+        "knowledge_backend": "memory",
+        "accounts_backend": "memory",
+        "gigachat_api_key": "test-key",
+        "gigachat_max_concurrent": 1,
+        "agent_max_concurrent_runs": 4,
+        "agent_deadline_seconds": 300.0,
+    }
+    material.update(overrides)
+    return Settings(**material)  # type: ignore[arg-type]
+
+
+def test_admission_limit_follows_model_throughput() -> None:
+    """Потолок приёма производен от слотов модели, а не от круглого числа в env.
+
+    Четыре принятых прогона при одном LLM-слоте — это ~32 ожидающих обращения:
+    очередь съедала дедлайн каждого из них.
+    """
+    assert agent_run_limit(_llm_settings()) == 2
+    assert agent_run_limit(_llm_settings(gigachat_max_concurrent=8)) == 4
+    # Явный env перекрывает эвристику — для нескольких воркеров и осознанной
+    # переподписки.
+    assert agent_run_limit(_llm_settings(agent_admission_limit=6)) == 6
+    # Без настроенной модели сравнивать ёмкость не с чем.
+    assert agent_run_limit(_llm_settings(gigachat_api_key="")) == 4
+
+
+def test_admission_refuses_instantly_beyond_the_derived_limit() -> None:
+    """Смысл 429 не меняется: отказ сразу, без очереди внутри дедлайна."""
+    settings = _llm_settings()
+    admission = AgentRunAdmission(
+        limit=agent_run_limit(settings), deadline_seconds=settings.agent_deadline_seconds
+    )
+    first = admission.acquire()
+    second = admission.acquire()
+    assert second.token is not None
+    with pytest.raises(AdmissionRefusedError) as refused:
+        admission.acquire()
+    assert refused.value.retry_after >= MIN_RETRY_AFTER_SECONDS
+    first.release()
+    assert admission.acquire().token is not None
+
+
+def test_startup_warns_when_ceiling_outruns_the_model(caplog: pytest.LogCaptureFixture) -> None:
+    """Конфиг, обещающий больше, чем вывезет модель, виден на старте."""
+    with caplog.at_level(logging.WARNING, logger="scientific_tangle.config"):
+        _llm_settings(agent_max_concurrent_runs=8)
+    assert "превышает пропускную способность модели" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="scientific_tangle.config"):
+        _llm_settings(agent_max_concurrent_runs=8, agent_admission_limit=8)
+    assert "превышает пропускную способность модели" not in caplog.text
+
+
+# ── D4: sanitized root cause и потолок candidate policy ──────────────────────
+
+
+class _LeakyKnowledge:
+    """Драйверы падают с connection string в тексте — он не вправе уехать в промпт."""
+
+    def __init__(self) -> None:
+        self._real = InMemoryKnowledgeBase()
+        self.calls: list[str] = []
+
+    def retrieve(
+        self, plan: Any, retrieval_plan: Any, allowed: Any, *, abort: Any = None
+    ) -> Any:
+        self.calls.append(retrieval_plan.lexical_query)
+        raise RuntimeError(
+            "neo4j unavailable at bolt://neo4j:7687, dsn postgresql://user:secret@postgres:5432"
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_error_hint_reaches_prompts_sanitized() -> None:
+    """``root_cause_hint`` уходит planner/controller: только нейтральное название сбоя."""
+    knowledge = _LeakyKnowledge()
+    executor = ResearchToolExecutor(knowledge)
+    bundle = planning_bundle()
+
+    result = await executor.execute(bundle.action_plan, bundle.query_plan, None)
+
+    hints = " ".join(observation.root_cause_hint or "" for observation in result.observations)
+    assert knowledge.calls, "действие должно была исполнено (отказа по бюджету нет)"
+    for fragment in ("bolt://", "postgresql://", "user:secret", "7687"):
+        assert fragment not in hints
+    assert hints.startswith("retrieval:")
+    assert len(hints) <= 300
+
+
+@pytest.mark.asyncio
+async def test_candidate_policy_is_capped_and_says_so() -> None:
+    """Активная политика не смеет молча вытеснять доказательства из промпта."""
+    policy = "Цитируй лист источника. " * 400
+    provider = ScriptedProvider(planning_bundle(), ENOUGH, reasoning("Вывод."), OK)
+    settings = Settings(knowledge_backend="memory", policy_max_tokens=64)
+
+    answer = await ResearchWorkflow(
+        provider=provider, settings=settings, extra_policy=policy
+    ).run(QueryRequest(question=QUESTION))
+
+    system = provider.prompts["PlanningBundle"][0][0]
+    assert "CANDIDATE POLICY" in system
+    assert system.count("Цитируй лист") < policy.count("Цитируй лист"), "политика усечена"
+    notes = [item for item in answer.degradation_reasons if "CANDIDATE POLICY усечена" in item]
+    assert len(notes) == 1, "усечение отмечается ровно один раз на прогон"
+
+    short = await ResearchWorkflow(
+        provider=ScriptedProvider(planning_bundle(), ENOUGH, reasoning("Вывод."), OK),
+        settings=settings,
+        extra_policy="Цитируй лист источника.",
+    ).run(QueryRequest(question=QUESTION))
+    assert not any("CANDIDATE POLICY усечена" in item for item in short.degradation_reasons)
+
+
+# ── D5/D6: редьюсеры и битые записи состояния ────────────────────────────────
+
+
+class _JunkyKnowledge:
+    """Отдаёт граф с записью неверной формы — как чекпоинт после смены схемы."""
+
+    def __init__(self) -> None:
+        self._real = InMemoryKnowledgeBase()
+
+    def retrieve(
+        self, plan: Any, retrieval_plan: Any, allowed: Any, *, abort: Any = None
+    ) -> Any:
+        context = self._real.retrieve(plan, retrieval_plan, allowed, abort=abort)
+        junk = {"id": ["не-строка"], "type": "мусор"}
+        graph = context.graph.model_copy(update={"nodes": [*context.graph.nodes, junk]})
+        return replace(context, graph=graph)
+
+
+@pytest.mark.asyncio
+async def test_invalid_graph_records_degrade_instead_of_500() -> None:
+    """Битая запись хранилища не смеет валить прогон сырым исключением.
+
+    Её ждут и граница tools, и редьюсер канала ``graph`` (он вызывается движком
+    LangGraph вне ``_instrument``): в обоих местах запись отбрасывается, а факт
+    уходит аналитику в ``degradation_reasons``.
+    """
+    provider = ScriptedProvider(planning_bundle(), ENOUGH, reasoning("Вывод."), OK)
+    workflow = ResearchWorkflow(knowledge=_JunkyKnowledge(), provider=provider)
+
+    answer = await workflow.run(QueryRequest(question=QUESTION))
+
+    assert answer.summary == "Вывод."
+    assert any("не прошли проверку" in item for item in answer.degradation_reasons)
+    assert answer.graph.nodes, "битая запись не отменяет валидную часть графа"
+
+
+def test_graph_reducer_survives_checkpoint_records_of_wrong_shape() -> None:
+    """``merge_graphs`` с невалидным левым значением деградирует, а не бросает."""
+    from scientific_tangle.agents.workflow import EMPTY_GRAPH, merge_graphs
+
+    junky = GraphSnapshot.model_construct(
+        nodes=[{"id": ["не-строка"]}], edges=["не-узел"], communities=[7, "сообщество"]
+    )
+
+    merged = merge_graphs(junky, EMPTY_GRAPH)
+
+    assert merged.nodes == [] and merged.edges == []
+    assert merged.communities == ["сообщество"]
+
+
+def test_state_validation_error_is_a_degradation_not_a_crash() -> None:
+    """``ValidationError`` из каналов состояния входит в список деградируемого."""
+    with pytest.raises(ValidationError) as caught:
+        GraphSnapshot(nodes=[1])  # type: ignore[list-item]
+    error = caught.value
+    assert isinstance(error, _DEGRADABLE)
+    assert _degradation_code(error) == "state_schema"
+    assert "проверку схемы" in _describe_failure(error)
+    assert str(error)[:40] not in _describe_failure(error), "сырое сообщение не уходит наружу"
+
+
+# ── D7: чекпоинтер вне дедлайна ──────────────────────────────────────────────
+
+
+class _HangingCheckpointer(InMemorySaver):
+    """Имитация боя Postgres: выбранный метод не отвечает первые ``calls`` вызовов.
+
+    ``graph.aget_state`` ходит в ``aget_tuple`` чекпоинтера — вешать надо именно его,
+    и только открытие ветки (первый вызов): внутренние супершаги графа ограничены
+    дедлайном прогона и к этой проверке отношения не имеют. ``adelete_thread``
+    засчитывается, чтобы повесить запись ветки (второй вызов).
+    """
+
+    def __init__(self, hang: set[str], *, calls: int = 1) -> None:
+        super().__init__()
+        self._hang = hang
+        self._calls = calls
+        self.tuples = 0
+        self.deletes = 0
+
+    async def aget_tuple(self, config: Any) -> Any:
+        self.tuples += 1
+        if "aget_state" in self._hang and self.tuples <= self._calls:
+            await asyncio.sleep(3600)
+        return await super().aget_tuple(config)
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        self.deletes += 1
+        if "adelete_thread" in self._hang and self.deletes > self._calls:
+            await asyncio.sleep(3600)
+        await super().adelete_thread(thread_id)
+
+
+@pytest.mark.asyncio
+async def test_hung_checkpointer_on_open_degrades_without_hanging() -> None:
+    """Открытие ветки ограничено: недоступный чекпоинтер не вешает запрос.
+
+    Оно лежит до ``asyncio.timeout`` прогона, поэтому без собственной границы
+    бое БД означал зависший HTTP-запрос вообще без деградации.
+    """
+    provider = ScriptedProvider(planning_bundle(), ENOUGH, reasoning("Ответ есть."), OK)
+    settings = Settings(knowledge_backend="memory", agent_deadline_seconds=8.0)
+    workflow = ResearchWorkflow(
+        provider=provider, settings=settings, checkpointer=_HangingCheckpointer({"aget_state"})
+    )
+
+    started = monotonic()
+    answer = await workflow.run(QueryRequest(question=QUESTION))
+    elapsed = monotonic() - started
+
+    assert elapsed < 7.5, f"ожидание БД обязано быть ограничено: {elapsed}"
+    assert answer.summary == "Ответ есть."
+    assert any("не открыта за" in item for item in answer.degradation_reasons)
+
+
+@pytest.mark.asyncio
+async def test_hung_checkpointer_on_commit_is_reported() -> None:
+    """Запись следа ветки тоже под таймаутом: ответ собран — вешать запрос нельзя."""
+    provider = ScriptedProvider(planning_bundle(), ENOUGH, reasoning("Ответ собран."), OK)
+    settings = Settings(knowledge_backend="memory", agent_deadline_seconds=8.0)
+    workflow = ResearchWorkflow(
+        provider=provider,
+        settings=settings,
+        checkpointer=_HangingCheckpointer({"adelete_thread"}),
+    )
+
+    started = monotonic()
+    answer = await workflow.run(QueryRequest(question=QUESTION))
+    elapsed = monotonic() - started
+
+    assert elapsed < 7.5
+    assert answer.summary == "Ответ собран."
+    assert any("не принят за" in item for item in answer.degradation_reasons)
+
+
+# ── D8: кооперативная отмена retrieval ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_expired_run_does_not_dispatch_new_retrieval() -> None:
+    """Истёкший бюджет не запускает новую работу: ``to_thread`` без токена не отзвать.
+
+    Действие, которое уже не прочитает ни один узел, только занимает worker-поток и
+    слот хранилища — поэтому проверка идёт до диспетчеризации.
+    """
+    knowledge = _CountingKnowledge()
+    executor = ResearchToolExecutor(knowledge)
+    bundle = planning_bundle()
+
+    expired = await executor.execute(
+        bundle.action_plan,
+        bundle.query_plan,
+        None,
+        budget=RunBudget(deadline_at=monotonic() - 1),
+    )
+    assert knowledge.calls == [], "истёкший прогон не имеет права трогать хранилище"
+    assert expired.observations, "план из двух действий обязан отдать наблюдения"
+    assert all(observation.status == "error" for observation in expired.observations)
+    assert any(
+        "исчерпанного бюджета времени прогона" in item for item in expired.degradation_reasons
+    )
+
+    fresh = await executor.execute(
+        bundle.action_plan,
+        bundle.query_plan,
+        None,
+        budget=RunBudget(deadline_at=monotonic() + 30),
+    )
+    assert fresh.findings, "с остатком бюджета действия исполняются как раньше"
+
+
+class _CountingKnowledge:
+    """Счётчик обращений к retrieval: без него нельзя отличить «не начали» от «упало»."""
+
+    def __init__(self) -> None:
+        self._real = InMemoryKnowledgeBase()
+        self.calls: list[str] = []
+
+    def retrieve(
+        self, plan: Any, retrieval_plan: Any, allowed: Any, *, abort: Any = None
+    ) -> Any:
+        self.calls.append(retrieval_plan.lexical_query)
+        return self._real.retrieve(plan, retrieval_plan, allowed, abort=abort)

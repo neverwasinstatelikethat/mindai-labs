@@ -5,10 +5,11 @@
 тарифа в минуты, за которые новичок не получал ответа вообще — хотя лексическая
 ветка была рабочая. Поверх этого зависший эндпоинт держал замок на четыре
 полных транспортных таймаута, а ``infrastructure._semantic_ids`` пересчитывал
-эмбеддинг одного и того же вопроса на каждом retrieval-действии. Отсюда три
-правила, зафиксированных тестами: постоянный отказ — одна попытка; транзиентный —
-четыре попытки, но суммарно не дольше ``gigachat_timeout_seconds``; идентичный
-текст переиспользуется из TTL-мемо, ошибка в мемо не попадает.
+эмбеддинг одного и того же вопроса на каждом retrieval-действии. Отсюда правила,
+зафиксированные тестами: постоянный отказ — одна попытка и короткая пауза на весь
+процесс (негативный кэш); транзиентный — четыре попытки, но суммарно не дольше
+``gigachat_timeout_seconds``; сон backoff вне замка; идентичный текст
+переиспользуется из TTL-мемо, ошибка в мемо не попадает.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from scientific_tangle.services.embeddings import (
     GigaChatEmbeddingClient,
     _EmbeddingCache,
     _refused_for_good,
+    _TerminalRefusalGate,
 )
 
 
@@ -51,6 +53,7 @@ def _stub_client(
     *,
     budget_seconds: float = 90.0,
     cache_ttl_seconds: float = 3600.0,
+    refusal_cooldown_seconds: float = 30.0,
 ) -> GigaChatEmbeddingClient:
     """Клиент без сети и без конструктора GigaChat: только проверяемые поля."""
     client = GigaChatEmbeddingClient.__new__(GigaChatEmbeddingClient)
@@ -59,6 +62,7 @@ def _stub_client(
     client._dimensions = 4
     client._retry_budget_seconds = budget_seconds
     client._cache = _EmbeddingCache(ttl_seconds=cache_ttl_seconds, max_entries=64)
+    client._refusals = _TerminalRefusalGate(refusal_cooldown_seconds)
     client._client = type("Stub", (), {"embeddings": staticmethod(embeddings)})()
     return client
 
@@ -78,29 +82,104 @@ def test_error_without_status_keeps_the_retry_budget() -> None:
     assert not _refused_for_good(RuntimeError("соединение оборвано"))
 
 
-def test_permanent_refusal_does_not_burn_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    """402 снимается одной попыткой и без sleep — деградация в лексику сразу.
+def test_permanent_refusal_is_one_trip_and_a_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """402 снимается одной попыткой и не повторяется на каждом новом тексте.
 
-    Повторный запрос обязан снова дойти до сети: отказ в мемо не пишется, иначе
-    починенный тариф навсегда остался бы «недоступным» внутри TTL.
+    Рубильник короткий и обнуляется успехом, поэтому починенный тариф снова
+    проверяется сетью сам — без перезапуска процесса и без вечного «недоступно».
+    """
+    calls: list[str] = []
+    clock = [1000.0]
+
+    def _refuse(texts: list[str], **kwargs: object) -> None:
+        calls.extend(texts)
+        raise _Status(402)
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda value: pytest.fail("пауз при 402 быть не может"))
+    client = _stub_client(_refuse)
+
+    with pytest.raises(EmbeddingError):
+        client.query("первый")
+    with pytest.raises(EmbeddingError):
+        client.query("второй")
+    assert calls == ["первый"], "второй текст не платит round-trip под занятым слотом модели"
+
+    # Пауза истекла — отказ проверяется заново.
+    clock[0] += 31.0
+    with pytest.raises(EmbeddingError):
+        client.query("третий")
+    assert calls == ["первый", "третий"]
+
+
+def test_successful_answer_clears_the_refusal_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Один успешный ответ снимает рубильник, а новый отказ взводит его снова.
+
+    Иначе пауза превратилась бы в односторонний выключатель: починенный тариф
+    живёт до следующего 402, и он обязан стоить ровно одну попытку, а не молча
+    блокировать процесс навсегда.
+    """
+    clock = [1000.0]
+    responses: list[object] = [_Status(402), _Response([[0.5] * 4]), _Status(402)]
+    requested: list[list[str]] = []
+
+    def _answer(texts: list[str], **kwargs: object) -> object:
+        requested.append(list(texts))
+        reply = responses.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda value: None)
+    client = _stub_client(_answer)
+
+    with pytest.raises(EmbeddingError):
+        client.query("первый")
+    assert client._refusals.remaining() == pytest.approx(30.0)
+
+    # Пауза истекла — попытка снова идёт в сеть и succeeds, сбрасывая рубильник.
+    clock[0] += 31.0
+    assert client.query("второй") == [0.5] * 4
+    assert client._refusals.remaining() <= 0
+
+    # Новый отказ взводит паузу заново: третий текст сети уже не платит.
+    with pytest.raises(EmbeddingError):
+        client.query("третий")
+    assert requested == [["первый"], ["второй"], ["третий"]]
+
+
+def test_backoff_sleep_does_not_hold_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Сон backoff вне замка: пауза одной цепочки не приковывает эмбеддинги процесса.
+
+    Раньше замок удерживался сквозь 2+4+8 с, и вопрос аналитика ждал освобождения
+    даже тогда, когда сеть была полностью здорова.
     """
     calls: list[int] = []
 
-    def _refuse(*args: object, **kwargs: object) -> None:
+    def _busy(*args: object, **kwargs: object) -> None:
         calls.append(1)
-        raise _Status(402)
+        raise _Status(429)
 
-    client = _stub_client(_refuse)
-    slept: list[float] = []
-    monkeypatch.setattr(time, "sleep", lambda value: slept.append(value))
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+    client = _stub_client(_busy, budget_seconds=90.0)
+    free_during_sleep: list[bool] = []
+
+    def _observe_sleep(value: float) -> None:
+        # Неблокирующая попытка взять замок проходит только тогда, когда спищий
+        # его не держит.
+        acquired = client._lock.acquire(blocking=False)
+        free_during_sleep.append(acquired)
+        if acquired:
+            client._lock.release()
+
+    monkeypatch.setattr(time, "sleep", _observe_sleep)
 
     with pytest.raises(EmbeddingError):
         client.query("вопрос")
-    with pytest.raises(EmbeddingError):
-        client.query("вопрос")
 
-    assert len(calls) == 2
-    assert slept == []
+    assert len(calls) == 4
+    assert free_during_sleep == [True, True, True], "замок должен освобождаться на время паузы"
 
 
 def test_transient_failure_still_gets_four_attempts(
@@ -242,11 +321,15 @@ def test_memo_disabled_with_non_positive_ttl() -> None:
     assert len(requested) == 2
 
 
-def test_success_then_refusal_keeps_last_good_vector() -> None:
+def test_success_then_refusal_keeps_last_good_vector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Успешный вектор уже в мемо: последующий отказ не откатывает retrieval.
 
     Degradation-путь 402 (эмбеддинги недоступны → лексическая ветка) обязан
-    работать и для новых текстов: отказ в сеть уходит каждый раз заново.
+    работать и для новых текстов: отказ в мемо не пишется. Негативный кэш здесь
+    выключен (cooldown=0) — тест ровно про это: при выключенном рубильнике каждое
+    обращение проверяется сетью, как было до его появления.
     """
     responses: list[object] = []
     requested: list[list[str]] = []
@@ -258,7 +341,8 @@ def test_success_then_refusal_keeps_last_good_vector() -> None:
             raise reply
         return _Response([[0.25] * 4 for _ in texts])
 
-    client = _stub_client(_answer)
+    monkeypatch.setattr(time, "sleep", lambda value: None)
+    client = _stub_client(_answer, refusal_cooldown_seconds=0.0)
 
     responses.append(object())
     assert client.query("первый") == [0.25] * 4

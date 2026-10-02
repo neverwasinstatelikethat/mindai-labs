@@ -18,9 +18,16 @@ from typing import Any
 import pytest
 from test_retrieval_persistence import Harness, build_backend, neo_node
 
-from scientific_tangle.domain.contracts import RetrievalPlan
+from scientific_tangle.domain.contracts import (
+    GraphEdge,
+    GraphNode,
+    GraphSnapshot,
+    NodeType,
+    RetrievalPlan,
+)
 from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import QueryPlan
+from scientific_tangle.services.governance import AccessPolicyEngine
 from scientific_tangle.services.knowledge import InMemoryKnowledgeBase
 
 RESTRICTED_MARKER = "Энергия в 3–5 раз"
@@ -160,3 +167,53 @@ def test_production_community_briefs_keep_restricted_claim_when_allowed(
     )
 
     assert RESTRICTED_MARKER in "\n".join(context.community_summaries)
+
+
+# ── ACL-срез не отдаёт общий список сообществ по ссылке ─────────────────────
+
+
+def _shared_snapshot() -> GraphSnapshot:
+    """Снимок графа из общего кэша: ровно тот объект, что отдаёт ``full_graph``."""
+    return GraphSnapshot(
+        nodes=[
+            GraphNode(id="evaporation", label="Выпаривание", type=NodeType.PROCESS),
+            GraphNode(
+                id="claim-energy",
+                label=RESTRICTED_LABEL,
+                type=NodeType.CLAIM,
+                data_class=DataClass.RESTRICTED,
+            ),
+        ],
+        edges=[
+            GraphEdge(
+                id="e-pub",
+                source="evaporation",
+                target="claim-energy",
+                relation="REQUIRES",
+                data_class=DataClass.RESTRICTED,
+            )
+        ],
+        communities=["community-heat", "community-brine"],
+    )
+
+
+def test_acl_slice_does_not_hand_out_the_shared_communities_list() -> None:
+    """``filter_graph`` возвращает список сообщений отдельным контейнером.
+
+    Узлы и рёбра срез собирает новые, а ``communities`` — единственное поле,
+    которое иначе доставалось бы вызывающей стороне от снимка из общего кэша:
+    правка returned-списка (редьюсер графа в рабочем процессе, профиль
+    сообщества) дошла бы до всех последующих запросов процесса. Копия в
+    governance обязана быть явной, а не следствием валидации pydantic: иначе
+    гарантия пропадёт вместе с первой «оптимизацией» построения снимка.
+    """
+    engine = AccessPolicyEngine()
+    cached = _shared_snapshot()
+
+    filtered = engine.filter_graph(cached, PUBLIC_CLASSES)
+    filtered.communities.append("community-подмешанная")
+
+    assert filtered.communities is not cached.communities
+    assert cached.communities == ["community-heat", "community-brine"]
+    # Следующий срез того же снимка — прежние сообщества, без чужой метки.
+    assert engine.filter_graph(cached, PUBLIC_CLASSES).communities == cached.communities

@@ -101,7 +101,7 @@ def test_entity_filter_matches_whole_tokens_only() -> None:
 
 
 class _BrokenKnowledge:
-    """index_document падает по-infraструктуре: это отказ пайплайна, а не OCR-бэклог."""
+    """index_document падает по инфраструктуре: это отказ пайплайна, а не OCR-бэклог."""
 
     def index_document(self, document: Any, source_path: str) -> Any:  # pragma: no cover
         raise RuntimeError("neo4j unavailable")
@@ -116,6 +116,34 @@ def test_infrastructure_failure_is_not_counted_as_ocr_backlog(tmp_path: Path) ->
     report = _compile(tmp_path, _BrokenKnowledge())
     assert report.ocr_required == 0
     assert report.failed == 1
+
+
+def test_file_without_chunks_is_not_counted_as_covered(tmp_path: Path) -> None:
+    """Файл, дошедший до отказа чанкинга, не входит в покрытие корпуса — цепочкой целиком.
+
+    Порог разбора (20 символов суммарного текста) ниже порога чанкинга (40 символов на
+    кусок), поэтому короткий файл проходит парсер и упирается в `NoChunksError`. На
+    уровне хранилища отказ закрыт тестами `test_retrieval_persistence.py`; здесь
+    проверяется то, что видит аналитик: отказ не зачислен в `created`, а его причина
+    дошла до `errors` отчёта компиляции.
+    """
+    from scientific_tangle.services.knowledge import InMemoryKnowledgeBase
+
+    (tmp_path / "note.txt").write_text(
+        "Песок 0,2 мм по гранулометрии.", encoding="utf-8"
+    )
+    knowledge = InMemoryKnowledgeBase()
+
+    report = CorpusCompiler(knowledge, tmp_path, max_file_bytes=10_000).compile(10)
+
+    assert report.created == 0
+    assert report.duplicates == 0
+    assert report.failed == 1
+    assert report.chunks == 0
+    assert any("чанкинга" in error for error in report.errors), report.errors
+    # Каталог не получил чанков: «документ в корпусе» без единого фрагмента — это
+    # ровно то расхождение, из-за которого окно поиска врёт про состав корпуса.
+    assert not any(f.id.startswith("chunk-") for f in knowledge.all_findings())
 
 
 def _blank_pdf() -> bytes:
@@ -440,7 +468,7 @@ def test_repair_attempts_are_counted_where_they_actually_happen() -> None:
     """Повтор принадлежит обращению к модели, а не агенту.
 
     Раньше дашборд показывал «повторов» в строке агента, хотя счётчик не
-    incrementился ни одним вызовом: отображаемое число обязано иметь источник.
+    инкрементировался ни одним вызовом: отображаемое число обязано иметь источник.
     """
     registry = AgentMetricsRegistry()
     registry.observe("reasoner", 120.0, True)

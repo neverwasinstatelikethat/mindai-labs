@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -41,6 +41,7 @@ from psycopg_pool import AsyncConnectionPool
 from scientific_tangle.config import Settings
 from scientific_tangle.domain.contracts import (
     AnswerPayload,
+    ConflictReview,
     EvaluationRun,
     EvolutionExperiment,
     EvolutionProposal,
@@ -56,7 +57,16 @@ logger = logging.getLogger(__name__)
 
 # Буферизация обязательна: прежние словари росли вместе с числом запросов и
 # никогда не очищались, а ответ — это полный граф с evidence-цитатами.
-MAX_STORED_ANSWERS = 200
+#
+# Потолок держится НА УЧЁТНУЮ ЗАПИСЬ, а не на весь сервис: при общем лимите в
+# 200 копий экспорт собственного ответа давал 404 ровно тогда, когда импортируют
+# и спрашивают другие аналитики («answer not found» — это потерянный результат
+# работы, а не пустая лента). ``MAX_STORED_ANSWERS_TOTAL`` — предохранитель от
+# линейного роста числа активных аккаунтов, и он на порядок больше личного
+# потолка, то есть вытесняет чужой ответ только когда журнал упёрся в потолок
+# всего процесса.
+MAX_STORED_ANSWERS = 100
+MAX_STORED_ANSWERS_TOTAL = 5000
 ANSWER_TTL = timedelta(hours=12)
 MAX_DECISIONS = 5000
 # Журнал аудита вытесняет старейшие события безвозвратно: потолок держится
@@ -69,12 +79,29 @@ MAX_EXPERIMENTS = 500
 # очередь означает потерянные решения, а активная политика промпта выводится именно
 # из принятых предложений и обязана переживать рестарт.
 MAX_PROPOSALS = 500
+# Решения по противоречиям — не поток событий, а состояние пары: первичный ключ
+# один на пару, поэтому повторное решение обновляет запись, а не множит её.
+# Потолок страховочный: он ограничивает число рассмотренных пар, а не число
+# обращений к эндпоинту.
+MAX_CONFLICT_REVIEWS = 5000
 MAX_EVALUATION_RUNS = 200
 # Запись закрывает один прогон (реже — одно обращение к модели): потолок держит
 # недельную историю расходов, но не превращает таблицу в бесконечный журнал.
 MAX_LLM_USAGE_RECORDS = 20000
+# Рабочие треды LangGraph. Успешный прогон снимает свой тред ``adelete_thread``,
+# а прерванный (отказ модели, снятый процессом worker, отмена по deadline)
+# остаётся навсегда: ``checkpoints``/``checkpoint_blobs``/``checkpoint_writes``
+# растут только вверх. Порог консервативный — удаляются треды, у которых и
+# ПОСЛЕДНИЙ чекпоинт старше срока: активный прогон затронут быть не может.
+CHECKPOINT_THREAD_TTL = timedelta(days=7)
+CHECKPOINT_CLEANUP_INTERVAL_SECONDS = 6 * 3600.0
+CHECKPOINT_CLEANUP_BATCH_THREADS = 200
 
 __all__ = [
+    "CHECKPOINT_CLEANUP_BATCH_THREADS",
+    "CHECKPOINT_CLEANUP_INTERVAL_SECONDS",
+    "CHECKPOINT_THREAD_TTL",
+    "CheckpointPurgeReport",
     "DurableState",
     "InMemoryDurableState",
     "LlmAccountUsage",
@@ -82,7 +109,22 @@ __all__ = [
     "PostgresDurableState",
     "StoredAnswer",
     "build_durable_state",
+    "run_checkpoint_cleanup",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointPurgeReport:
+    """Итог одной волны очистки рабочих тредов LangGraph.
+
+    ``removed_threads`` и ``removed_rows`` идут в журнал и в ``/health/ready``:
+    молча удалять чужое состояние нельзя, оператор обязан видеть, сколько и
+    насколько древних тредов контур счёл осиротевшими.
+    """
+
+    removed_threads: int = 0
+    removed_rows: int = 0
+    skipped_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +215,10 @@ class DurableState(Protocol):
     async def record_decision(self, decision: ExpertDecision) -> None: ...
 
     async def recent_decisions(
-        self, *, limit: int = 100, actor_id: str | None = None
+        self, *, limit: int = 100, offset: int = 0, actor_id: str | None = None
     ) -> list[ExpertDecision]: ...
+
+    async def count_decisions(self, *, actor_id: str | None = None) -> int: ...
 
     async def append_audit(self, event: AuditEvent) -> None: ...
 
@@ -182,25 +226,44 @@ class DurableState(Protocol):
         self,
         *,
         limit: int = 100,
+        offset: int = 0,
         correlation_id: str | None = None,
         actor_id: str | None = None,
     ) -> list[AuditEvent]: ...
+
+    async def count_audit(
+        self, *, correlation_id: str | None = None, actor_id: str | None = None
+    ) -> int: ...
 
     async def append_notification(self, notification: Notification) -> None: ...
 
     async def recent_notifications(self, *, limit: int = 20) -> list[Notification]: ...
 
+    async def count_notifications(self) -> int: ...
+
     async def record_experiment(self, experiment: EvolutionExperiment) -> None: ...
 
-    async def recent_experiments(self, *, limit: int = 100) -> list[EvolutionExperiment]: ...
+    async def recent_experiments(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[EvolutionExperiment]: ...
+
+    async def count_experiments(self) -> int: ...
 
     async def record_evaluation(self, run: EvaluationRun) -> None: ...
 
-    async def recent_evaluations(self, *, limit: int = 100) -> list[EvaluationRun]: ...
+    async def recent_evaluations(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[EvaluationRun]: ...
+
+    async def count_evaluations(self) -> int: ...
 
     async def record_proposal(self, proposal: EvolutionProposal) -> None: ...
 
     async def recent_proposals(self, *, limit: int = 100) -> list[EvolutionProposal]: ...
+
+    async def record_conflict_review(self, review: ConflictReview) -> None: ...
+
+    async def conflict_reviews(self, *, limit: int = 1000) -> list[ConflictReview]: ...
 
     async def record_llm_usage(
         self,
@@ -216,6 +279,20 @@ class DurableState(Protocol):
     ) -> LlmUsageRecord: ...
 
     async def usage_by_account(self, *, since: datetime) -> list[LlmAccountUsage]: ...
+
+    async def purge_stale_checkpoint_threads(
+        self,
+        *,
+        older_than: timedelta = CHECKPOINT_THREAD_TTL,
+        batch_threads: int = CHECKPOINT_CLEANUP_BATCH_THREADS,
+    ) -> CheckpointPurgeReport:
+        """Снимает рабочие треды LangGraph, у которых последний чекпоинт старше срока.
+
+        Метод в контракте, а не в одной ветке: ``/health/ready`` и оператор читают
+        один и тот же контракт, а память обязана честно отвечать «чистить нечего»,
+        вместо ``AttributeError`` в планировщике.
+        """
+        ...
 
 
 def _new_answer(answer: AnswerPayload, owner_id: str, now: datetime) -> StoredAnswer:
@@ -296,13 +373,17 @@ class InMemoryDurableState:
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._answers: dict[str, StoredAnswer] = {}
-        self._order: deque[str] = deque()
+        # ``OrderedDict`` — LRU по обращению, а не порядок вставки: перечитанный
+        # ответ уходит в конец очереди, и вытеснение, идущее с начала, до него не
+        # добирается. Прежний deque вставлял ответ в хвост один раз и при trim
+        # снимал его же, если аналитик как раз открыл экспорт.
+        self._answers: OrderedDict[str, StoredAnswer] = OrderedDict()
         self._decisions: deque[ExpertDecision] = deque(maxlen=MAX_DECISIONS)
         self._audit = InMemoryAuditLog(capacity=MAX_AUDIT_EVENTS)
         self._notifications: deque[Notification] = deque(maxlen=MAX_NOTIFICATIONS)
         self._experiments: deque[EvolutionExperiment] = deque(maxlen=MAX_EXPERIMENTS)
         self._proposals: dict[UUID, EvolutionProposal] = {}
+        self._conflict_reviews: dict[str, ConflictReview] = {}
         self._evaluations: deque[EvaluationRun] = deque(maxlen=MAX_EVALUATION_RUNS)
         self._llm_usage: deque[LlmUsageRecord] = deque(maxlen=MAX_LLM_USAGE_RECORDS)
 
@@ -321,11 +402,9 @@ class InMemoryDurableState:
         record = _new_answer(answer, owner_id, now)
         async with self._lock:
             self._prune(now)
-            if record.query_id not in self._answers:
-                self._order.append(record.query_id)
             self._answers[record.query_id] = record
-            while len(self._order) > MAX_STORED_ANSWERS:
-                self._answers.pop(self._order.popleft(), None)
+            self._answers.move_to_end(record.query_id)
+            self._trim_answers(record.owner_id)
         return record
 
     async def get_answer(self, query_id: str) -> StoredAnswer | None:
@@ -335,6 +414,9 @@ class InMemoryDurableState:
             record = self._answers.get(query_id)
             if record is None:
                 return None
+            # Отметка обращения — не косметика: журнал вытесняет по «давности
+            # пользования», и перечитанный ответ обязан перестать быть кандидатом.
+            self._answers.move_to_end(query_id)
             return replace(record, answer=record.answer.model_copy(deep=True))
 
     async def record_decision(self, decision: ExpertDecision) -> None:
@@ -342,15 +424,30 @@ class InMemoryDurableState:
             self._decisions.append(decision.model_copy(deep=True))
 
     async def recent_decisions(
-        self, *, limit: int = 100, actor_id: str | None = None
+        self, *, limit: int = 100, offset: int = 0, actor_id: str | None = None
     ) -> list[ExpertDecision]:
         async with self._lock:
-            items = [
-                item
-                for item in self._decisions
-                if actor_id is None or item.actor_id == actor_id
-            ][-max(limit, 1) :]
-        return [item.model_copy(deep=True) for item in reversed(items)]
+            newest_first = list(
+                reversed(
+                    [
+                        item
+                        for item in self._decisions
+                        if actor_id is None or item.actor_id == actor_id
+                    ]
+                )
+            )
+            page = newest_first[offset : offset + max(limit, 1)]
+        return [item.model_copy(deep=True) for item in page]
+
+    async def count_decisions(self, *, actor_id: str | None = None) -> int:
+        async with self._lock:
+            return len(
+                [
+                    item
+                    for item in self._decisions
+                    if actor_id is None or item.actor_id == actor_id
+                ]
+            )
 
     async def append_audit(self, event: AuditEvent) -> None:
         async with self._lock:
@@ -360,12 +457,25 @@ class InMemoryDurableState:
         self,
         *,
         limit: int = 100,
+        offset: int = 0,
         correlation_id: str | None = None,
         actor_id: str | None = None,
     ) -> list[AuditEvent]:
         async with self._lock:
             events = self._audit.list(correlation_id=correlation_id, actor_id=actor_id)
-        return [event.model_copy(deep=True) for event in reversed(events[-max(limit, 1) :])]
+        # Лента «с новых к старым»: окно берём от конца списка (самые свежие),
+        # поэтому offset=0 — первая страница, а offset за длиной — пустой массив.
+        newest_first = list(reversed(events))
+        page = newest_first[offset : offset + max(limit, 1)]
+        return [event.model_copy(deep=True) for event in page]
+
+    async def count_audit(
+        self, *, correlation_id: str | None = None, actor_id: str | None = None
+    ) -> int:
+        # Тот же предикат, что у чтения: total обязан сходиться со страницей,
+        # иначе «больше не было» и «не дочитали» снова неразличимы.
+        async with self._lock:
+            return len(self._audit.list(correlation_id=correlation_id, actor_id=actor_id))
 
     async def append_notification(self, notification: Notification) -> None:
         async with self._lock:
@@ -376,14 +486,25 @@ class InMemoryDurableState:
             items = list(self._notifications)[-max(limit, 1) :]
         return [item.model_copy(deep=True) for item in reversed(items)]
 
+    async def count_notifications(self) -> int:
+        async with self._lock:
+            return len(self._notifications)
+
     async def record_experiment(self, experiment: EvolutionExperiment) -> None:
         async with self._lock:
             self._experiments.append(experiment.model_copy(deep=True))
 
-    async def recent_experiments(self, *, limit: int = 100) -> list[EvolutionExperiment]:
+    async def recent_experiments(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[EvolutionExperiment]:
         async with self._lock:
-            items = list(self._experiments)[-max(limit, 1) :]
-        return [item.model_copy(deep=True) for item in reversed(items)]
+            newest_first = list(reversed(self._experiments))
+            page = newest_first[offset : offset + max(limit, 1)]
+        return [item.model_copy(deep=True) for item in page]
+
+    async def count_experiments(self) -> int:
+        async with self._lock:
+            return len(self._experiments)
 
     async def record_proposal(self, proposal: EvolutionProposal) -> None:
         async with self._lock:
@@ -402,14 +523,33 @@ class InMemoryDurableState:
             items = sorted(self._proposals.values(), key=lambda item: item.created_at)
         return [item.model_copy(deep=True) for item in reversed(items[-max(limit, 1) :])]
 
+    async def record_conflict_review(self, review: ConflictReview) -> None:
+        async with self._lock:
+            self._conflict_reviews[review.candidate_id] = review.model_copy(deep=True)
+            while len(self._conflict_reviews) > MAX_CONFLICT_REVIEWS:
+                oldest = min(self._conflict_reviews.values(), key=lambda item: item.created_at)
+                self._conflict_reviews.pop(oldest.candidate_id, None)
+
+    async def conflict_reviews(self, *, limit: int = 1000) -> list[ConflictReview]:
+        async with self._lock:
+            items = sorted(self._conflict_reviews.values(), key=lambda item: item.created_at)
+        return [item.model_copy(deep=True) for item in reversed(items[-max(limit, 1) :])]
+
     async def record_evaluation(self, run: EvaluationRun) -> None:
         async with self._lock:
             self._evaluations.append(run.model_copy(deep=True))
 
-    async def recent_evaluations(self, *, limit: int = 100) -> list[EvaluationRun]:
+    async def recent_evaluations(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[EvaluationRun]:
         async with self._lock:
-            items = list(self._evaluations)[-max(limit, 1) :]
-        return [item.model_copy(deep=True) for item in reversed(items)]
+            newest_first = list(reversed(self._evaluations))
+            page = newest_first[offset : offset + max(limit, 1)]
+        return [item.model_copy(deep=True) for item in page]
+
+    async def count_evaluations(self) -> int:
+        async with self._lock:
+            return len(self._evaluations)
 
     async def record_llm_usage(
         self,
@@ -445,8 +585,30 @@ class InMemoryDurableState:
     def _prune(self, now: datetime) -> None:
         for key in [key for key, item in self._answers.items() if item.expires_at <= now]:
             self._answers.pop(key, None)
-        alive = set(self._answers)
-        self._order = deque(key for key in self._order if key in alive)
+
+    def _trim_answers(self, owner_id: str) -> None:
+        """Вытеснение: потолок на аккаунт, затем общий предохранитель процесса.
+
+        Обход идёт с начала LRU-очереди (давнее обращение), поэтому ответ,
+        запрошенный секунду назад, — последний кандидат на removal: он уже
+        переставлен в хвост. Личный потолок считает по своему владельцу, и чужая
+        активность не съедает историю аналитика.
+        """
+        own = [key for key, item in self._answers.items() if item.owner_id == owner_id]
+        while len(own) > MAX_STORED_ANSWERS:
+            self._answers.pop(own.pop(0), None)
+        while len(self._answers) > MAX_STORED_ANSWERS_TOTAL:
+            self._answers.popitem(last=False)
+
+    async def purge_stale_checkpoint_threads(
+        self,
+        *,
+        older_than: timedelta = CHECKPOINT_THREAD_TTL,
+        batch_threads: int = CHECKPOINT_CLEANUP_BATCH_THREADS,
+    ) -> CheckpointPurgeReport:
+        """На памяти чекпоинтов нет: агентный граф работает без Postgres-сейвера."""
+        del older_than, batch_threads
+        return CheckpointPurgeReport(skipped_reason="in-memory: чекпоинты не сохраняются")
 
 
 _ANSWERS_DDL = """
@@ -455,12 +617,27 @@ CREATE TABLE IF NOT EXISTS nk_answers (
     owner_id text NOT NULL,
     answer_json text NOT NULL,
     created_at timestamptz NOT NULL,
-    expires_at timestamptz NOT NULL
+    expires_at timestamptz NOT NULL,
+    last_accessed_at timestamptz
 )
 """
 
+# Таблица в рабочем контуре уже создана без колонки обращений: ``ALTER ... ADD
+# COLUMN IF NOT EXISTS`` догоняет её на старте, иначе вытеснение по «давности
+# пользования» было бы доступно только свежим установкам.
+_ANSWERS_ACCESS_COLUMN_DDL = (
+    "ALTER TABLE nk_answers ADD COLUMN IF NOT EXISTS last_accessed_at timestamptz"
+)
+
 _ANSWERS_OWNER_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS nk_answers_owner_idx ON nk_answers (owner_id)"
+)
+
+# Личный потолок выбирает «кого вытеснить первым» по этому порядку — без индекса
+# это сортировка по всей таблице на каждый ответ.
+_ANSWERS_OWNER_ACCESS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS nk_answers_owner_access_idx ON nk_answers "
+    "(owner_id, coalesce(last_accessed_at, created_at) DESC)"
 )
 
 _DECISIONS_DDL = """
@@ -529,6 +706,21 @@ _PROPOSALS_DDL = """
 CREATE TABLE IF NOT EXISTS nk_evolution_proposals (
     id text PRIMARY KEY,
     status text NOT NULL,
+    payload jsonb NOT NULL,
+    created_at timestamptz NOT NULL
+)
+"""
+
+# Решение привязано к отпечатку пары тезисов, поэтому первичный ключ —
+# ``candidate_id``: повторное решение той же пары обновляет строку. Через
+# ``nk_expert_decisions`` эта история не проходит — тот журнал вытесняет
+# старейшие записи по общему потолку, а подтверждённое противоречие, молча
+# исчезнувшее из очереди, снова выглядело бы нерассмотренным.
+_CONFLICT_REVIEWS_DDL = """
+CREATE TABLE IF NOT EXISTS nk_conflict_reviews (
+    candidate_id text PRIMARY KEY,
+    status text NOT NULL,
+    actor_id text NOT NULL,
     payload jsonb NOT NULL,
     created_at timestamptz NOT NULL
 )
@@ -635,7 +827,9 @@ class PostgresDurableState:
             async with pool.connection(timeout=5.0) as conn:
                 for ddl in (
                     _ANSWERS_DDL,
+                    _ANSWERS_ACCESS_COLUMN_DDL,
                     _ANSWERS_OWNER_INDEX_DDL,
+                    _ANSWERS_OWNER_ACCESS_INDEX_DDL,
                     _DECISIONS_DDL,
                     _AUDIT_DDL,
                     _AUDIT_CORRELATION_INDEX_DDL,
@@ -643,6 +837,7 @@ class PostgresDurableState:
                     _EXPERIMENTS_DDL,
                     _EVALUATIONS_DDL,
                     _PROPOSALS_DDL,
+                    _CONFLICT_REVIEWS_DDL,
                     _LLM_USAGE_DDL,
                     _LLM_USAGE_ACCOUNT_INDEX_DDL,
                 ):
@@ -693,23 +888,65 @@ class PostgresDurableState:
         await self._execute("DELETE FROM nk_answers WHERE expires_at <= %s", (now,))
         await self._execute(
             """
-            INSERT INTO nk_answers (query_id, owner_id, answer_json, created_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO nk_answers (query_id, owner_id, answer_json, created_at, expires_at,
+                                    last_accessed_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (query_id) DO UPDATE
-            SET answer_json = EXCLUDED.answer_json, expires_at = EXCLUDED.expires_at
+            SET answer_json = EXCLUDED.answer_json,
+                expires_at = EXCLUDED.expires_at,
+                last_accessed_at = EXCLUDED.last_accessed_at
             """,
-            (record.query_id, owner_id, answer.model_dump_json(), now, record.expires_at),
+            (record.query_id, owner_id, answer.model_dump_json(), now, record.expires_at, now),
         )
-        await self._trim_table("nk_answers", "query_id", MAX_STORED_ANSWERS)
+        # Личный потолок владельца: прежний глобальный trim снимал старейшие копии
+        # всего сервиса, и экспорт своего ответа получал 404 из-за чужой активности.
+        await self._execute(
+            """
+            DELETE FROM nk_answers WHERE query_id IN (
+                SELECT query_id FROM (
+                    SELECT query_id,
+                           row_number() OVER (
+                               PARTITION BY owner_id
+                               ORDER BY coalesce(last_accessed_at, created_at) DESC
+                           ) AS rank
+                    FROM nk_answers
+                    WHERE owner_id = %s
+                ) ranked
+                WHERE ranked.rank > %s
+            )
+            """,
+            (owner_id, MAX_STORED_ANSWERS),
+        )
+        # Общий предохранитель — LRU по всему журналу: он обязан сработать только
+        # когда упёрся потолок процесса, а не тогда, когда много аналитиков спрашивают.
+        await self._execute(
+            "DELETE FROM nk_answers WHERE query_id NOT IN ("
+            " SELECT query_id FROM nk_answers"
+            " ORDER BY coalesce(last_accessed_at, created_at) DESC LIMIT %s)",
+            (MAX_STORED_ANSWERS_TOTAL,),
+        )
         return record
 
     async def get_answer(self, query_id: str) -> StoredAnswer | None:
+        now = datetime.now(UTC)
         row = await self._fetchone(
             "SELECT query_id, owner_id, answer_json, created_at, expires_at FROM nk_answers "
             "WHERE query_id = %s AND expires_at > %s",
-            (query_id, datetime.now(UTC)),
+            (query_id, now),
         )
-        return _answer_from_row(row) if row else None
+        if row is None:
+            return None
+        # Отметка обращения двигает ответ в начало LRU-очереди владельца: запись,
+        # перечитанная секунду назад, не имеет права быть вытесненной следующим
+        # же ответом того же аналитика. Один сбой UPDATE не отменяет чтение.
+        try:
+            await self._execute(
+                "UPDATE nk_answers SET last_accessed_at = %s WHERE query_id = %s",
+                (now, query_id),
+            )
+        except Exception as error:  # noqa: BLE001 - отметка пользования не критична для ответа
+            logger.warning("Отметка обращения к ответу %s не сохранена: %s", query_id, error)
+        return _answer_from_row(row)
 
     async def record_decision(self, decision: ExpertDecision) -> None:
         await self._execute(
@@ -732,22 +969,35 @@ class PostgresDurableState:
         await self._trim_table("nk_expert_decisions", "id", MAX_DECISIONS)
 
     async def recent_decisions(
-        self, *, limit: int = 100, actor_id: str | None = None
+        self, *, limit: int = 100, offset: int = 0, actor_id: str | None = None
     ) -> list[ExpertDecision]:
         columns = (
             "SELECT id, actor_id, action, object_id, outcome, metadata, created_at "
             "FROM nk_expert_decisions "
         )
+        params: list[Any] = []
+        conditions = ""
         if actor_id is not None:
-            rows = await self._fetchall(
-                columns + "WHERE actor_id = %s ORDER BY created_at DESC LIMIT %s",
-                (actor_id, max(limit, 1)),
-            )
-        else:
-            rows = await self._fetchall(
-                columns + "ORDER BY created_at DESC LIMIT %s", (max(limit, 1),)
-            )
+            conditions = "WHERE actor_id = %s "
+            params.append(actor_id)
+        params.extend([max(limit, 1), max(offset, 0)])
+        rows = await self._fetchall(
+            columns + conditions + "ORDER BY created_at DESC LIMIT %s OFFSET %s", params
+        )
         return [_decision_from_row(row) for row in rows]
+
+    async def count_decisions(self, *, actor_id: str | None = None) -> int:
+        # Тот же предикат, что у чтения, без ORDER BY и без окна: ``X-Total-Count``
+        # обязан сходиться с длиной страницы, иначе «прочитаны все» снова
+        # неразличимо с «не дочитали».
+        if actor_id is None:
+            row = await self._fetchone("SELECT COUNT(*) AS total FROM nk_expert_decisions")
+        else:
+            row = await self._fetchone(
+                "SELECT COUNT(*) AS total FROM nk_expert_decisions WHERE actor_id = %s",
+                (actor_id,),
+            )
+        return int(row["total"]) if row else 0
 
     async def append_audit(self, event: AuditEvent) -> None:
         await self._execute(
@@ -774,6 +1024,7 @@ class PostgresDurableState:
         self,
         *,
         limit: int = 100,
+        offset: int = 0,
         correlation_id: str | None = None,
         actor_id: str | None = None,
     ) -> list[AuditEvent]:
@@ -789,13 +1040,33 @@ class PostgresDurableState:
             params.append(actor_id)
         conditions = f"WHERE {' AND '.join(where)} " if where else ""
         params.append(max(limit, 1))
+        params.append(max(offset, 0))
         rows = await self._fetchall(
             "SELECT id, actor_id, action, object_id, outcome, correlation_id, metadata, "
             f"created_at FROM nk_audit_events {conditions}"
-            "ORDER BY created_at DESC LIMIT %s",
+            "ORDER BY created_at DESC LIMIT %s OFFSET %s",
             params,
         )
         return [_audit_from_row(row) for row in rows]
+
+    async def count_audit(
+        self, *, correlation_id: str | None = None, actor_id: str | None = None
+    ) -> int:
+        # Те же WHERE, что у чтения, без JOIN и без LIMIT: X-Total-Count обязан
+        # быть полным числом подходящих записей, а не длиной страницы.
+        where = []
+        params: list[Any] = []
+        if correlation_id is not None:
+            where.append("correlation_id = %s")
+            params.append(correlation_id)
+        if actor_id is not None:
+            where.append("actor_id = %s")
+            params.append(actor_id)
+        conditions = f" WHERE {' AND '.join(where)}" if where else ""
+        row = await self._fetchone(
+            f"SELECT COUNT(*) AS total FROM nk_audit_events{conditions}", params
+        )
+        return int(row["total"]) if row else 0
 
     async def append_notification(self, notification: Notification) -> None:
         await self._execute(
@@ -821,6 +1092,13 @@ class PostgresDurableState:
         )
         return [_notification_from_row(row) for row in rows]
 
+    async def count_notifications(self) -> int:
+        # Полное число записей ленты, а не длина страницы: потолок ленты
+        # (`MAX_NOTIFICATIONS`) иначе был бы невидим читателю, и «прочитаны все»
+        # отличался бы от «старые вытеснены».
+        row = await self._fetchone("SELECT COUNT(*) AS total FROM nk_notifications")
+        return int(row["total"]) if row else 0
+
     async def record_experiment(self, experiment: EvolutionExperiment) -> None:
         await self._execute(
             """
@@ -837,12 +1115,18 @@ class PostgresDurableState:
         )
         await self._trim_table("nk_experiments", "id", MAX_EXPERIMENTS)
 
-    async def recent_experiments(self, *, limit: int = 100) -> list[EvolutionExperiment]:
+    async def recent_experiments(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[EvolutionExperiment]:
         rows = await self._fetchall(
-            "SELECT payload FROM nk_experiments ORDER BY created_at DESC LIMIT %s",
-            (max(limit, 1),),
+            "SELECT payload FROM nk_experiments ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            (max(limit, 1), max(offset, 0)),
         )
         return [EvolutionExperiment.model_validate(row["payload"]) for row in rows]
+
+    async def count_experiments(self) -> int:
+        row = await self._fetchone("SELECT COUNT(*) AS total FROM nk_experiments")
+        return int(row["total"]) if row else 0
 
     async def record_proposal(self, proposal: EvolutionProposal) -> None:
         await self._execute(
@@ -868,6 +1152,34 @@ class PostgresDurableState:
         )
         return [EvolutionProposal.model_validate(row["payload"]) for row in rows]
 
+    async def record_conflict_review(self, review: ConflictReview) -> None:
+        await self._execute(
+            """
+            INSERT INTO nk_conflict_reviews
+                (candidate_id, status, actor_id, payload, created_at)
+            VALUES (%s, %s, %s, %s::jsonb, %s)
+            ON CONFLICT (candidate_id) DO UPDATE
+            SET status = EXCLUDED.status,
+                actor_id = EXCLUDED.actor_id,
+                payload = EXCLUDED.payload,
+                created_at = EXCLUDED.created_at
+            """,
+            (
+                review.candidate_id,
+                review.status,
+                review.actor_id,
+                review.model_dump_json(),
+                review.created_at,
+            ),
+        )
+
+    async def conflict_reviews(self, *, limit: int = 1000) -> list[ConflictReview]:
+        rows = await self._fetchall(
+            "SELECT payload FROM nk_conflict_reviews ORDER BY created_at DESC LIMIT %s",
+            (max(limit, 1),),
+        )
+        return [ConflictReview.model_validate(row["payload"]) for row in rows]
+
     async def record_evaluation(self, run: EvaluationRun) -> None:
         await self._execute(
             """
@@ -879,12 +1191,19 @@ class PostgresDurableState:
         )
         await self._trim_table("nk_evaluation_runs", "id", MAX_EVALUATION_RUNS)
 
-    async def recent_evaluations(self, *, limit: int = 100) -> list[EvaluationRun]:
+    async def recent_evaluations(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[EvaluationRun]:
         rows = await self._fetchall(
-            "SELECT payload FROM nk_evaluation_runs ORDER BY created_at DESC LIMIT %s",
-            (max(limit, 1),),
+            "SELECT payload FROM nk_evaluation_runs "
+            "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            (max(limit, 1), max(offset, 0)),
         )
         return [EvaluationRun.model_validate(row["payload"]) for row in rows]
+
+    async def count_evaluations(self) -> int:
+        row = await self._fetchone("SELECT COUNT(*) AS total FROM nk_evaluation_runs")
+        return int(row["total"]) if row else 0
 
     async def record_llm_usage(
         self,
@@ -959,6 +1278,98 @@ class PostgresDurableState:
             )
             for row in rows
         ]
+
+    async def _table_present(self, table: str) -> bool:
+        """Есть ли таблица в схеме: чекпоинты создаёт LangGraph, а не этот контур."""
+        row = await self._fetchone("SELECT to_regclass(%s) AS table_name", (table,))
+        return bool(row and row.get("table_name"))
+
+    async def purge_stale_checkpoint_threads(
+        self,
+        *,
+        older_than: timedelta = CHECKPOINT_THREAD_TTL,
+        batch_threads: int = CHECKPOINT_CLEANUP_BATCH_THREADS,
+    ) -> CheckpointPurgeReport:
+        """Снимает треды LangGraph, у которых и последний чекпоинт старше срока.
+
+        Успешный прогон вызывает ``adelete_thread`` сам; этот путь закрывает
+        прерванный: отказ модели, отмена по дедлайну, снятый worker — и всё, что
+        осталось от прошлой версии схемы. Консервативность задана условием
+        ``max(ts) < cutoff`` по треду целиком: нитка, в которую писали на этой
+        неделе, не удаляется независимо от числа её чекпоинтов.
+
+        Дочерние таблицы снимаются первыми: тред без ``checkpoint_blobs`` и
+        ``checkpoint_writes`` читался бы сейвером как повреждённый, а не как
+        удалённый. Таблицы — литералы модуля (идентификатор в SQL не
+        параметризуется), имена тредов уходят только параметром.
+        """
+        if not await self._table_present("checkpoints"):
+            return CheckpointPurgeReport(skipped_reason="таблица checkpoints не создана")
+        cutoff = datetime.now(UTC) - older_than
+        try:
+            rows = await self._fetchall(
+                """
+                SELECT thread_id, max((checkpoint->>'ts')::timestamptz) AS last_seen
+                FROM checkpoints
+                GROUP BY thread_id
+                HAVING max((checkpoint->>'ts')::timestamptz) < %s
+                ORDER BY last_seen ASC
+                LIMIT %s
+                """,
+                (cutoff, max(batch_threads, 1)),
+            )
+        except Exception as error:  # noqa: BLE001 - очистка не имеет права ронять цикл
+            logger.warning("Список устаревших тредов чекпоинтов не получен: %s", error)
+            return CheckpointPurgeReport(skipped_reason=f"чтение checkpoints: {error}")
+        if not rows:
+            return CheckpointPurgeReport()
+        threads = [str(row["thread_id"]) for row in rows]
+        removed_rows = 0
+        for table in ("checkpoint_writes", "checkpoint_blobs"):
+            if not await self._table_present(table):
+                continue
+            removed_rows += await self._execute(
+                f"DELETE FROM {table} WHERE thread_id = ANY(%s)", (threads,)
+            )
+        removed_rows += await self._execute(
+            "DELETE FROM checkpoints WHERE thread_id = ANY(%s)", (threads,)
+        )
+        logger.info(
+            "Осиротевшие треды чекпоинтов сняты: %d (старше %s), строк: %d",
+            len(threads),
+            older_than,
+            removed_rows,
+        )
+        return CheckpointPurgeReport(removed_threads=len(threads), removed_rows=removed_rows)
+
+
+async def run_checkpoint_cleanup(
+    state: DurableState,
+    *,
+    interval_seconds: float = CHECKPOINT_CLEANUP_INTERVAL_SECONDS,
+    older_than: timedelta = CHECKPOINT_THREAD_TTL,
+    batch_threads: int = CHECKPOINT_CLEANUP_BATCH_THREADS,
+) -> None:
+    """Цикл очистки чекпоинтов: задача для ``asyncio.create_task`` из lifespan.
+
+    Спит сначала и только потом чистит: старт контейнера не должен начинаться с
+    массового DELETE по живой базе, а первая волна приходит, когда сервис уже
+    готов обслуживать запросы. Ошибка одной волны не убивает планировщик —
+    иначе осиротевшие треды снова остались бы навсегда, и об очистке никто не
+    узнал бы. ``CancelledError`` наружу: его ждёт ``lifespan`` при остановке.
+    """
+    while True:
+        await asyncio.sleep(max(interval_seconds, 1.0))
+        try:
+            report = await state.purge_stale_checkpoint_threads(
+                older_than=older_than, batch_threads=batch_threads
+            )
+            if report.skipped_reason is not None:
+                logger.info("Очистка чекпоинтов пропущена: %s", report.skipped_reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - планировщик не роняет сервис
+            logger.error("Очистка чекпоинтов не удалась, следующая волна по расписанию: %s", error)
 
 
 def build_durable_state(settings: Settings) -> DurableState:

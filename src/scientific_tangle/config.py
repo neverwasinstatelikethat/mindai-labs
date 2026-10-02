@@ -45,6 +45,17 @@ DEFAULT_TRUSTED_ORIGINS = ",".join(
     )
 )
 
+# ── Эвристика приёма агентных прогонов ───────────────────────────────────────
+# Один прогон рабочего процесса делает не меньше восьми обращений к модели
+# (planning, controller, action_planner, controller, reasoner, critic, improver,
+# critic), а семафор провайдера сериализует их в одном процессе. Потолок приёма
+# обязан следовать за пропускной способностью модели, иначе «принятый» второй
+# прогон тратит свой дедлайн на очередь чужих обращений.
+_ADMISSION_CALLS_PER_RUN = 8
+# Оценка одного structured-output обращения: консервативно, по бюджету вывода
+# 2048 токенов, а не по лучшему случаю.
+_ADMISSION_SECONDS_PER_CALL = 15.0
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -81,13 +92,34 @@ class Settings(BaseSettings):
     agent_deadline_seconds: float = Field(default=300.0, gt=0)
     agent_max_tool_rounds: int = Field(default=2, ge=1, le=4)
     agent_max_revisions: int = Field(default=1, ge=0, le=2)
+    # Потолок времени ОДНОГО узла. Провайдер считает транспортный таймаут делением
+    # всего дедлайна на попытки одного обращения, и без этого потолка один медленный
+    # узел выжигал бюджет, оставляя остальные не запущенными (см. agents/workflow.py).
+    agent_node_budget_seconds: float = Field(default=60.0, gt=0, le=600)
     # Сколько токенов доказательства помещается в промпт reasoner/critic/improver.
     context_token_budget: int = Field(default=_DEFAULT_CONTEXT_TOKEN_BUDGET, ge=500)
+    # Потолок candidate policy в системном промпте: активные правки EvolutionService
+    # росли вместе с числом принятых предложений и вытесняли доказательства.
+    policy_max_tokens: int = Field(default=600, ge=16, le=4096)
     # Потолок одновременных исследований: сверх него запрос получает 429, а не
-    # очередь внутри чужого дедлайна. Держится ниже GIGACHAT_MAX_CONCURRENT косвенно:
-    # один агентный запрос делает несколько вызовов модели, поэтому большой порог
-    # лишь перекладывает ожидание семафора внутрь `agent_deadline_seconds`.
+    # очередь внутри чужого дедлайна. Значение — ЗАПРОС оператора: фактически
+    # принимается min с пропускной способностью модели (см.
+    # ``expected_agent_admission_limit``), иначе четыре прогона при одном LLM-слоте
+    # означали бы ~32 ожидающих обращения и гарантированную деградацию.
     agent_max_concurrent_runs: int = Field(default=4, ge=1, le=16)
+    # Явное повышение потолка приёма через env (AGENT_ADMISSION_LIMIT): перекрывает
+    # эвристику, когда оператор знает про тариф или несколько воркеров больше, чем
+    # видно из настроек процесса.
+    agent_admission_limit: int | None = Field(default=None, ge=1, le=64)
+    # Пул потоков, в котором исполняются блокирующие обращения к хранилищу
+    # (Neo4j, Elasticsearch, файловый корпус). Обращения уходят через
+    # ``asyncio.to_thread``, то есть в default executor цикла, а его размер по
+    # умолчанию считается от числа ядер хоста — не от ёмкости контейнера и не от
+    # числа прогонов. Узкое место отсюда следует неприятное: один медленный обход
+    # графа занимает потоки, и соседний запрос на `/findings` ждёт не хранилище, а
+    # освободившийся поток. Значение — потолок одновременных блокирующих чтений,
+    # он же размер именованного пула (поток видно в журнале и в трассировке).
+    storage_thread_pool_size: int = Field(default=16, ge=2, le=128)
 
     # Кэш structured output: planning/controller-вызовы детерминированы при
     # temperature=0.1 и попадают на одни и те же секции контекста в повторных
@@ -103,6 +135,10 @@ class Settings(BaseSettings):
     # и в публичном контуре они не должны читаться кем угодно.
     metrics_token: str | None = Field(default=None, repr=False)
     embedding_cache_ttl_seconds: float = Field(default=3600.0, ge=0)
+    # Пауза после терминального 4xx на /embeddings (402, 401, 403…): без неё каждый
+    # новый текст вопроса платит round-trip, хотя приговор аккаунта не меняется.
+    # 0 выключает негативный кэш — поведение как до его появления.
+    embedding_refusal_cooldown_seconds: float = Field(default=30.0, ge=0, le=3600)
     knowledge_backend: Literal["memory", "neo4j"] = "memory"
     neo4j_uri: str = "bolt://neo4j:7687"
     neo4j_username: str = "neo4j"
@@ -136,6 +172,36 @@ class Settings(BaseSettings):
     def use_gigachat(self) -> bool:
         """GigaChat настроен (ключ задан)."""
         return bool(self.gigachat_api_key)
+
+    @property
+    def expected_agent_admission_limit(self) -> int:
+        """Сколько прогонов вывезет модель, не выдавив их за дедлайн.
+
+        Модель принимает ``gigachat_max_concurrent`` обращений одновременно, а один
+        прогон делает ``_ADMISSION_CALLS_PER_RUN`` последовательных обращений. За
+        время одного дедлайна контур обслуживает ``deadline / seconds_per_call``
+        обращений — отсюда и потолок прогонов. Эвристика консервативная: она
+        ограничивает приём, а не обещает пропускную способность.
+        """
+        calls_affordable = self.agent_deadline_seconds / _ADMISSION_SECONDS_PER_CALL
+        derived = calls_affordable * max(self.gigachat_max_concurrent, 1) / _ADMISSION_CALLS_PER_RUN
+        return max(1, int(derived))
+
+    @property
+    def effective_agent_admission_limit(self) -> int:
+        """Фактический потолок приёма: запрос оператора ограничен способностью модели.
+
+        Без настроенного GigaChat обращений к модели нет вообще, и ограничивать приём
+        эвристикой провайдера смысла нет: остаётся запрошенное значение.
+        ``AGENT_ADMISSION_LIMIT`` перекрывает эвристику явно — для нескольких
+        воркеров uvicorn, где на процесс приходится часть тарифного лимита, и для
+        осознанной переподписки «часть прогонов деградирует по времени».
+        """
+        if self.agent_admission_limit is not None:
+            return self.agent_admission_limit
+        if not self.use_gigachat:
+            return self.agent_max_concurrent_runs
+        return min(self.agent_max_concurrent_runs, self.expected_agent_admission_limit)
 
     @property
     def gigachat_ssl_context(self) -> SSLContext | None:
@@ -172,6 +238,33 @@ class Settings(BaseSettings):
                 self.context_token_budget,
                 self.gigachat_model,
                 window,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def warn_admission_above_model_capacity(self) -> "Settings":
+        """Конфиг обещает больше прогонов, чем вывезет модель.
+
+        Потолок приёма ниже производного значения — это тихая потеря ёмкости, а
+        потолок выше него означает очередь обращений внутри чужого дедлайна и
+        неполные ответы вместо честного 429. Предупреждение делает выбор видимым на
+        старте; явный ``AGENT_ADMISSION_LIMIT`` считается осознанным решением, а без
+        настроенного GigaChat сравнивать ёмкость не с чем — провайдер другой, и
+        эвристика к нему неприменима.
+        """
+        if self.agent_admission_limit is not None or not self.use_gigachat:
+            return self
+        expected = self.expected_agent_admission_limit
+        if self.agent_max_concurrent_runs > expected:
+            logger.warning(
+                "AGENT_MAX_CONCURRENT_RUNS=%d превышает пропускную способность модели "
+                "(%d слот(а) × ~%.0f обращений на прогон => %d): лишние прогоны будут "
+                "ждать модель внутри своего дедлайна и деградировать. Уменьшите порог "
+                "или поднимите GIGACHAT_MAX_CONCURRENT.",
+                self.agent_max_concurrent_runs,
+                self.gigachat_max_concurrent,
+                _ADMISSION_CALLS_PER_RUN,
+                expected,
             )
         return self
 

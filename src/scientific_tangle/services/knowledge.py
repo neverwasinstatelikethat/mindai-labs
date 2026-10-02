@@ -8,7 +8,8 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Protocol, runtime_checkable
+from functools import wraps
+from typing import Any, Protocol, cast, runtime_checkable
 from uuid import UUID, uuid5
 
 from scientific_tangle.domain.contracts import (
@@ -47,6 +48,8 @@ from scientific_tangle.services.retrieval_semantics import (
     SCOPE_GEOGRAPHY,
     SCOPE_ORIGIN,
     SCOPE_YEAR,
+    AbortCheck,
+    abort_note,
     apply_numeric_filters,
     candidate_window,
     cap_notes,
@@ -54,6 +57,7 @@ from scientific_tangle.services.retrieval_semantics import (
     demo_notes,
     enforce_scope,
     global_context_notes,
+    is_aborted,
     numeric_notes,
     scope_notes,
     split_demo,
@@ -67,6 +71,12 @@ logger = logging.getLogger(__name__)
 # memory- и neo4j-ветке означали бы разный ответ на один и тот же план.
 MAX_ANCHORS = 5
 _RRF_K = 5
+
+# Окно чтения каталога находок: списочным маршрутам не нужен весь список с
+# копией каждой находки. Потолок страницы держит ответ в разумном размере, а
+# запрос с большим ``limit`` обрезается до него, а не читает корпус целиком.
+FINDINGS_WINDOW_DEFAULT = 50
+FINDINGS_WINDOW_MAX = 500
 
 # Окно и шаг структурного чанкинга — единые для обоих бэкендов: идентификатор
 # чанка вычисляется от смещения внутри фрагмента, поэтому разные константы
@@ -103,9 +113,11 @@ __all__ = [
     "ChunkPiece",
     "CommunityBriefCache",
     "CommunityViews",
+    "FindingWindow",
     "GraphStamp",
     "InMemoryKnowledgeBase",
     "KnowledgeBase",
+    "NoChunksError",
     "RetrievalContext",
     "brief_key",
     "cached_community_briefs",
@@ -115,9 +127,63 @@ __all__ = [
     "finalize_retrieval",
     "finding_communities",
     "graph_element_ids",
+    "invalidate_derived_llm_cache",
+    "normalize_window",
     "quote_offsets",
     "stable_uuid",
 ]
+
+
+def normalize_window(
+    limit: int, offset: int, *, max_limit: int = FINDINGS_WINDOW_MAX
+) -> tuple[int, int]:
+    """Окно каталога к одному виду для обоих бэкендов.
+
+    Отрицательное смещение и «безразмерная» страница — это не «как повезёт»:
+    ``offset`` меньше нуля читался бы с конца списка, а ``limit`` без потолка
+    доставал бы весь корпус, то есть ровно та цена, ради которой окно и ввели.
+    """
+    size = min(max(int(limit), 1), max(int(max_limit), 1))
+    start = max(int(offset), 0)
+    return size, start
+
+
+def invalidate_derived_llm_cache(context: str) -> None:
+    """Сбрасывает кэш structured output провайдера после мутации корпуса.
+
+    Промпты модели собираются из текста корпуса, поэтому закэшированный ответ
+    устаревает вместе с находками — даже когда промпт буквально совпадает. Вызов
+    отложенный: ``services/provider.py`` сам не импортирует knowledge-модуль, но
+    импорт верхнего уровня связал бы два контура в цикл при сборке пакета.
+    Отсутствие кэша или его сбой не имеют права валить запись в корпус — наружу
+    уходит только предупреждение в лог.
+    """
+    try:
+        from scientific_tangle.services import provider
+
+        invalidate = getattr(provider, "invalidate_llm_cache", None)
+        if callable(invalidate):
+            invalidate()
+    except Exception as error:  # noqa: BLE001 - инвалидация чужого кэша не блокирует запись
+        logger.warning("Кэш LLM не сброшен после изменения %s: %s", context, error)
+
+
+@dataclass(frozen=True, slots=True)
+class FindingWindow:
+    """Окно каталога находок вместе с полным числом подходящих записей.
+
+    ``total`` — сколько находок подходит под фильтр доступа во всём каталоге, а
+    не в странице: интерфейс режет список по нему. ``note`` обязана быть, когда
+    страница оказалась короче ``limit`` по причинам, которые запрос к индексу не
+    описывает (заменённые версии и демо-контент в индексах прежнего маппинса).
+    """
+
+    findings: list[Finding]
+    total: int
+    offset: int
+    limit: int
+    note: str | None = None
+
 
 
 def brief_key(
@@ -327,6 +393,18 @@ class KnowledgeState:
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     chains: dict[str, list[str]]
+
+
+class NoChunksError(ValueError):
+    """Структурный импорт не породил ни одного чанка — молча «создано» вернуть нельзя.
+
+    Порог разбора файла (20 символов суммарного текста) ниже порога чанкинга
+    (40 символов на кусок): документ из одного короткого фрагмента проходит
+    парсер, но в индекс не легло ничего. Прежний ``status="created"`` при
+    ``chunks=0`` считался покрытым файлом в отчёте компиляции и в статистике
+    корпуса, а в окне поиска его нет — аналитик получал «в корпусе такого нет»
+    на текст, который он в корпус положил.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,6 +643,30 @@ def _chunk_state_edges(
     ]
 
 
+def _synchronized[MethodT: Callable[..., Any]](method: MethodT) -> MethodT:
+    """Метод целиком под замком каталога памяти.
+
+    В memory-контуре нет сетевого ввода-вывода: весь метод — это работа со
+    словарями и списками процесса, поэтому критическая секция короткая по
+    построению, а не по выверенному выбору строк. Разрывать её «где попало»
+    означало бы вернуться к прежнему дефекту: обход ``self._findings`` в одном
+    потоке против вставки в другом поднимает ``RuntimeError: dictionary changed
+    size during iteration``, то есть 500 на ровном месте вместо ответа.
+
+    Сигнатура сохраняется через generic-декоратор (PEP 695): без этого декоратор
+    стирал бы типы публичных методов, и production-адаптер, вызывающий seed-контур,
+    терял бы проверку возвращаемых значений.
+    """
+
+    @wraps(method)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        store = cast("InMemoryKnowledgeBase", args[0])
+        with store._lock:
+            return method(*args, **kwargs)
+
+    return cast("MethodT", wrapper)
+
+
 @runtime_checkable
 class KnowledgeBase(Protocol):
     """Полный контракт, который реально используют API и CLI.
@@ -582,7 +684,13 @@ class KnowledgeBase(Protocol):
         plan: QueryPlan,
         retrieval_plan: RetrievalPlan,
         allowed_data_classes: set[DataClass] | None = None,
-    ) -> RetrievalContext: ...
+        *,
+        abort: AbortCheck | None = None,
+    ) -> RetrievalContext:
+        """Исполняет план retrieval. ``abort`` — кооперативная отмена прогона:
+        предикат читается на границе платных фаз, пропущенные фазы называются в
+        деградации ответа. Без него retrieval исполняет план целиком."""
+        ...
 
     def full_graph(self, allowed_data_classes: set[DataClass] | None = None) -> GraphSnapshot: ...
 
@@ -605,6 +713,20 @@ class KnowledgeBase(Protocol):
 
     def all_findings(self, allowed_data_classes: set[DataClass] | None = None) -> list[Finding]: ...
 
+    def findings_window(
+        self,
+        *,
+        limit: int = FINDINGS_WINDOW_DEFAULT,
+        offset: int = 0,
+        allowed_data_classes: set[DataClass] | None = None,
+        status: str | None = None,
+        subject: str | None = None,
+    ) -> FindingWindow: ...
+
+    def warmup(self) -> None:
+        """Прогрев хранилища до первого запроса (схема, индексы, каталог)."""
+        ...
+
     def supersede_finding(
         self,
         finding_id: str,
@@ -615,6 +737,8 @@ class KnowledgeBase(Protocol):
         review_date: str | None = None,
         review_reason: str | None = None,
     ) -> Finding: ...
+
+    def set_finding_status(self, finding_id: str, status: str) -> Finding: ...
 
     def claim_history(self, finding_id: str) -> list[Finding]: ...
 
@@ -642,9 +766,23 @@ def supersede_node_id(finding_id: str, existing_ids: set[str]) -> str:
 
 
 class InMemoryKnowledgeBase:
-    """In-memory KG-adapter с тем же контрактом, что и production репозитории."""
+    """In-memory KG-adapter с тем же контрактом, что и production репозитории.
+
+    Контур исполняется в рабочих потоках (``asyncio.to_thread`` в API и в
+    инструментах агента), поэтому каталог, граф и цепочки версий закрыты одним
+    замком: ``RLock`` — потому что публичные методы вызывают друг друга
+    (``retrieve`` → ``full_graph``, ``ingest`` → ``_invalidate``), и обычный Lock
+    умер бы на повторном входе того же потока.
+
+    Отдельного замка на документ здесь нет: вся операция с каталогом проходит под
+    общим, поэтому второй параллельный импорт того же файла встаёт в ожидание и
+    повторно проверяет дедуп уже на записанном состоянии — гонки «проверил до,
+    написал после» не остаётся. В production-ветке так нельзя (замок держался бы
+    сквозь Neo4j и Elasticsearch), там сериализация на документ своя.
+    """
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._documents: dict[str, DocumentRequest] = {}
         self._findings: dict[str, Finding] = {
             finding.id: finding for finding in self._seed_findings()
@@ -659,14 +797,20 @@ class InMemoryKnowledgeBase:
 
     # ── Инварианты версии графа ─────────────────────────────────────────────
 
+    @_synchronized
     def _invalidate(self) -> None:
         # Единая точка сброса производных кэшей: сюда приводят все записи каталога
         # (ingest, index_document, supersede_finding, register_findings, откат),
         # поэтому ни сводки сообществ, ни список кластеров не переживают мутацию.
+        # Кэш structured output снимается и здесь: в memory-контуре промпты
+        # собираются из тех же находок, и закэшированный ответ переживал бы импорт,
+        # показывая аналитику корпус до правки источника.
         self._communities = None
         self._graph_epoch += 1
         self._brief_cache.invalidate()
+        invalidate_derived_llm_cache("каталог memory-контура")
 
+    @_synchronized
     def _ensure_communities(self) -> list[str]:
         if self._communities is None:
             self._communities = detect_communities(self._graph.nodes, self._graph.edges)
@@ -674,6 +818,7 @@ class InMemoryKnowledgeBase:
 
     # ── Ingestion ───────────────────────────────────────────────────────────
 
+    @_synchronized
     def ingest(self, document: DocumentRequest, extraction: ExtractionResult) -> DocumentReceipt:
         checksum = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
         document_id = stable_uuid(checksum)
@@ -702,6 +847,7 @@ class InMemoryKnowledgeBase:
             extracted_claims=len(extraction.claims),
         )
 
+    @_synchronized
     def snapshot_state(self) -> KnowledgeState:
         """Снимок каталога до записи — опора для отката production-импорта."""
         return KnowledgeState(
@@ -712,6 +858,7 @@ class InMemoryKnowledgeBase:
             chains={key: list(value) for key, value in self._version_chains.items()},
         )
 
+    @_synchronized
     def restore_state(self, state: KnowledgeState) -> None:
         """Возвращает каталог к снимку: половину импорта держать в контуре нельзя."""
         self._documents = dict(state.documents)
@@ -721,6 +868,7 @@ class InMemoryKnowledgeBase:
         self._version_chains = {key: list(value) for key, value in state.chains.items()}
         self._invalidate()
 
+    @_synchronized
     def register_findings(self, findings: Iterable[Finding]) -> int:
         """Принимает находки, обнаруженные вне локального каталога.
 
@@ -918,11 +1066,14 @@ class InMemoryKnowledgeBase:
 
     # ── Retrieval ───────────────────────────────────────────────────────────
 
+    @_synchronized
     def retrieve(
         self,
         plan: QueryPlan,
         retrieval_plan: RetrievalPlan,
         allowed_data_classes: set[DataClass] | None = None,
+        *,
+        abort: AbortCheck | None = None,
     ) -> RetrievalContext:
         """Исполняет план retrieval теми же хелперами, что и production-контур.
 
@@ -932,6 +1083,10 @@ class InMemoryKnowledgeBase:
         ``semantic_query``/``use_global_context`` не читались нигде. Теперь окно
         кандидатов шире потолка выдачи, ограничения исполняются
         ``finalize_retrieval``, а неприменимое ограничение называется вслух.
+
+        ``abort`` здесь не декорация: тот же предикат, что и в neo4j-ветке, снимает
+        с прогона обход и сводки сообществ, и оба контура рапортуют пропущенные фазы
+        одними словами.
         """
         notes: list[str] = []
         if (retrieval_plan.semantic_query or "").strip() and (
@@ -941,8 +1096,14 @@ class InMemoryKnowledgeBase:
                 "Семантическая ветка в memory-контуре недоступна (эмбеддингов нет): "
                 "использован лексический запрос, отдельного векторного поиска не было."
             )
-        graph, graph_notes = self._neighbourhood(retrieval_plan, allowed_data_classes)
-        notes.extend(graph_notes)
+        if not retrieval_plan.use_local_graph:
+            graph = GraphSnapshot(nodes=[], edges=[], communities=[])
+        elif is_aborted(abort):
+            notes.append(abort_note("обход графа"))
+            graph = GraphSnapshot(nodes=[], edges=[], communities=[])
+        else:
+            graph, graph_notes = self._neighbourhood(retrieval_plan, allowed_data_classes)
+            notes.extend(graph_notes)
         # Копия находок здесь не нужна: `finalize_retrieval` копирует ровно то, что
         # ушло в выдачу, — двойное глубокое копирование кандидатов на каждое
         # действие только удваивало цену ранжирования.
@@ -954,12 +1115,15 @@ class InMemoryKnowledgeBase:
         )
         wants_global = retrieval_plan.use_community_context or retrieval_plan.use_global_context
         briefs: list[str] = []
-        if wants_global:
+        if wants_global and is_aborted(abort):
+            notes.append(abort_note("сводки сообществ"))
+        elif wants_global:
             briefs = self._community_briefs(
                 allowed_data_classes,
                 candidates,
                 query_tokens(retrieval_plan.lexical_query),
             )
+        if wants_global:
             notes.extend(global_context_notes(retrieval_plan.use_global_context, briefs))
         return finalize_retrieval(
             candidates,
@@ -1066,6 +1230,7 @@ class InMemoryKnowledgeBase:
                 seen.add(node.id)
         return anchors[:MAX_ANCHORS]
 
+    @_synchronized
     def rank_findings(
         self,
         query: str,
@@ -1153,6 +1318,7 @@ class InMemoryKnowledgeBase:
         total = statement_hits + 0.3 * evidence_hits + 0.5 * source_hits + 0.5 * subject_hits
         return (total, statement_hits, finding.confidence)
 
+    @_synchronized
     def document_count(self) -> int:
         return len(
             {
@@ -1162,6 +1328,7 @@ class InMemoryKnowledgeBase:
             }
         )
 
+    @_synchronized
     def index_document(
         self, document: DocumentRequest, source_path: str
     ) -> StructuralDocumentReceipt:
@@ -1184,6 +1351,11 @@ class InMemoryKnowledgeBase:
         state = self.snapshot_state()
         try:
             pieces = chunk_document(document, document_id)
+            if not pieces:
+                raise NoChunksError(
+                    f"фрагменты короче порога чанкинга ({CHUNK_MIN_CHARS} символов): "
+                    "в индекс не лёг ни один кусок текста"
+                )
             document_node_id = f"document-{document_id}"
             known_nodes = {node.id for node in self._graph.nodes}
             if document_node_id not in known_nodes:
@@ -1212,6 +1384,7 @@ class InMemoryKnowledgeBase:
             chunks=len(pieces),
         )
 
+    @_synchronized
     def corpus_stats(self) -> CorpusStats:
         chunks = sum(finding.id.startswith("chunk-") for finding in self._findings.values())
         return CorpusStats(
@@ -1226,6 +1399,7 @@ class InMemoryKnowledgeBase:
             vectors_indexed=0,
         )
 
+    @_synchronized
     def full_graph(self, allowed_data_classes: set[DataClass] | None = None) -> GraphSnapshot:
         """Снимок графа для чтения: новые списки-контейнеры, общие модели элементов.
 
@@ -1263,6 +1437,7 @@ class InMemoryKnowledgeBase:
             allowed_data_classes,
         )
 
+    @_synchronized
     def all_findings(self, allowed_data_classes: set[DataClass] | None = None) -> list[Finding]:
         """Каталог находок для внешних потребителей — копия на границе.
 
@@ -1278,6 +1453,7 @@ class InMemoryKnowledgeBase:
             and (allowed_data_classes is None or finding.data_class in allowed_data_classes)
         ]
 
+    @_synchronized
     def finding_catalog(self) -> Mapping[str, Finding]:
         """Каталог актуальных находок без копирования — для внутреннего диффа.
 
@@ -1291,6 +1467,71 @@ class InMemoryKnowledgeBase:
             if value.superseded_by is None
         }
 
+    @_synchronized
+    def findings_window(
+        self,
+        *,
+        limit: int = FINDINGS_WINDOW_DEFAULT,
+        offset: int = 0,
+        allowed_data_classes: set[DataClass] | None = None,
+        status: str | None = None,
+        subject: str | None = None,
+    ) -> FindingWindow:
+        """Окно каталога: отобрано под замком, скопирована ровно страница.
+
+        Отбор идёт по тому же правилу, что у ``all_findings`` (заменённые версии и
+        срез доступа), а порядок — по идентификатору: он не зависит от порядка
+        вставки, поэтому вторая страница не «уплывает» после параллельного импорта.
+        Глубокое копирование — только у возвращаемого окна: прежняя реализация
+        копировала весь каталог на каждый вызов, и постраничный список обходился
+        дороже, чем весь корпус целиком.
+
+        ``status`` и ``subject`` отсекаются здесь, а не в индексе: в in-memory
+        контуре индекса нет, и маршрут обязан получить то же самое окно, что и на
+        рабочем контуре (там те же предикаты уходят в запрос Elasticsearch).
+        """
+        size, start = normalize_window(limit, offset)
+        allowed = None if allowed_data_classes is None else set(allowed_data_classes)
+        needle = subject.lower() if subject else None
+        selected = sorted(
+            (
+                finding
+                for finding in self._findings.values()
+                if finding.superseded_by is None
+                and (allowed is None or finding.data_class in allowed)
+                and (status is None or finding.status == status)
+                and (needle is None or needle in (finding.subject or "").lower())
+            ),
+            key=lambda finding: finding.id,
+        )
+        return FindingWindow(
+            findings=[finding.model_copy(deep=True) for finding in selected[start : start + size]],
+            total=len(selected),
+            offset=start,
+            limit=size,
+            note=None,
+        )
+
+    def warmup(self) -> None:
+        """In-memory-каталог собирается в конструкторе: прогревать нечего."""
+
+    @_synchronized
+    def set_finding_status(self, finding_id: str, status: str) -> Finding:
+        """Меняет степень консенсуса находки, не порождая версию.
+
+        ``supersede_finding`` переписывает сам тезис и для этого создаёт
+        следующую версию с ребром SUPERSEDES. Подтверждённое противоречие источник
+        не переписывает: у двух находок меняется только ``status`` — это тот
+        переход, которого ждёт экспертный разбор пар.
+        """
+        current = self._findings.get(finding_id)
+        if current is None:
+            raise KeyError(f"Finding not found: {finding_id}")
+        updated = current.model_copy(update={"status": status})
+        self._findings[finding_id] = updated
+        return updated.model_copy(deep=True)
+
+    @_synchronized
     def supersede_finding(
         self,
         finding_id: str,
@@ -1306,6 +1547,10 @@ class InMemoryKnowledgeBase:
         Работает и по идентификатору структурного чанка (``chunk-<uuid>``): чанки
         регистрируются в каталоге при ``index_document`` и принимаются извне через
         ``register_findings``, поэтому контракт id единый для обоих бэкендов.
+
+        Проверка «уже заменён» и запись идут под одним замком: второй эксперт,
+        который открыл ту же карточку, получает ``ValueError`` (наружу — 409), а
+        не вторую версию одного тезиса с двумя рёбрами SUPERSEDES.
         """
         old = self._findings.get(finding_id)
         if old is None:
@@ -1367,6 +1612,7 @@ class InMemoryKnowledgeBase:
         self._invalidate()
         return new_finding
 
+    @_synchronized
     def claim_history(self, finding_id: str) -> list[Finding]:
         """Версии тезиса: из `_version_chains`, после перезапуска — из связей `superseded_by`.
 

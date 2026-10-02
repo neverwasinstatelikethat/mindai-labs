@@ -8,16 +8,18 @@ import json
 import logging
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from typing import Annotated, Any, Literal, cast
-from urllib.parse import urlsplit
+from typing import Annotated, Any, Literal, cast, get_args
+from urllib.parse import quote, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from elasticsearch import TransportError as ElasticsearchTransportError
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from httpx import TransportError as HttpxTransportError
@@ -27,6 +29,8 @@ from neo4j.exceptions import TransientError as Neo4jTransientError
 from prometheus_fastapi_instrumentator import Instrumentator
 from psycopg import OperationalError as PsycopgOperationalError
 from starlette.background import BackgroundTask
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from scientific_tangle import __version__
 from scientific_tangle.agents.workflow import ResearchWorkflow, WorkflowNodeError
@@ -42,6 +46,9 @@ from scientific_tangle.domain.contracts import (
     ClaimHistoryEntry,
     ComparisonRequest,
     ComparisonTable,
+    ConflictCandidateView,
+    ConflictReview,
+    ConflictReviewRequest,
     CorpusStats,
     DashboardResponse,
     DocumentReceipt,
@@ -88,14 +95,18 @@ from scientific_tangle.services.admission import (
     agent_run_limit,
 )
 from scientific_tangle.services.agent_metrics import (
+    STORAGE_THREADS,
     AgentMetricsRegistry,
     agent_metrics,
     begin_llm_usage,
     current_llm_usage,
 )
 from scientific_tangle.services.comparison import ComparisonService
+from scientific_tangle.services.conflicts import candidate_views, resolve_for_review
 from scientific_tangle.services.document_parser import UnsupportedDocumentError, parse_document
 from scientific_tangle.services.durable_state import (
+    MAX_CONFLICT_REVIEWS,
+    MAX_EXPERIMENTS,
     DurableState,
     InMemoryDurableState,
     StoredAnswer,
@@ -103,10 +114,10 @@ from scientific_tangle.services.durable_state import (
 )
 from scientific_tangle.services.evolution import EvolutionService
 from scientific_tangle.services.exporter import ExportError, ExportService
-from scientific_tangle.services.governance import AccessPolicyEngine
+from scientific_tangle.services.governance import BASE_DATA_CLASSES, AccessPolicyEngine
 from scientific_tangle.services.infrastructure import Neo4jElasticsearchKnowledgeBase
 from scientific_tangle.services.ingestion import IngestionService
-from scientific_tangle.services.knowledge import KnowledgeBase
+from scientific_tangle.services.knowledge import FindingWindow, KnowledgeBase
 from scientific_tangle.services.ontology import OntologyValidationError
 from scientific_tangle.services.provider import ModelUnavailableError, build_provider
 from scientific_tangle.services.research_intelligence import (
@@ -124,6 +135,9 @@ logging.basicConfig(level=logging.INFO)
 NOTIFICATION_FEED_LIMIT = 20
 AUDIT_LIMIT_DEFAULT = 200
 AUDIT_LIMIT_MAX = 1000
+# Потолок прогрева хранилища на старте: зависший Neo4j/Elasticsearch не должен
+# превращать запуск сервиса в вечное ожидание (см. _warmup_knowledge).
+STORAGE_WARMUP_SECONDS = 30.0
 # Профиль читает журнал своего аккаунта экраном, а не выгрузкой: сотни строк
 # человеку не нужны, а большой лимит только зря гоняет состояние через прокси.
 ME_ACTIVITY_LIMIT_DEFAULT = 40
@@ -133,7 +147,15 @@ ME_ACTIVITY_LIMIT_MAX = 200
 # здесь — это прочитать её до этого потолка, а не неограниченный запрос к базе.
 # Значение обязано совпадать с MAX_PROPOSALS: если потолок журнала изменится,
 # менять нужно и здесь, иначе X-Total-Count начнёт врать о размере очереди.
+# Это единственное число для всех путей, которые что-либо решают по ленте
+# (список, гейт «известно ли предложение», A/B-прогон, гидратация зеркала при
+# подъёме): дефолт параметра чужой зоны (``durable_state``) эти пути не устраивает —
+# предложение за дефолтом оставалось бы видно в очереди, но было бы нерешаемо.
 PROPOSAL_FEED_READ_LIMIT = 500
+# Запись в закрытый класс — отдельный гейт от чтения, и он проверяется первым на
+# обоих путях импорта (JSON и multipart): извлечение и OCR стоят минут, поэтому
+# отказ по праву доступа не должен оплачиваться полным разбором файла.
+RESTRICTED_WRITE_DETAIL = "Запись в класс «restricted» требует экспертного права на запись"
 # Сбой хранилища знаний формулируется человеку, а не стеком: 500 на недоступном
 # Neo4j выглядел бы падением приложения, и мониторинг звал бы разработчика туда,
 # где нужно только поднять граф или индекс.
@@ -157,12 +179,30 @@ METRICS_PATH = "/metrics"
 # success_rate узлов начал бы зависеть от того, закрыл ли кто-то вкладку.
 CANCELLED_RUN_AGENT = "query.http"
 CANCELLED_STREAM_AGENT = "query.stream.http"
+# Как часто JSON-прогон смотрит, жив ли клиент: чаще — раньше освободится слот,
+# реже — больше лишних обращений к ``is_disconnected`` на длинном прогоне.
+DISCONNECT_POLL_SECONDS = 1.0
 _WORKFLOW_LOCK = threading.Lock()
 # Только против параллельного холодного старта витрины (см. /demo).
 _DEMO_LOCK = asyncio.Lock()
 # Задачи, дописывающие акты после отмены прогона: event loop хранит задачи по
 # слабым ссылкам, без держателя недочитанный акт исчезал бы при сборке мусора.
 _PENDING_CLEANUP: set[asyncio.Task[None]] = set()
+# Пробы готовности: ``/health/ready`` опрашивают мониторинг и человек, поэтому
+# результат держится несколько секунд — иначе каждый опрос гонял бы ping Neo4j,
+# cluster health Elasticsearch и SELECT 1 в Postgres. Жёсткий потолок короткий:
+# readiness не имеет права сам становиться источником задержки.
+READINESS_PROBE_TTL_SECONDS = 5.0
+READINESS_PROBE_TIMEOUT_SECONDS = 2.0
+# Значение «сервис настроен, но не отвечает» появляется в литерале ``ServiceState``
+# только вместе с контрактом (зона domain/contracts.py), поэтому оно выбирается по
+# фактическому составу литерала: pydantic отверг бы неизвестное значение прямо в
+# теле readiness, и роут падал бы 500 ровно там, где он обязан показать деградацию.
+_UNAVAILABLE_SERVICE_STATE = cast(
+    ServiceState, "unavailable" if "unavailable" in get_args(ServiceState) else "disabled"
+)
+_readiness_probe_cache: tuple[float, dict[str, bool]] | None = None
+_readiness_probe_lock = asyncio.Lock()
 
 # ── Доступ: контракт «сессия → субъект» ──────────────────────────────────────
 SESSION_COOKIE = "nk_session"
@@ -174,6 +214,51 @@ METRICS_UNAUTHENTICATED_DETAIL = (
     "Для чтения метрик нужен заголовок Authorization: Bearer <METRICS_TOKEN>"
 )
 STATE_CHANGING_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
+# pydantic описывает отказ схемы типом ошибки и значением, присланным клиентом.
+# Значение (``input``, ``ctx``) наружу не уходит: в него попадает весь текст
+# restricted-документа, который 422 отдавал бы обратно в браузере и в чужих
+# логах. Поэтому сообщения собираются по типу ошибки, а не по присланным данным.
+VALIDATION_REASONS: dict[str, str] = {
+    "missing": "не заполнено",
+    "extra_forbidden": "не разрешено в этом запросе",
+    "string_type": "ожидался текст",
+    "string_too_short": "значение короче допустимого",
+    "string_too_long": "значение длиннее допустимого",
+    "int_type": "ожидалось целое число",
+    "int_parsing": "не читается как целое число",
+    "float_type": "ожидалось число",
+    "float_parsing": "не читается как число",
+    "bool_type": "ожидается да или нет",
+    "bool_parsing": "не читается как да или нет",
+    "greater_than": "значение должно быть больше допустимого предела",
+    "greater_than_equal": "значение ниже допустимого предела",
+    "less_than": "значение должно быть меньше допустимого предела",
+    "less_than_equal": "значение выше допустимого предела",
+    "too_short": "элементов меньше, чем требуется",
+    "too_long": "элементов больше, чем допустимо",
+    "literal_error": "значение вне допустимого перечня",
+    "enum": "значение вне допустимого перечня",
+    "list_type": "ожидался список",
+    "dict_type": "ожидался набор полей",
+    "model_attributes_type": "передана структура неожиданного вида",
+    "uuid_parsing": "ожидался идентификатор в формате UUID",
+    "json_invalid": "тело не разобрано как JSON",
+    "json_type": "тело не разобрано как JSON",
+    "value_error": "значение отклонено проверкой",
+}
+# Области запроса из ``loc``: без них человек не понял бы, что именно править —
+# поле формы, параметр строки запроса или заголовок.
+VALIDATION_AREAS: dict[str, str] = {
+    "body": "тело запроса",
+    "query": "параметр запроса",
+    "path": "параметр пути",
+    "header": "заголовок",
+    "cookie": "cookie",
+    "form": "поле формы",
+}
+# Сколько замечаний показывается человеку: больше — простыня, которую в
+# интерфейсе не читают, а полный перечень остаётся в журнале процесса.
+VALIDATION_DETAIL_MAX = 3
 # Без сессии работают только регистрация/вход и агрегированная статистика
 # корпуса (числа без признаков класса доступа).
 PUBLIC_API_PATHS = frozenset(
@@ -340,7 +425,10 @@ async def _prepare_state(deps: AppDependencies) -> None:
     # Очередь предложений эволюции и активная политика промпта поднимаются из
     # серверного состояния: без этого рестарт процесса молча менял поведение
     # агента (принятые правки исчезали) и обнулял экспертный обзор.
-    restored = await deps.state.recent_proposals()
+    # Потолок читается тот же, что и у ``/proposals``: дефолт параметра чужой
+    # зоны оставлял бы хвост очереди без зеркала, и решение по такому предложению
+    # падало бы вместо работы.
+    restored = await deps.state.recent_proposals(limit=PROPOSAL_FEED_READ_LIMIT)
     for proposal in restored:
         deps.evolution.restore(proposal)
     if any(proposal.status == "accepted" for proposal in restored):
@@ -348,12 +436,106 @@ async def _prepare_state(deps: AppDependencies) -> None:
             deps.workflow = deps.build_workflow(extra_policy=deps.evolution.active_policy())
 
 
+class _StorageThreadPool(ThreadPoolExecutor):
+    """Default executor цикла с явным размером и метрикой очереди.
+
+    Все блокирующие обращения к хранилищу уходят через ``asyncio.to_thread``, то
+    есть в default executor цикла. Без явного размера это ``min(32, ядер + 4)``,
+    посчитанное от хоста, а не от ёмкости контейнера и не от числа прогонов: один
+    медленный обход графа занимает потоки, и соседний ``/findings`` ждёт не
+    Elasticsearch, а освободившийся поток. Пул именуемый (потоки видно в журнале и
+    в снимке трассировки), а его занятость — метрика, а не догадка по p95.
+    """
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        STORAGE_THREADS.labels(state="queued").inc()
+        try:
+            future = super().submit(self._instrumented(fn), *args, **kwargs)
+        except BaseException:
+            STORAGE_THREADS.labels(state="queued").dec()
+            raise
+        future.add_done_callback(lambda _: STORAGE_THREADS.labels(state="queued").dec())
+        return future
+
+    @staticmethod
+    def _instrumented(fn: Callable[..., Any]) -> Callable[[], Any]:
+        def run() -> Any:
+            STORAGE_THREADS.labels(state="in_flight").inc()
+            try:
+                return fn()
+            finally:
+                STORAGE_THREADS.labels(state="in_flight").dec()
+
+        return run
+
+
+def _configure_storage_pool(settings: Settings) -> ThreadPoolExecutor:
+    """Ставит именованный пул потоков как default executor текущего цикла."""
+    pool = _StorageThreadPool(
+        max_workers=settings.storage_thread_pool_size,
+        thread_name_prefix="storage",
+    )
+    asyncio.get_running_loop().set_default_executor(pool)
+    STORAGE_THREADS.labels(state="limit").set(settings.storage_thread_pool_size)
+    if settings.storage_thread_pool_size < settings.agent_max_concurrent_runs * 2:
+        logger.warning(
+            "STORAGE_THREAD_POOL_SIZE=%d меньше удвоенного потолка приёма "
+            "(%d прогонов): обращения к хранилищу будут ждать поток друг за "
+            "другом, и медленный обход графа затормозит списки. Увеличьте пул или "
+            "уменьшите AGENT_MAX_CONCURRENT_RUNS.",
+            settings.storage_thread_pool_size,
+            settings.agent_max_concurrent_runs,
+        )
+    logger.info(
+        "Пул блокирующих чтений хранилища: %d потоков (prefix=storage)",
+        settings.storage_thread_pool_size,
+    )
+    return pool
+
+
+async def _warmup_knowledge(deps: AppDependencies) -> None:
+    """Хранилище прогревается до первого запроса, но старт ради прогрева не встаёт.
+
+    Схема Neo4j, индексы Elasticsearch, подъём каталога и доводка старых записей
+    были ленивыми: первый аналитик платил за них секундами при полностью
+    исправном контуре. Потолок нужен, потому что зависшее хранилище не должно
+    блокировать запуск — healthcheck контейнера посчитал бы его мёртвым. Прогрев
+    по таймауту не отменяется (поток в `to_thread` не прерывается): он доходит до
+    конца сам, а первый запрос либо застанет каталог готовым, либо прогреет его
+    как раньше.
+    """
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(deps.knowledge.warmup),
+            timeout=STORAGE_WARMUP_SECONDS,
+        )
+        logger.info("Хранилище знаний прогрето до первого запроса")
+    except TimeoutError:
+        logger.error(
+            "Прогрев хранилища не уложился в %.0f с: сервис поднимается, каталог"
+            " догреется в фоне или на первом запросе",
+            STORAGE_WARMUP_SECONDS,
+        )
+    except Exception as error:  # noqa: BLE001 — хранилище может лежать, это не причина не стартовать
+        logger.error("Прогрев хранилища не удался: %s", error)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     deps = get_dependencies()
     application.state.dependencies = deps
+    # Пул блокирующих чтений ставится раньше всего: через него пойдут и прогрев,
+    # и первый же список находок.
+    storage_pool = _configure_storage_pool(deps.settings)
     await _prepare_accounts(deps)
     await _prepare_state(deps)
+    await _warmup_knowledge(deps)
     try:
         if deps.settings.knowledge_backend == "neo4j":
             try:
@@ -376,6 +558,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         await deps.state.close()
         # Драйверы Neo4j закрываются синхронно — уводим из event loop.
         await asyncio.to_thread(deps.close)
+        # Пул гасится последним: последний блокирующий вызов выше всё ещё его.
+        # Ожидание не ставится: зависший поток хранилища не должен удерживать
+        # остановку сервиса, а счётчики обнуляются, чтобы перезапуск в одном
+        # процессе не оставил висящее значение.
+        storage_pool.shutdown(wait=False, cancel_futures=False)
+        STORAGE_THREADS.labels(state="in_flight").set(0)
+        STORAGE_THREADS.labels(state="queued").set(0)
 
 
 def _correlation_id(request: Request) -> str:
@@ -469,7 +658,7 @@ async def _notify(deps: AppDependencies, topic: NotificationTopic, message: str)
 
 @asynccontextmanager
 async def _storage_or_unavailable(request: Request, what: str) -> AsyncIterator[None]:
-    """Чтение из хранилища под честным 503: сбой базы — не падение приложения.
+    """Обращение к хранилищу под честным 503: сбой базы — не падение приложения.
 
     Маршруты чтения графа вызывали ``asyncio.to_thread`` прямо, и на недоступном
     Neo4j/Elasticsearch/Postgres это была 500 с пустым объяснением: мониторинг
@@ -477,12 +666,18 @@ async def _storage_or_unavailable(request: Request, what: str) -> AsyncIterator[
     «хранилище не отвечает». Ошибки соединения и таймауты отображаются в 503,
     прикладные (``ValueError``, ``KeyError``, синтаксис Cypher) — нет: они и
     должны оставаться 500, потому что это баг кода, а не отсутствие сервиса.
+
+    Тем же механизмом закрыты durable-чтения (выгрузка, журнал, оценки, расход) и
+    пути записи (импорт, перезапись утверждения, решение по предложению): «базы
+    нет» одинаково и там, и там, а 4xx (доступ, не найден, конфликт) остаются
+    своими кодами — они поднимаются как ``HTTPException`` и через этот фильтр не
+    проходят.
     """
     try:
         yield
     except STORAGE_ERRORS as error:
         logger.warning(
-            "%s не читается: хранилище недоступно (correlation_id=%s): %s",
+            "Обращение «%s» не выполнено: хранилище недоступно (correlation_id=%s): %s",
             what,
             _correlation_id(request) or "—",
             error,
@@ -507,6 +702,27 @@ def _paginated[Item](
     return list(items[offset : offset + limit])
 
 
+def _report_window(
+    response: Response, window: FindingWindow, *, requested_limit: int
+) -> None:
+    """Окно хранилища: полное число — в ``X-Total-Count``, оговорку — в заголовок.
+
+    ``FindingWindow.note`` жил только в сервисе: клиент получал короткую страницу и
+    не мог отличить «больше записей нет» от «Elasticsearch не ответил, окно взято из
+    каталога процесса». Тело не трогаем — его читает фронтенд как массив.
+
+    Значение URL-кодировано: заголовок уходит как latin-1, а оговорка по-русски.
+    """
+    response.headers["X-Total-Count"] = str(window.total)
+    notes = [window.note] if window.note else []
+    if window.limit < requested_limit:
+        notes.append(
+            f"Потолок страницы — {window.limit} записей, запрос был на {requested_limit}."
+        )
+    if notes:
+        response.headers["X-Window-Note"] = quote(" ".join(notes))
+
+
 def _invalidate_demo_cache(deps: AppDependencies) -> None:
     """Витрина сброшена: корпус изменился, а кэш ответа — нет.
 
@@ -520,6 +736,35 @@ def _invalidate_demo_cache(deps: AppDependencies) -> None:
     deps.demo_answer = None
     deps.demo_evaluation = None
     deps.demo_access = None
+
+
+async def _await_or_client_gone[T](
+    request: Request, work: Callable[[], Coroutine[Any, Any, T]]
+) -> T:
+    """Ждёт работу и отменяет её, как только клиент ушёл.
+
+    Отмена HTTP-запроса при обрыве соединения — поведение сервера, а не приложения:
+    uvicorn не отменяет задачу обработчика на POST-запросе с длинным прогоном,
+    поэтому без этой проверки закрытая вкладка держала слот приёма и слот модели до
+    ``AGENT_DEADLINE_SECONDS``. Поток SSE отменяется сам; этот хелпер закрывает JSON-путь.
+
+    Работает ровно потому, что слой доступа больше не ``BaseHTTPMiddleware``: тот
+    подменяет канал ``receive``, и ``is_disconnected()`` из обработчика обрыв не
+    видит (замер на реальном сокете: с ним прогон доходил до конца, без него
+    отменяется на 0.01 с после ухода клиента).
+
+    ``CancelledError`` поднимается намеренно: вызывающий обработчик ведёт тот же учёт,
+    что и при настоящей отмене (след прогона, акт, освобождение слота).
+    """
+    task: asyncio.Task[T] = asyncio.create_task(work())
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=DISCONNECT_POLL_SECONDS)
+        if done:
+            return await task
+        if await request.is_disconnected():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise asyncio.CancelledError("клиент отключился до завершения прогона")
 
 
 async def _record_cancelled_run(
@@ -624,6 +869,24 @@ def _allowed_classes(request: Request) -> set[DataClass]:
     return set(access_engine.allowed_data_classes(principal.review_enabled))
 
 
+def _require_restricted_write(request: Request, data_class: DataClass) -> None:
+    """Единый гейт на запись в закрытый класс для обоих путей импорта.
+
+    ``restricted:read`` отвечает за доступ к данным, а запись в закрытый контур —
+    отдельное действие ``document.write_restricted`` (governance.WRITE_ACTIONS):
+    расширение доступа на чтение не должно молча открывать импорт в restricted.
+    Класс ``internal`` гейта не требует — он входит в базовый уровень продукта
+    (PRODUCT.md), поэтому проверяется принадлежность к ``BASE_DATA_CLASSES``, а не
+    «всё, что не public».
+    """
+    if data_class in BASE_DATA_CLASSES:
+        return
+    principal: Principal | None = getattr(request.state, "principal", None)
+    if access_engine.can_write(principal, "document.write_restricted"):
+        return
+    raise HTTPException(status_code=403, detail=RESTRICTED_WRITE_DETAIL)
+
+
 def _requires_session(path: str) -> bool:
     """Всё под ``/api/v1/`` работает только с сессией, кроме белого списка.
 
@@ -678,27 +941,27 @@ def _origin_trusted(request: Request, settings: Settings) -> bool:
     return netloc in settings.trusted_origin_hosts
 
 
-app = FastAPI(
-    title="Научный Клубок API",
-    version=__version__,
-    description="Evidence-centric Agentic GraphRAG API by MindAI",
-    lifespan=lifespan,
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=get_settings().allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-Instrumentator(excluded_handlers=["/metrics"]).instrument(app).expose(
-    app,
-    include_in_schema=False,
-)
+def _mutating_get_refused(request: Request, settings: Settings) -> bool:
+    """Источник GET, который мутирует состояние, назван и чужой — отказ.
+
+    ``STATE_CHANGING_METHODS`` в middleware покрывает POST/PATCH/PUT/DELETE, а
+    ``/api/v1/demo`` — GET, который записывает серверную копию ответа, акт в
+    журнал и сжигает бюджет витрины на первом обращении. Переводить его в POST
+    нельзя: интерфейс обращается к нему как к GET. Поэтому источник проверяется
+    внутри обработчика той же функцией, что и в middleware.
+
+    Отказ даёт названный, но не доверенный источник, плюс ``Sec-Fetch-Site`` от
+    браузера: запрос вообще без этих заголовков не подделывает чужая страница
+    (на навигации браузер источник не сообщает), зато такой запрос legit-клиента
+    не должен превращаться в 403.
+    """
+    declared = request.headers.get("origin") or request.headers.get("referer")
+    if declared and not _origin_trusted(request, settings):
+        return True
+    return request.headers.get("sec-fetch-site", "").strip().lower() == "cross-site"
 
 
-@app.middleware("http")
-async def access_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+class AccessMiddleware:
     """Серверная аутентификация: cookie-сессия → субъект, затем порог доступа.
 
     Заменяет эпоху ``X-User-Role``/``X-User-Id``, где личность приходила от
@@ -716,21 +979,55 @@ async def access_middleware(request: Request, call_next):  # type: ignore[no-unt
       CORSMiddleware, который висит внутренним слоем.
 
     Тонкие права (``audit:read``, ``proposal:review``, ``restricted:read``)
-    по-прежнему проверяет ``require_permission`` — middleware отвечает только
-    за «есть ли субъект».
+    по-прежнему проверяет ``require_permission`` — этот слой отвечает только за
+    «есть ли субъект».
+
+    Класс, а не ``@app.middleware("http")``, по причине, измеренной на этом
+    контуре: BaseHTTPMiddleware запускает обработчик в отдельной задаче и своим
+    каналом ``receive``, из-за чего ``request.is_disconnected()`` внутри маршрута
+    обрыв соединения не видит. Замеры на одном и том же медленном JSON-роуте:
+    без этого слоя прогон отменяется через 2–3 с после закрытой вкладки, с
+    ``@app.middleware("http")`` — доходит до конца (10 с). То есть хелпер
+    ``_await_or_client_gone`` был бутафорией ровно до этой замены: закрытая
+    вкладка держала слот приёма и слот модели до ``AGENT_DEADLINE_SECONDS``.
     """
-    deps = dependencies(request)
-    # correlation_id назначается на сервере, если клиент его не принёс: иначе
-    # акту в журнале не с чем сопоставить, и разбор инцидента невозможен.
-    correlation_id = request.headers.get("X-Correlation-Id", "").strip() or uuid4().hex
-    request.state.correlation_id = correlation_id
-    token = request.cookies.get(SESSION_COOKIE)
-    account = await deps.accounts.resolve_session(token) if token else None
-    request.state.account = account
-    request.state.principal = (
-        access_engine.principal(account.id, account.review_enabled) if account else None
-    )
-    if request.method != "OPTIONS":
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        # correlation_id назначается на сервере, если клиент его не принёс: иначе
+        # акту в журнале не с чем сопоставить, и разбор инцидента невозможен.
+        correlation_id = request.headers.get("X-Correlation-Id", "").strip() or uuid4().hex
+        request.state.correlation_id = correlation_id
+        deps = dependencies(request)
+        token = request.cookies.get(SESSION_COOKIE)
+        account = await deps.accounts.resolve_session(token) if token else None
+        request.state.account = account
+        request.state.principal = (
+            access_engine.principal(account.id, account.review_enabled) if account else None
+        )
+        send_with_id = self._send_with_correlation(send, correlation_id)
+        if request.method != "OPTIONS":
+            refusal = self._refusal(request, deps, account, token, correlation_id)
+            if refusal is not None:
+                await refusal(scope, receive, send_with_id)
+                return
+        await self.app(scope, receive, send_with_id)
+
+    @staticmethod
+    def _refusal(
+        request: Request,
+        deps: AppDependencies,
+        account: Account | None,
+        token: str | None,
+        correlation_id: str,
+    ) -> JSONResponse | None:
+        """Отказ слоя доступа или ``None`` — продолжить обработку."""
         if request.url.path == METRICS_PATH and not _metrics_allowed(request, deps.settings):
             return JSONResponse(
                 status_code=401,
@@ -761,17 +1058,114 @@ async def access_middleware(request: Request, call_next):  # type: ignore[no-unt
                 content={"detail": CSRF_DETAIL},
                 headers={"X-Correlation-Id": correlation_id},
             )
-    response = await call_next(request)
-    # Идентификатор доезжает до клиента и на обычных ответах, и на потоках:
-    # заголовок есть у каждого обращения, включая SSE, где тело может и не
-    # дойти до события с идентификатором.
-    response.headers["X-Correlation-Id"] = correlation_id
-    return response
+        return None
+
+    @staticmethod
+    def _send_with_correlation(send: Send, correlation_id: str) -> Send:
+        """Отдаёт идентификатор на каждом ответе — и на обычных, и на потоках.
+
+        SSE не обязан доходить до события с идентификатором, поэтому заголовок
+        ставится на ``http.response.start``, а не в теле обработчика.
+        """
+
+        async def wrapped(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Correlation-Id"] = correlation_id
+            await send(message)
+
+        return wrapped
+
+
+app = FastAPI(
+    title="Научный Клубок API",
+    version=__version__,
+    description="Evidence-centric Agentic GraphRAG API by MindAI",
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    # Без этого списка браузер читает только простые заголовки ответа: окно
+    # выдачи (`limit`/`offset`) теряет полное число записей, и экран «показаны
+    # первые N из M» показывает «показаний нет», хотя сервер его отдал.
+    expose_headers=["X-Total-Count", "X-Correlation-Id", "X-Window-Note"],
+)
+Instrumentator(excluded_handlers=["/metrics"]).instrument(app).expose(
+    app,
+    include_in_schema=False,
+)
+
+
+app.add_middleware(AccessMiddleware)
 
 
 @app.exception_handler(ModelUnavailableError)
 async def model_unavailable(_: Request, error: ModelUnavailableError) -> JSONResponse:
     return JSONResponse(status_code=503, content={"detail": str(error)})
+
+
+def _validation_field(loc: Sequence[object]) -> str:
+    """Человеческое имя поля по ``loc`` из ошибки схемы.
+
+    ``loc`` собран из служебных сегментов (``body``, ``query``, имена полей схемы),
+    а не из присланных данных, поэтому наружу он безопасен.
+    """
+    parts = [str(item) for item in loc]
+    if not parts:
+        return "запрос"
+    area = VALIDATION_AREAS.get(parts[0])
+    if area is None:
+        return f"поле «{' → '.join(parts)}»"
+    if len(parts) == 1:
+        return area
+    return f"поле «{' → '.join(parts[1:])}» ({area})"
+
+
+def _validation_message(error: dict[str, object]) -> str:
+    """Одна причина отказа схемы: поле + что с ним не так, без присланных значений.
+
+    Именно поэтому в текст не попадают ``input`` и ``ctx``: pydantic кладёт в них
+    всё тело запроса, включая текст restricted-документа, и такой 422 уезжал бы
+    обратно клиенту и в чужие прокси-логи.
+    """
+    reason = VALIDATION_REASONS.get(str(error.get("type", "")), "заполнено неверно")
+    loc = cast(Sequence[object], error.get("loc") or ())
+    return f"{_validation_field(loc)}: {reason}"
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, error: RequestValidationError) -> JSONResponse:
+    """Отказ схемы запроса — по-русски, без эха тела и с ``correlation_id``.
+
+    Оболочка остаётся той же, что у остальных ошибок (``{"detail": ...}`` плюс
+    заголовок ``X-Correlation-Id``), и код ответа не меняется: 422 как был, так и
+    есть. Меняется только содержимое ``detail``: вместо перечня служебных словарей
+    — строки, которые читает аналитик. Полная картина (включая ``input``) уходит в
+    журнал процесса под ``correlation_id`` — по нему разберёт инцидент тот, кому
+    это нужно.
+    """
+    errors = [dict(item) for item in error.errors()]
+    reasons = [_validation_message(item) for item in errors[:VALIDATION_DETAIL_MAX]]
+    if not reasons:
+        reasons = ["запрос заполнен неверно"]
+    remaining = len(errors) - len(reasons)
+    detail = "; ".join(reasons)
+    if remaining > 0:
+        detail += f"; и ещё замечаний: {remaining}"
+    logger.warning(
+        "Запрос отклонён на границе схемы (correlation_id=%s): %d замечаний",
+        _correlation_id(request) or "—",
+        len(errors),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": f"Проверьте запрос — {detail}."},
+        headers={"X-Correlation-Id": _correlation_id(request)},
+    )
 
 
 @app.exception_handler(OntologyValidationError)
@@ -843,6 +1237,111 @@ async def liveness() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _probe_neo4j(knowledge: object) -> bool:
+    """Фактическая проверка Neo4j, а не «бэкенд выбран при старте».
+
+    Драйвер ищется по свойству, а не по имени класса: контур на памяти probe не
+    имеет, и отсутствие соединения там — норма, а не деградация.
+
+    Вызов без аргументов и без ``timeout``: в драйвере 6.x
+    ``verify_connectivity`` возвращает ``None`` (результат полагаться на
+    исключение, а не на булево значение), именованные параметры считаются
+    preview-фичей. Потолок ожидания держит ``_readiness_probes`` снаружи, плюс
+    работают собственные таймауты драйвера из URI.
+    """
+    driver = getattr(knowledge, "_driver", None)
+    verify = getattr(driver, "verify_connectivity", None)
+    if not callable(verify):
+        return True
+    try:
+        verify()
+    except Exception as error:  # noqa: BLE001 — готовность не вправе падать из-за пробы
+        logger.warning("Neo4j не отвечает (readiness-проба): %s", error)
+        return False
+    return True
+
+
+def _probe_elasticsearch(knowledge: object) -> bool:
+    """Cluster health Elasticsearch: индекс может быть жив, а кластер — нет."""
+    client = getattr(knowledge, "_search", None)
+    health = getattr(getattr(client, "cluster", None), "health", None)
+    if not callable(health):
+        return True
+    try:
+        health()
+    except Exception as error:  # noqa: BLE001 — готовность не вправе падать из-за пробы
+        logger.warning("Elasticsearch не отвечает (readiness-проба): %s", error)
+        return False
+    return True
+
+
+async def _probe_postgres(store: object) -> bool:
+    """``SELECT 1`` через собственный пул адаптера: без него «configured» было бы
+    обещанием, данным на момент старта процесса.
+
+    Пула нет — контур работает на памяти, и это уже отражено в ``services`` как
+    ``fallback``, а не как отказ.
+    """
+    pool = getattr(store, "_pool", None)
+    if pool is None:
+        return True
+    try:
+        async with pool.connection(timeout=READINESS_PROBE_TIMEOUT_SECONDS) as connection:
+            await connection.execute("SELECT 1")
+    except Exception as error:  # noqa: BLE001 — готовность не вправе падать из-за пробы
+        logger.warning("Postgres не отвечает (readiness-проба): %s", error)
+        return False
+    return True
+
+
+async def _readiness_probes(deps: AppDependencies) -> dict[str, bool]:
+    """Пробы хранилищ с коротким кэшем: роут готовности читают часто.
+
+    Результат живёт ``READINESS_PROBE_TTL_SECONDS`` и выполняется в потоке, потому
+    что ping Neo4j и cluster health — блокирующие вызовы драйверов. Без кэша
+    каждый опрос мониторинга добавлял бы процессу лишние обращения к базе, а
+    без внешнего потолка пробы могли бы держать роут дольше, чем человек готов
+    ждать ответа о статусе сервиса.
+    """
+    global _readiness_probe_cache  # noqa: PLW0603 — кэш проб живёт в модуле намеренно
+    now = time.monotonic()
+    if (
+        _readiness_probe_cache is not None
+        and now - _readiness_probe_cache[0] < READINESS_PROBE_TTL_SECONDS
+    ):
+        return _readiness_probe_cache[1]
+    async with _readiness_probe_lock:
+        now = time.monotonic()
+        if (
+            _readiness_probe_cache is not None
+            and now - _readiness_probe_cache[0] < READINESS_PROBE_TTL_SECONDS
+        ):
+            return _readiness_probe_cache[1]
+        try:
+            graph, search, accounts_store, state = await asyncio.wait_for(
+                asyncio.gather(
+                    asyncio.to_thread(_probe_neo4j, deps.knowledge),
+                    asyncio.to_thread(_probe_elasticsearch, deps.knowledge),
+                    _probe_postgres(deps.accounts),
+                    _probe_postgres(deps.state),
+                ),
+                timeout=READINESS_PROBE_TIMEOUT_SECONDS * 2,
+            )
+        except TimeoutError:
+            # CancelledError отправляется дальше: гасить отмену роута означало бы
+            # врать вызывающей стороне.
+            logger.warning("Readiness-пробы не уложились в потолок, контур деградирован")
+            graph = search = accounts_store = state = False
+        fresh = {
+            "knowledge_graph": graph,
+            "hybrid_search": search,
+            "accounts": accounts_store,
+            "server_state": state,
+        }
+        _readiness_probe_cache = (time.monotonic(), fresh)
+        return fresh
+
+
 @app.get("/health/ready", tags=["health"], response_model=SystemStatus)
 async def readiness(request: Request, response: Response) -> SystemStatus:
     """Готовность сервиса: деградация отдаётся кодом 503, а не «успешным» 200.
@@ -853,29 +1352,59 @@ async def readiness(request: Request, response: Response) -> SystemStatus:
     «готовым» было бы неправдой — балансировщик заводил бы трафик на сервис,
     который умеет только 503.
 
+    Прошлый вариант сообщал ``configured`` по флагам старта и ни к кому не
+    обращался: контейнер считался здоровым при мёртвом Neo4j, Elasticsearch или
+    Postgres, а платить за ленивое соединение приходилось первому аналитику.
+    Теперь состояние хранилищ проверяется фактическими пробами (с кэшем на
+    несколько секунд), и неотвеченный сервис виден в тех же полях ``services`` и
+    в ``degradation_reasons`` словами — сам роут при этом не падает.
+
     ``/health/live`` к этому не относится и остаётся 200: он отвечает за «процесс
     жив», иначе оркестратор убивал бы контейнер, который чинится ключом модели, а
     не перезапуском. Поэтому healthcheck в compose.yaml смотрит на liveness, а
     readiness остаётся делом человека и мониторинга.
     """
     deps = dependencies(request)
+    probes = await _readiness_probes(deps)
     model_mode = deps.provider.mode
     neo4j_backend = deps.settings.knowledge_backend == "neo4j"
     postgres_accounts = deps.accounts.kind == "postgres"
     postgres_state = deps.state.kind == "postgres"
+
+    def backend_state(configured: bool, key: str) -> ServiceState:
+        """Три состояния вместо двух: «не настроен», «настроен и отвечает»,
+        «настроен, но не отвечает».
+
+        Проба важнее флага старта: ``configured`` из конфигурации означал лишь
+        «выбрали Neo4j/Postgres при подъёме», из-за чего healthcheck оставался
+        зелёным при мёртвом хранилище.
+        """
+        if not probes[key]:
+            return _UNAVAILABLE_SERVICE_STATE
+        return "configured" if configured else "fallback"
+
     services: dict[str, ServiceState] = {
-        "knowledge_graph": "configured" if neo4j_backend else "fallback",
-        "hybrid_search": "configured" if neo4j_backend else "fallback",
+        "knowledge_graph": backend_state(neo4j_backend, "knowledge_graph"),
+        "hybrid_search": backend_state(neo4j_backend, "hybrid_search"),
         "model_provider": "configured" if model_mode == "gigachat" else "disabled",
         "evaluation": "ready",
         "checkpointer": "configured" if deps.checkpointer is not None else "disabled",
         # "fallback" = Postgres был недоступен на старте, сессии живут в памяти.
-        "accounts": "configured" if postgres_accounts else "fallback",
+        "accounts": backend_state(postgres_accounts, "accounts"),
         # Тот же смысл для серверного состояния: на памяти состояние обнуляется
         # перезапуском вместе с остальными журналами.
-        "server_state": "configured" if postgres_state else "fallback",
+        "server_state": backend_state(postgres_state, "server_state"),
     }
     reasons = [reason for reason in (deps.accounts_error, deps.state_error) if reason]
+    if not probes["knowledge_graph"]:
+        reasons.append("Граф знаний (Neo4j) не отвечает: проба соединения не прошла.")
+    if not probes["hybrid_search"]:
+        reasons.append("Поисковый индекс (Elasticsearch) не отвечает: проба не прошла.")
+    if not probes["accounts"]:
+        reasons.append("Хранилище учётных записей (Postgres) не отвечает: проба не прошла.")
+    if not probes["server_state"]:
+        reasons.append("Серверное состояние (Postgres) не отвечает: проба не прошла.")
+    storage_down = not all(probes.values())
     if model_mode != "gigachat":
         # Причина в теле обязана читаться и на 503: «почему оркестратор считает
         # сервис недоступным» — первый вопрос того, кто смотрит на статус.
@@ -883,11 +1412,12 @@ async def readiness(request: Request, response: Response) -> SystemStatus:
             "Модель не настроена: агентные ответы недоступны до указания "
             "GIGACHAT_API_KEY."
         )
+    if model_mode != "gigachat" or storage_down:
         # Код ставится на внедрённый Response: FastAPI сериализует SystemStatus и
         # берёт status_code из него, поэтому контракт тела не плывёт.
         response.status_code = 503
     return SystemStatus(
-        status="ready" if model_mode == "gigachat" else "degraded",
+        status="ready" if model_mode == "gigachat" and not storage_down else "degraded",
         model_mode=model_mode,
         services=services,
         accounts=deps.accounts.kind,
@@ -1179,9 +1709,13 @@ async def research_query(
     handle = deps.admission.acquire()
     try:
         begin_llm_usage()
-        answer = await workflow_for(request).run(
-            _thread_scoped(account, query), allowed_data_classes=allowed
-        )
+
+        async def _run_research() -> AnswerPayload:
+            return await workflow_for(request).run(
+                _thread_scoped(account, query), allowed_data_classes=allowed
+            )
+
+        answer = await _await_or_client_gone(request, _run_research)
         filtered, evaluation = await _finalize_answer(
             request, deps, answer, allowed, account, audit_action="query.run"
         )
@@ -1222,8 +1756,13 @@ async def demo_query(request: Request, account: CurrentAccount) -> QueryResponse
     витрина собирается в контуре доступа первого зрителя, поэтому аккаунт с
     более широкими правами видит отметку в ``degradation_reasons`` — restricted
     доказательств в этом ответе просто нет, задним числом они не подтягиваются.
+
+    GET здесь не освобождён от проверки источника: роут мутирует состояние
+    (серверная копия ответа и акт), а middleware такие методы не покрывает.
     """
     deps = dependencies(request)
+    if _mutating_get_refused(request, deps.settings):
+        raise HTTPException(status_code=403, detail=CSRF_DETAIL)
     allowed = _allowed_classes(request)
     # Витрина собирается один раз на процесс и в том контуре доступа, в котором
     # её впервые запросили: более широкий зритель не получает restricted-текст
@@ -1443,7 +1982,11 @@ async def ingest_document(
     «ответ настоящий, из того же корпуса».
     """
     deps = dependencies(request)
-    receipt = await deps.ingestion.ingest(document)
+    # Гейт закрытого класса — первым, до извлечения: ``knowledge:read`` даёт
+    # читать корпус, но не право записывать в restricted (см. WRITE_ACTIONS).
+    _require_restricted_write(request, document.data_class)
+    async with _storage_or_unavailable(request, "Импорт документа"):
+        receipt = await deps.ingestion.ingest(document)
     _invalidate_demo_cache(deps)
     await _log_audit(request, "document.ingest", str(receipt.document_id))
     return receipt
@@ -1459,6 +2002,14 @@ async def upload_document(
     data_class: Annotated[Literal["public", "internal", "restricted"], Form()] = "public",
     _: None = Depends(require_permission("knowledge:read")),
 ) -> DocumentReceipt:
+    """Загрузка файла в корпус тем же путём импорта, что и JSON-эндпоинт.
+
+    Право на закрытый класс проверяется по значению формы ДО разбора: ``data_class``
+    известен серверу сразу, а парсинг и OCR — минуты CPU. Иначе отказ по доступу
+    стоил бы полного разбора, а неразбираемый restricted-файл отдавался бы 422
+    вместо 403 — то есть сам факт отказа скрывался бы за ошибкой формата.
+    """
+    _require_restricted_write(request, DataClass(data_class))
     content = await file.read()
     try:
         # Разбор и OCR — блокирующие (PyMuPDF, pytesseract, openpyxl): минуты на
@@ -1473,17 +2024,9 @@ async def upload_document(
         )
     except (UnsupportedDocumentError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    restricted_upload = document.data_class != DataClass.PUBLIC or data_class != "public"
-    # Запись в закрытый класс требует права на действие, а не права на чтение:
-    # ``restricted:read`` отвечает за доступ к данным, и выдавать его аналитику
-    # означало бы молча разрешить ему перезапись закрытого контура.
-    if restricted_upload and not access_engine.can_write(
-        request.state.principal, "document.write_restricted"
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Загрузка в restricted требует экспертного права на запись",
-        )
+    # Парсер тоже вправе сам отнести документ к закрытому классу (пометка на
+    # скане, гриф на титуле) — тогда гейт повторяется уже по факту разбора.
+    _require_restricted_write(request, document.data_class)
     document = document.model_copy(update={"data_class": DataClass(data_class)})
     # Импорт и сброс витрины — в ingest_document: загрузка не минует его.
     return await ingest_document(document, request)
@@ -1512,17 +2055,26 @@ async def get_findings(
     Список режется окном ``[offset:offset+limit]``: находок в корпусе сотни, и
     отдавать их целиком на каждый экран — гонять один и тот же массив через
     прокси. Тело остаётся массивом (так его читает фронтенд), полное число
-    подходящих записей — в ``X-Total-Count``.
+    подходящих записей — в ``X-Total-Count``, а явная оговорка окна — в
+    ``X-Window-Note``.
+
+    Окно читается из хранилища вместе с фильтрами: ``status`` и ``subject`` уходят
+    предикатами запроса (поля индексуются обоими индексами), поэтому страница
+    перестала быть вырезкой из поднятого в память каталога и не упирается в
+    ``CATALOG_RESTORE_LIMIT``.
     """
     deps = dependencies(request)
     async with _storage_or_unavailable(request, "Находки"):
-        findings = await asyncio.to_thread(deps.knowledge.all_findings, _allowed_classes(request))
-    if subject:
-        findings = [f for f in findings if subject.lower() in (f.subject or "").lower()]
-    if status:
-        findings = [f for f in findings if f.status == status]
-    window = _paginated(findings, limit, offset, response)
-    return [finding.model_dump(mode="json") for finding in window]
+        window = await asyncio.to_thread(
+            deps.knowledge.findings_window,
+            limit=limit,
+            offset=offset,
+            allowed_data_classes=_allowed_classes(request),
+            status=status,
+            subject=subject,
+        )
+    _report_window(response, window, requested_limit=limit)
+    return [finding.model_dump(mode="json") for finding in window.findings]
 
 
 @app.get("/api/v1/conflicts", tags=["knowledge"])
@@ -1534,16 +2086,124 @@ async def get_conflicts(
 ) -> list[dict[str, object]]:
     """Конфликтные находки (status=disputed) в пределах прав аккаунта.
 
-    Окно здесь то же, что у ``/findings``: ``X-Total-Count`` считает именно
-    подходящие конфликты, а не весь корпус, и экран «N расхождений» сходится с
-    выгрузкой.
+    ``X-Total-Count`` считает именно подходящие конфликты, а не весь корпус, и
+    экран «N расхождений» сходится с выгрузкой. Статус отсекается предикатом
+    хранилища, как и в ``/findings``: список не строится из поднятого в память
+    каталога.
     """
     deps = dependencies(request)
     async with _storage_or_unavailable(request, "Конфликты"):
+        window = await asyncio.to_thread(
+            deps.knowledge.findings_window,
+            limit=limit,
+            offset=offset,
+            allowed_data_classes=_allowed_classes(request),
+            status="disputed",
+        )
+    _report_window(response, window, requested_limit=limit)
+    return [finding.model_dump(mode="json") for finding in window.findings]
+
+
+@app.get(
+    "/api/v1/conflicts/candidates",
+    tags=["knowledge"],
+    response_model=list[ConflictCandidateView],
+)
+async def get_conflict_candidates(
+    request: Request,
+    response: Response,
+    limit: Annotated[int, Query(ge=1, le=AUDIT_LIMIT_MAX)] = AUDIT_LIMIT_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[ConflictCandidateView]:
+    """Очередь противоречий: пары тезисов, которые считает детектор по корпусу.
+
+    ``/conflicts`` показывает подтверждённое (находки со статусом ``disputed``),
+    этот список — то, что ещё ждёт эксперта. Пары пересчитываются на каждое
+    обращение и потому не переживают ту пару, которая перестала быть
+    противоречием после импорта нового документа или правки тезиса.
+    """
+    deps = dependencies(request)
+    async with _storage_or_unavailable(request, "Противоречия"):
         findings = await asyncio.to_thread(deps.knowledge.all_findings, _allowed_classes(request))
-    disputed = [f for f in findings if f.status == "disputed"]
-    window = _paginated(disputed, limit, offset, response)
-    return [finding.model_dump(mode="json") for finding in window]
+        reviews = await deps.state.conflict_reviews(limit=MAX_CONFLICT_REVIEWS)
+    views = await asyncio.to_thread(candidate_views, findings, reviews)
+    return _paginated(views, limit, offset, response)
+
+
+@app.post(
+    "/api/v1/conflicts/candidates/{candidate_id}/review",
+    tags=["knowledge"],
+    response_model=ConflictReview,
+)
+async def review_conflict_candidate(
+    candidate_id: str,
+    body: ConflictReviewRequest,
+    request: Request,
+    _: None = Depends(require_permission("proposal:review")),
+) -> ConflictReview:
+    """Экспертное решение по паре: противоречие подтверждено или отклонено.
+
+    Подтверждение переводит обе находки в ``disputed`` — только так расхождение
+    попадает в ``/conflicts``, в сводку дашборда и в фильтр выдачи. Отклонение
+    статус не откатывает: консенсус мог быть изменён по другой паре, и откат
+    приписал бы эксперту то, чего он не решал.
+
+    Отвечает записанным решением, а не строкой очереди: очередь ограничена
+    потолком, и подтверждённая пара могла в неё уже не входить.
+
+    Порядок записей — сначала находки, потом решение: если durable-контур недоступен,
+    повтор запроса идемпотентен (статус уже стоит, запись допишется), а не оставляет
+    сохранённое решение без последствия для корпуса.
+    """
+    deps = dependencies(request)
+    principal = request.state.principal
+    async with _storage_or_unavailable(request, "Противоречия"):
+        findings = await asyncio.to_thread(deps.knowledge.all_findings, _allowed_classes(request))
+        reviews = await deps.state.conflict_reviews(limit=MAX_CONFLICT_REVIEWS)
+    resolution = await asyncio.to_thread(resolve_for_review, candidate_id, findings)
+    if resolution is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Пара больше не считается противоречием в текущем корпусе",
+        )
+    desired: Literal["confirmed", "dismissed"] = "confirmed" if body.confirmed else "dismissed"
+    previous = next((item for item in reviews if item.candidate_id == candidate_id), None)
+    if previous is not None and previous.status == desired:
+        raise HTTPException(status_code=409, detail="Решение по этой паре уже записано")
+    if body.confirmed:
+        try:
+            async with _storage_or_unavailable(request, "Статус находок"):
+                for finding_id in (resolution.left_finding_id, resolution.right_finding_id):
+                    await asyncio.to_thread(
+                        deps.knowledge.set_finding_status, finding_id, "disputed"
+                    )
+        except KeyError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    review = ConflictReview(
+        candidate_id=candidate_id,
+        status=desired,
+        actor_id=principal.id,
+        property_name=resolution.candidate.property_name,
+        left_finding_id=resolution.left_finding_id,
+        right_finding_id=resolution.right_finding_id,
+    )
+    async with _storage_or_unavailable(request, "Решение по противоречию"):
+        await deps.state.record_conflict_review(review)
+    await _record_decision(
+        request,
+        "conflict.reviewed",
+        candidate_id,
+        metadata={
+            "status": review.status,
+            "left_finding_id": review.left_finding_id,
+            "right_finding_id": review.right_finding_id,
+        },
+    )
+    await _log_audit(request, "conflict.review", candidate_id)
+    # Корпус изменился (статус находок) — витрина и закэшированные прогоны по
+    # старому состоянию больше не ответ на текущие данные.
+    _invalidate_demo_cache(deps)
+    return review
 
 
 @app.get("/api/v1/corpus/stats", tags=["knowledge"], response_model=CorpusStats)
@@ -1597,9 +2257,10 @@ async def review_entity_resolution_proposal(
     """
     deps = dependencies(request)
     try:
-        proposal = await asyncio.to_thread(
-            deps.resolution.review, proposal_id, review.action, reviewer_id=account.id
-        )
+        async with _storage_or_unavailable(request, "Решение по склейке"):
+            proposal = await asyncio.to_thread(
+                deps.resolution.review, proposal_id, review.action, reviewer_id=account.id
+            )
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Merge proposal not found") from error
     except ValueError as error:
@@ -1619,13 +2280,24 @@ async def review_entity_resolution_proposal(
 @app.get("/api/v1/evaluations", tags=["evaluation"], response_model=list[EvaluationRun])
 async def get_evaluations(
     request: Request,
+    response: Response,
     limit: Annotated[int, Query(ge=1, le=AUDIT_LIMIT_MAX)] = AUDIT_LIMIT_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
     _: None = Depends(require_permission("evaluation:view")),
 ) -> list[EvaluationRun]:
     """Прогоны оценки из серверного состояния: история качества не обнуляется
-    перезапуском процесса, иначе «самооценка платформы» не подтверждается ничем."""
+    перезапуском процесса, иначе «самооценка платформы» не подтверждается ничем.
+
+    Окно читается хранилищем (``LIMIT``/``OFFSET``), а полное число подходящих
+    записей уходит в ``X-Total-Count`` — иначе аналитик видит 50 строк и не
+    отличает «больше не было» от «не дочитали». Тело остаётся массивом.
+    """
     deps = dependencies(request)
-    return await deps.state.recent_evaluations(limit=limit)
+    async with _storage_or_unavailable(request, "Прогоны оценки"):
+        runs = await deps.state.recent_evaluations(limit=limit, offset=offset)
+        total = await deps.state.count_evaluations()
+    response.headers["X-Total-Count"] = str(total)
+    return runs
 
 
 @app.get("/api/v1/agents/metrics", tags=["evaluation"], response_model=AgentMetricsResponse)
@@ -1649,7 +2321,8 @@ async def run_retrieval_benchmark(
 ) -> RetrievalBenchmark:
     deps = dependencies(request)
     # Бенчмарк прогоняет ранжирование по всему корпусу синхронно.
-    return await asyncio.to_thread(deps.harness.benchmark_retrieval, deps.knowledge)
+    async with _storage_or_unavailable(request, "Бенчмарк ранжирования"):
+        return await asyncio.to_thread(deps.harness.benchmark_retrieval, deps.knowledge)
 
 
 @app.post(
@@ -1663,7 +2336,8 @@ async def run_pipeline_benchmark(
     _: None = Depends(require_permission("evaluation:view")),
 ) -> PipelineBenchmark:
     deps = dependencies(request)
-    stats = await asyncio.to_thread(deps.knowledge.corpus_stats)
+    async with _storage_or_unavailable(request, "Статистика корпуса для бенчмарка"):
+        stats = await asyncio.to_thread(deps.knowledge.corpus_stats)
     if stats.semantic_documents < max_cases:
         raise HTTPException(
             status_code=409,
@@ -1696,17 +2370,18 @@ async def run_evolution_experiment(
     политику агента после промоушена, и это экспертное действие, а не чтение метрик.
     """
     deps = dependencies(request)
-    proposal = next(
-        (item for item in await deps.state.recent_proposals() if item.id == proposal_id),
-        None,
-    )
-    if proposal is None:
-        raise HTTPException(status_code=404, detail="Proposal not found") from None
-    if proposal.kind not in {"prompt", "rule"}:
-        raise HTTPException(
-            status_code=422,
-            detail="A/B workflow experiment поддерживает prompt и rule proposals.",
-        )
+    # Тот же потолок ленты, что у ``/proposals``: предложение, видимое в очереди,
+    # обязано быть и решаемым, иначе хвост очереди получал бы 404.
+    async with _storage_or_unavailable(request, "Лента предложений"):
+        feed = await deps.state.recent_proposals(limit=PROPOSAL_FEED_READ_LIMIT)
+        proposal = next((item for item in feed if item.id == proposal_id), None)
+        if proposal is None:
+            raise HTTPException(status_code=404, detail="Proposal not found") from None
+        if proposal.kind not in {"prompt", "rule"}:
+            raise HTTPException(
+                status_code=422,
+                detail="A/B workflow experiment поддерживает prompt и rule proposals.",
+            )
     cases = EvaluationHarness.gold_cases()[:max_cases]
     handle = deps.admission.acquire()
     try:
@@ -1740,7 +2415,8 @@ async def run_evolution_experiment(
         regressions=regressions,
         decision="promote" if promote else "reject",
     )
-    await deps.state.record_experiment(experiment)
+    async with _storage_or_unavailable(request, "Результат A/B"):
+        await deps.state.record_experiment(experiment)
     await _record_decision(
         request,
         "proposal.reviewed",
@@ -1758,12 +2434,22 @@ async def run_evolution_experiment(
 )
 async def get_evolution_experiments(
     request: Request,
+    response: Response,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
     _: None = Depends(require_permission("proposal:review")),
 ) -> list[EvolutionExperiment]:
-    """Решения по предложениям и A/B-история — экспертный контур, и они durable."""
+    """Решения по предложениям и A/B-история — экспертный контур, и они durable.
+
+    Полное число экспериментов — в ``X-Total-Count``: страница без offset не
+    позволяла отличить «решений больше нет» от «окно обрезано».
+    """
     deps = dependencies(request)
-    return await deps.state.recent_experiments(limit=limit)
+    async with _storage_or_unavailable(request, "A/B-эксперименты"):
+        experiments = await deps.state.recent_experiments(limit=limit, offset=offset)
+        total = await deps.state.count_experiments()
+    response.headers["X-Total-Count"] = str(total)
+    return experiments
 
 
 @app.post("/api/v1/feedback", tags=["evolution"], response_model=FeedbackResult)
@@ -1792,15 +2478,16 @@ async def submit_feedback(
             )
         try:
             # Перезапись графа — блокирующий вызов драйвера Neo4j.
-            superseded = await asyncio.to_thread(
-                deps.knowledge.supersede_finding,
-                feedback.finding_id,
-                feedback.correction,
-                0.95,
-                reviewer_id=principal.id,
-                review_date=datetime.now(UTC).isoformat(),
-                review_reason=feedback.comment,
-            )
+            async with _storage_or_unavailable(request, "Замена утверждения"):
+                superseded = await asyncio.to_thread(
+                    deps.knowledge.supersede_finding,
+                    feedback.finding_id,
+                    feedback.correction,
+                    0.95,
+                    reviewer_id=principal.id,
+                    review_date=datetime.now(UTC).isoformat(),
+                    review_reason=feedback.comment,
+                )
         except (KeyError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         # Утверждение переписано — витрина по старому тезису больше не ответ на
@@ -1871,12 +2558,29 @@ async def _ab_gate_passed(deps: AppDependencies, proposal_id: UUID) -> bool:
     Прежняя проверка читала словарь `EvolutionService`, куда эксперимент больше
     не записывается (результат A/B живёт в `nk_experiments`), и принятие
     prompt/rule-предложения было невозможно в принципе.
+
+    Лента читается до своего потолка целиком: с дефолтным окном промоушен,
+    сделанный на длинной истории экспериментов, переставал «засчитываться», и
+    эксперту показывался ложный 409 «ворота не пройдены».
     """
-    experiments = await deps.state.recent_experiments()
+    experiments = await deps.state.recent_experiments(limit=MAX_EXPERIMENTS)
     return any(
         item.proposal_id == proposal_id and item.decision == "promote"
         for item in experiments
     )
+
+
+def _review_transition_allowed(status: str, accepted: bool) -> bool:
+    """Разрешён ли переход по предложению — детерминированно, по серверному статусу.
+
+    Версий у предложения нет, поэтому второе «accept» молча перезаписывало первое
+    решение и правку теряло. Разрешены первый обзор (``proposed`` → любое решение)
+    и явный откат принятого (``accepted`` → отказ); отказ повторно и повторный
+    отказ после отказа — уже не решение, а конфликт (409).
+    """
+    if status == "proposed":
+        return True
+    return status == "accepted" and not accepted
 
 
 @app.post(
@@ -1894,23 +2598,39 @@ async def review_proposal(
     # Порядок проверок важен: не найденное предложение обязано остаться 404,
     # а не превращаться в 409 «ворота не пройдены». Источник истины — серверное
     # состояние: зеркало сервиса переживает только текущий процесс.
-    known = await deps.state.recent_proposals()
-    if not any(item.id == proposal_id for item in known):
-        raise HTTPException(status_code=404, detail="Proposal not found")
-    if review_request.accepted and not await _ab_gate_passed(deps, proposal_id):
-        raise HTTPException(status_code=409, detail="Proposal не прошёл regression A/B gate")
-    reviewed = deps.evolution.review(proposal_id, review_request.accepted)
-    await deps.state.record_proposal(reviewed)
+    # Потолок чтения — общий со ``/proposals`` (см. PROPOSAL_FEED_READ_LIMIT).
+    async with _storage_or_unavailable(request, "Лента предложений"):
+        known = await deps.state.recent_proposals(limit=PROPOSAL_FEED_READ_LIMIT)
+        current = next((item for item in known if item.id == proposal_id), None)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        if not _review_transition_allowed(current.status, review_request.accepted):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Предложение уже рассмотрено (статус «{current.status}»): "
+                    "повторное решение отклонено, чтобы не потерять прежнюю правку."
+                ),
+            )
+        if review_request.accepted and not await _ab_gate_passed(deps, proposal_id):
+            raise HTTPException(status_code=409, detail="Proposal не прошёл regression A/B gate")
+        # Зеркало сервиса поднимается из серверного состояния, но обязано жить и
+        # для записи, сделанной в обход него (другой процесс, обрезанное
+        # зеркало): решение принимается по durable-копии, а не по её отсутствию.
+        deps.evolution.restore(current)
+        reviewed = deps.evolution.review(proposal_id, review_request.accepted)
+        await deps.state.record_proposal(reviewed)
     if reviewed.status == "accepted":
         await _notify(
             deps,
             "proposal.accepted",
             f"Предложение {proposal_id} принято и активировано.",
         )
-        # Переключение политики перенесено в lock приложения: гонка двух
-        # одновременных review оставляла рабочий процесс в неопределённом виде.
-        with _WORKFLOW_LOCK:
-            deps.workflow = deps.build_workflow(extra_policy=deps.evolution.active_policy())
+    # Пересборка нужна любому решению, а не только принятию: отклонённое ранее
+    # принятое предложение оставалось бы в ``CANDIDATE POLICY`` промпта агента, и
+    # отказ эксперта не менял бы его поведение.
+    with _WORKFLOW_LOCK:
+        deps.workflow = deps.build_workflow(extra_policy=deps.evolution.active_policy())
     await _record_decision(
         request,
         "proposal.reviewed",
@@ -1930,14 +2650,26 @@ async def review_proposal(
 @app.get("/api/v1/audit", tags=["acl"], response_model=list[AuditEvent])
 async def get_audit_log(
     request: Request,
+    response: Response,
     limit: Annotated[int, Query(ge=1, le=AUDIT_LIMIT_MAX)] = AUDIT_LIMIT_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
     correlation_id: str | None = None,
     _: None = Depends(require_permission("audit:read")),
 ) -> list[AuditEvent]:
     """Журнал из серверного состояния: с фильтром по ``correlation_id`` — тем
-    самым, что вернулся клиенту в ответе и в заголовке ``X-Correlation-Id``."""
+    самым, что вернулся клиенту в ответе и в заголовке ``X-Correlation-Id``.
+
+    ``X-Total-Count`` — полное число подходящих актов (по тому же фильтру, что и
+    чтение), а не длина страницы: иначе «50 строк» не отличить от «дочитали всё».
+    """
     deps = dependencies(request)
-    return await deps.state.recent_audit(limit=limit, correlation_id=correlation_id)
+    async with _storage_or_unavailable(request, "Журнал аудита"):
+        events = await deps.state.recent_audit(
+            limit=limit, offset=offset, correlation_id=correlation_id
+        )
+        total = await deps.state.count_audit(correlation_id=correlation_id)
+    response.headers["X-Total-Count"] = str(total)
+    return events
 
 
 @app.get(
@@ -1947,8 +2679,10 @@ async def get_audit_log(
 )
 async def get_expert_decisions(
     request: Request,
+    response: Response,
     account: CurrentAccount,
     limit: Annotated[int, Query(ge=1, le=AUDIT_LIMIT_MAX)] = AUDIT_LIMIT_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[ExpertDecision]:
     """История решений собственного аккаунта — из серверного состояния.
 
@@ -1956,16 +2690,29 @@ async def get_expert_decisions(
     ``query_id``; журнал же всех экспертов закрыт правом ``audit:read`` через
     ``/audit``. Пока read-пути не было, запись решений существовала только как
     обещание «история действий сохранена», которое нечем было проверить.
+
+    Окно читается хранилищем (``LIMIT``/``OFFSET``), а полное число решений
+    того же аккаунта уходит в ``X-Total-Count``: без offset список из 200 строк
+    при потолке в 5000 записей не отличал «решений больше нет» от «не дочитали»
+    — та же молчаливая обрезка, которую продукт запрещает на прочих лентах.
     """
     deps = dependencies(request)
-    return await deps.state.recent_decisions(limit=limit, actor_id=account.id)
+    async with _storage_or_unavailable(request, "Решения экспертов"):
+        decisions = await deps.state.recent_decisions(
+            limit=limit, offset=offset, actor_id=account.id
+        )
+        total = await deps.state.count_decisions(actor_id=account.id)
+    response.headers["X-Total-Count"] = str(total)
+    return decisions
 
 
 @app.get("/api/v1/me/activity", tags=["acl"], response_model=list[ActivityEntry])
 async def get_my_activity(
     account: CurrentAccount,
     request: Request,
+    response: Response,
     limit: Annotated[int, Query(ge=1, le=ME_ACTIVITY_LIMIT_MAX)] = ME_ACTIVITY_LIMIT_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[ActivityEntry]:
     """Журнал действий собственного аккаунта — он же «что я здесь делал».
 
@@ -1974,9 +2721,17 @@ async def get_my_activity(
     из запрос. Ответ — проекция ``ActivityEntry`` без ``metadata``: в метаданных
     лежат фрагменты вопросов и служебные ссылки, которым не место в списке
     профиля.
+
+    ``X-Total-Count`` считает только свои акты того же фильтра, что и чтение, —
+    чужой актор в полную численность не попадает.
     """
     deps = dependencies(request)
-    events = await deps.state.recent_audit(limit=limit, actor_id=account.id)
+    async with _storage_or_unavailable(request, "Журнал аккаунта"):
+        events = await deps.state.recent_audit(
+            limit=limit, offset=offset, actor_id=account.id
+        )
+        total = await deps.state.count_audit(actor_id=account.id)
+    response.headers["X-Total-Count"] = str(total)
     return [
         ActivityEntry(
             action=event.action,
@@ -2004,7 +2759,8 @@ async def get_my_usage(
     продукте нет (``audit:read`` про акты, а не про расход).
     """
     deps = dependencies(request)
-    rows = await deps.state.usage_by_account(since=datetime.now(UTC) - timedelta(days=days))
+    async with _storage_or_unavailable(request, "Расход модели"):
+        rows = await deps.state.usage_by_account(since=datetime.now(UTC) - timedelta(days=days))
     row = next((item for item in rows if item.account_id == account.id), None)
     return LlmUsageSummary(
         window_days=days,
@@ -2049,7 +2805,8 @@ async def export_answer(
     раскрываем), нехватка класса данных — ``403``.
     """
     deps = dependencies(request)
-    stored: StoredAnswer | None = await deps.state.get_answer(str(export_req.query_id))
+    async with _storage_or_unavailable(request, "Серверная копия ответа"):
+        stored: StoredAnswer | None = await deps.state.get_answer(str(export_req.query_id))
     if stored is None or stored.owner_id != account.id:
         raise HTTPException(status_code=404, detail="Ответ не найден или срок хранения истёк")
     allowed = _allowed_classes(request)
@@ -2151,10 +2908,10 @@ async def get_dashboard(request: Request, account: CurrentAccount) -> DashboardR
         stats, findings = await asyncio.to_thread(
             lambda: (deps.knowledge.corpus_stats(), deps.knowledge.all_findings(allowed))
         )
+        recent = await deps.state.recent_audit(
+            limit=10, actor_id=None if shared_journal else account.id
+        )
     gaps, omitted = await asyncio.to_thread(_coverage_gaps, findings)
-    recent = await deps.state.recent_audit(
-        limit=10, actor_id=None if shared_journal else account.id
-    )
     return DashboardResponse(
         documents=stats.documents,
         claims=stats.claims,
@@ -2184,12 +2941,22 @@ async def get_dashboard(request: Request, account: CurrentAccount) -> DashboardR
 )
 async def get_notifications(
     request: Request,
+    response: Response,
     limit: Annotated[int, Query(ge=1, le=NOTIFICATION_FEED_LIMIT)] = NOTIFICATION_FEED_LIMIT,
 ) -> list[Notification]:
     """Лента из серверного состояния: в postgres-контуре она переживает перезапуск.
 
     Доставка — только опросом этого эндпоинта: push-канала в продукте нет, а
     «подписка на тему» обещала бы рассылку, которую выполнять нечем.
+
+    Смещения здесь нет намеренно (это фид последних ``NOTIFICATION_FEED_LIMIT``,
+    а не лента), но ``X-Total-Count`` отдаёт полное число записей хранилища:
+    читатель обязан отличить «событий больше не было» от «старые вытеснены
+    потолком ленты».
     """
     deps = dependencies(request)
-    return await deps.state.recent_notifications(limit=limit)
+    async with _storage_or_unavailable(request, "Лента уведомлений"):
+        items = await deps.state.recent_notifications(limit=limit)
+        total = await deps.state.count_notifications()
+    response.headers["X-Total-Count"] = str(total)
+    return items

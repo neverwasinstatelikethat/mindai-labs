@@ -79,7 +79,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Скорость обращений к модели",
-      "description": "mindai_llm_calls_total{schema,status} — исход последней попытки обращения по схеме structured output.",
+      "description": "mindai_llm_calls_total{schema,status} — исход обращения по схеме structured output. status принимает четыре значения: success, failure (отказ модели), cancelled (отмена клиента или агентный дедлайн) и timeout (таймаут провайдера). Отмена и таймаут в failure не входят: доля отказов модели не имеет права зависеть от того, закрыл ли пользователь вкладку.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -200,7 +200,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Отмены и таймауты обращений",
-      "description": "mindai_llm_cancelled_total — отмена клиента (обрыв SSE) или агентный дедлайн; в отказы модели такие вызовы не входят намеренно. mindai_llm_timeouts_total — вызов не уложился в таймаут провайдера: счётчик заполняется, только когда провайдер помечает его явно, поэтому пустая линия «таймаут» значит «не размечено», а не «таймаутов не было».",
+      "description": "mindai_llm_cancelled_total — отмена клиента (обрыв SSE) или агентный дедлайн; в отказы модели такие вызовы не входят намеренно. mindai_llm_timeouts_total — вызов не уложился в таймаут провайдера: счётчик заполняется, только когда провайдер помечает его явно, поэтому пустая линия «таймаут» значит «не размечено», а не «таймаутов не было». Тот же исход виден отдельной серией в mindai_llm_calls_total{status=\"cancelled\"} и {status=\"timeout\"} — см. панель «Исходы обращений».",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -442,6 +442,78 @@
       ]
     },
     {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Исходы обращений: отказ / отмена / таймаут (доли)",
+      "description": "Доля обращений к модели с каждым исходом от всех обращений: mindai_llm_calls_total{status=\"failure\"|\"cancelled\"|\"timeout\"}. Три линии разделены нарочно: отмена — поведение клиента, таймаут — настройка транспорта (GIGACHAT_TIMEOUT_SECONDS), отказ модели — качество ответа провайдера и единственный исход, который чинит schema-repair. Рост «cancelled» при нуле «failure» — это не деградация модели.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 22
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0,
+          "custom": {
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_llm_calls_total{status=\"failure\"}[$__rate_interval])) / sum(rate(mindai_llm_calls_total[$__rate_interval]))",
+          "legendFormat": "отказ модели"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_llm_calls_total{status=\"cancelled\"}[$__rate_interval])) / sum(rate(mindai_llm_calls_total[$__rate_interval]))",
+          "legendFormat": "отмена клиента/дедлайна"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mindai_llm_calls_total{status=\"timeout\"}[$__rate_interval])) / sum(rate(mindai_llm_calls_total[$__rate_interval]))",
+          "legendFormat": "таймаут провайдера"
+        }
+      ]
+    },
+    {
       "id": 9,
       "type": "row",
       "title": "Приём запросов, ёмкость и очередь",
@@ -450,7 +522,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 30
       },
       "panels": []
     },
@@ -467,7 +539,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 23
+        "y": 31
       },
       "fieldConfig": {
         "defaults": {
@@ -527,7 +599,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 23
+        "y": 31
       },
       "fieldConfig": {
         "defaults": {
@@ -587,7 +659,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 23
+        "y": 31
       },
       "fieldConfig": {
         "defaults": {
@@ -634,7 +706,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 39
       },
       "panels": []
     },
@@ -651,7 +723,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
@@ -704,7 +776,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
@@ -773,7 +845,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 40
+        "y": 48
       },
       "fieldConfig": {
         "defaults": {
@@ -820,7 +892,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 48
+        "y": 56
       },
       "panels": []
     },
@@ -837,7 +909,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 49
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -888,7 +960,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 49
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -939,7 +1011,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 57
+        "y": 65
       },
       "fieldConfig": {
         "defaults": {
@@ -991,7 +1063,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 57
+        "y": 65
       },
       "fieldConfig": {
         "defaults": {

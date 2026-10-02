@@ -1,18 +1,19 @@
+"""Формы домена, общие для графа, извлечения и оценки.
+
+Живой носитель утверждения в продукте — ``contracts.Finding``: у него есть
+``status`` (consensus/disputed/hypothesis), ``version``/``superseded_by`` для
+версионирования и ``observations`` с числовыми условиями. Отдельные ``Claim`` и
+``KnowledgeStatus`` здесь когда-то описывали то же самое вторым словарём, не
+импортировались ни из одного модуля ``src`` и только создавали соблазн разойтись
+с реальным состоянием графа, поэтому удалены.
+"""
+
 from __future__ import annotations
 
-from datetime import datetime
-from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
-
-
-class KnowledgeStatus(StrEnum):
-    PROPOSED = "proposed"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
-    SUPERSEDED = "superseded"
 
 
 class EvidenceLocator(BaseModel):
@@ -72,27 +73,6 @@ class NumericObservation(BaseModel):
             raise ValueError(f"{self.operator} — одно значение; min/max принадлежат between")
         if self.value is None or self.normalized_value is None:
             raise ValueError(f"{self.operator} требует value и normalized_value")
-        return self
-
-
-class Claim(BaseModel):
-    id: UUID
-    subject_id: UUID
-    predicate: str = Field(pattern=r"^[A-Z][A-Z0-9_]*$")
-    object_id: UUID | None = None
-    literal_value: str | None = None
-    polarity: Literal["positive", "negative"] = "positive"
-    status: KnowledgeStatus = KnowledgeStatus.PROPOSED
-    extraction_confidence: Annotated[float, Field(ge=0, le=1)]
-    version: int = Field(default=1, ge=1)
-    valid_from: datetime
-    evidence: list[EvidenceLocator] = Field(min_length=1)
-    observations: list[NumericObservation] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def validate_object(self) -> Claim:
-        if (self.object_id is None) == (self.literal_value is None):
-            raise ValueError("claim должен иметь ровно один object_id или literal_value")
         return self
 
 

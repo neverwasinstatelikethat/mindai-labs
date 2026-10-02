@@ -5,10 +5,16 @@
 поймало бы, а здесь она видна напрямую.
 
 Вторая часть файла гейтит сам CLI (`main` возвращает код, а не печатает отчёт),
-регрессионный контроль с эталоном и две необязательные метрики качества ответа —
-точность по проверенному ожидаемому ответу и LLM-судью. Корпуса в CI нет, поэтому
-CLI проверяется на двойнике корпуса из `.txt`-двойников: имена файлов дают те же
-заголовки, что и `REAL_GOLD_CASES`.
+регрессионный контроль с эталоном и метрики качества ответа: точность по
+проверенному ожидаемому ответу, LLM-судью, совпадение содержимого цитаты
+(`citation_content_match`) и полноту дифференциаторов (`conflict_recall`,
+`gap_recall`). Корпуса в CI нет, поэтому CLI проверяется на двойнике корпуса из
+`.txt`-двойников: имена файлов дают те же заголовки, что и `REAL_GOLD_CASES`.
+
+Третья часть держит две инвариантности оценки, за которые продукт отвечает перед
+аналитиком: пустой ответ не получает долю за то, что проверять было нечего, и
+метрики, которые нечего измерять, попадают в `skips` с названной причиной, а не в
+0.0 или 1.0.
 """
 
 from __future__ import annotations
@@ -23,15 +29,28 @@ import pytest
 from scientific_tangle.domain.contracts import AnswerPayload, Finding, GoldCase
 from scientific_tangle.domain.models import EvidenceLocator
 from scientific_tangle.evaluation import run_benchmark as bench
-from scientific_tangle.evaluation.gold_cases import REAL_GOLD_CASES
+from scientific_tangle.evaluation.gold_cases import (
+    REAL_GOLD_CASES,
+    RealGoldCase,
+    reconcile_gold_cases,
+)
 from scientific_tangle.evaluation.harness import (
+    MIN_SAMPLES_FOR_P95,
     OVERALL_FLOOR,
     EvaluationHarness,
     GoldCaseWithAnswer,
     JudgeVerdict,
     grade_answer_correctness,
+    grade_citation_content_match,
+    grade_differential_recall,
+    latency_sample_report,
 )
-from scientific_tangle.evaluation.run_benchmark import TOP_K_VALUES, compute_case_metrics
+from scientific_tangle.evaluation.run_benchmark import (
+    TOP_K_VALUES,
+    aggregate,
+    aggregate_samples,
+    compute_case_metrics,
+)
 
 TOP_K = TOP_K_VALUES
 
@@ -99,13 +118,22 @@ def test_empty_expectation_does_not_divide_by_zero() -> None:
 # ── Композит качества ответа: формула закреплена, судья внедряется ──────
 
 
-def _answer(statements: list[str], *, confidence: float = 0.4) -> AnswerPayload:
-    """Ответ, в котором каждое число тезиса подтверждён своей цитатой.
+def _answer(
+    statements: list[str],
+    *,
+    confidence: float = 0.4,
+    quotes: list[str] | None = None,
+) -> AnswerPayload:
+    """Ответ, где цитата по умолчанию равна тезису (базовая четвёрка метрик = 1.0).
 
-    Цитата равна тезису, поэтому базовая тройка метрик (полнота цитирования,
-    числовая поддержка, доля неподтверждённых выводов) даёт ровно 1.0 — и любое
-    отклонение `overall` объясняется только добавленной метрикой.
+    Цитата равна тезису, поэтому ``citation_coverage``, ``numeric_support``,
+    ``unsupported_claim_ratio`` и ``citation_content_match`` дают ровно 1.0 — и
+    любое отклонение `overall` объясняется только добавленной метрикой. `quotes`
+    позволяет подложить цитату «не про это» и увидеть расхождение двух мер.
     """
+    pairs = list(
+        zip(statements, quotes if quotes is not None else statements, strict=True)
+    )
     findings = [
         Finding(
             id=f"finding-{index}",
@@ -116,17 +144,19 @@ def _answer(statements: list[str], *, confidence: float = 0.4) -> AnswerPayload:
                     document_id=uuid5(UUID(int=2), statement),
                     source_title="Обеднение_шлаков",
                     page=1,
-                    quote=statement,
+                    quote=quote,
                 )
             ],
         )
-        for index, statement in enumerate(statements)
+        for index, (statement, quote) in enumerate(pairs)
     ]
     return AnswerPayload.model_construct(
         query_id=uuid4(),
         question="Какие параметры влияют на обеднение шлаков?",
         summary=" ".join(statements),
         findings=findings,
+        conflicts=[],
+        knowledge_gaps=[],
         degradation_reasons=[],
     )
 
@@ -146,29 +176,160 @@ class _StubJudge:
         return JudgeVerdict(quality=self.quality, rationale="Числа опираются на цитаты корпуса.")
 
 
-def test_overall_formula_stays_legacy_when_no_judge() -> None:
-    """Без судьи `overall` = среднее прежних трёх компонент: смысл «0.8+» не менялся."""
+def test_overall_is_the_mean_of_measured_components_without_judge() -> None:
+    """Без судьи композит = среднее измеренных метрик трассировки; смысл «0.8+» тот же.
+
+    Четвёртая компонента — ``citation_content_match``: на ответе, где цитата равна
+    тезису, она равна 1.0 и число не меняется, но знаменатель теперь честный
+    (было бы «три метрики из четырёх измеренных»).
+    """
     answer = _answer(["Обеднение шлака даёт 70 % извлечения меди"])
-    run = EvaluationHarness().evaluate(answer)
+    assessment = EvaluationHarness().assess(answer)
+    run = assessment.run
     assert run.metrics.citation_coverage == 1.0
     assert run.metrics.numeric_support == 1.0
     assert run.metrics.unsupported_claim_ratio == 0.0
-    assert run.metrics.overall == round((1.0 + 1.0 + (1.0 - 0.0)) / 3, 3) == 1.0
+    assert assessment.citation_content_match == 1.0
+    assert assessment.components == 4
+    assert run.metrics.overall == round((1.0 + 1.0 + 1.0 + 1.0) / 4, 3) == 1.0
     assert run.passed is True
 
 
-def test_judge_becomes_fourth_component_and_gates_passed() -> None:
+def test_empty_answer_is_not_credited_for_having_nothing_to_check() -> None:
+    """Пустой ответ не получает 0.667 за вакуум: метрики не измерены, прогон не принят.
+
+    ``numeric_support`` и ``unsupported_claim_ratio`` при нуле находок были 1.0 и
+    0.0 — «все числа подтверждены», «неподтверждённых нет», потому что проверять
+    было нечего. Теперь это ``skips`` с названной причиной, ``overall`` не выше
+    правды (0.0) и ``passed=False``.
+    """
+    empty = AnswerPayload.model_construct(
+        query_id=uuid4(),
+        question="Какие параметры влияют на обеднение шлаков?",
+        summary="",
+        findings=[],
+        conflicts=[],
+        knowledge_gaps=[],
+        degradation_reasons=[],
+    )
+    assessment = EvaluationHarness().assess(empty)
+
+    assert assessment.findings == 0
+    assert assessment.components == 0
+    assert assessment.run.metrics.overall == 0.0
+    assert assessment.run.metrics.citation_coverage == 0.0
+    assert assessment.run.metrics.numeric_support == 0.0
+    assert assessment.citation_content_match is None
+    assert assessment.run.passed is False
+    # Причина названа, а не выведена из молчаливого нуля.
+    assert any("ноль находок" in note for note in assessment.skips)
+    assert any("нечего принимать" in note for note in assessment.skips)
+
+
+def test_unrelated_quote_keeps_coverage_but_loses_content_match() -> None:
+    """Цитата «не про это» даёт 1.0 по наличию и 0.0 по содержимому — обе метрики видны.
+
+    Обещание продукта — тезис трассирован к ЦИТАТЕ, поэтому ``citation_coverage``
+    (``bool(finding.evidence)``) больше не может быть единственной мерой: иначе
+    ответ с приложенной невпопад цитатой проходил бы порог 0.999.
+    """
+    finding = Finding(
+        id="finding-1",
+        statement="Обеднение шлака даёт 70 % извлечения меди",
+        confidence=0.9,
+        evidence=[
+            EvidenceLocator(
+                document_id=uuid5(UUID(int=3), "Обеднение_шлаков"),
+                source_title="Обеднение_шлаков",
+                page=4,
+                quote="Шлак состоит из силикатов и флюорита",
+            )
+        ],
+    )
+    answer = AnswerPayload.model_construct(
+        query_id=uuid4(),
+        question="Какие параметры влияют на обеднение шлаков?",
+        summary="Обеднение шлака даёт 70 % извлечения меди",
+        findings=[finding],
+        conflicts=[],
+        knowledge_gaps=[],
+        degradation_reasons=[],
+    )
+    assessment = EvaluationHarness().assess(answer)
+
+    assert assessment.run.metrics.citation_coverage == 1.0
+    assert assessment.citation_content_match == 0.0
+    assert assessment.content_match is not None
+    assert assessment.content_match.missing == ["finding-1"]
+    assert assessment.run.passed is False
+    # Непроверенное содержимое цитаты тянет композит вниз даже при полной «наличной»
+    # трассировке: (1.0 + 1.0 + 0.0 + 0.0) / 4.
+    assert assessment.run.metrics.overall == 0.5
+
+
+def test_content_match_normalizes_number_forms_and_thousand_separators() -> None:
+    """Числа сверяются по значению: «70» подтверждается «70,0», «10 000» равно «10000»."""
+    verdict = grade_citation_content_match(
+        _answer(
+            [
+                "Расход 10 000 м3/ч при температуре 70,0 °C",
+            ],
+            quotes=["расход раствора 10000 м3/ч, температура 70 °C"],
+        )
+    )
+    assert verdict is not None
+    assert verdict.ratio == 1.0
+    assert verdict.missing == []
+
+
+def test_content_match_requires_document_and_address_in_locator() -> None:
+    """Локатор без имени источника и без адреса — не трассировка, даже с цитатой."""
+    finding = Finding(
+        id="finding-blank",
+        statement="Обеднение шлака даёт 70 % извлечения меди",
+        confidence=0.9,
+        evidence=[
+            EvidenceLocator(
+                document_id=uuid4(),
+                source_title="   ",
+                sheet="Лист1",
+                quote="Обеднение шлака даёт 70 % извлечения меди",
+            )
+        ],
+    )
+    verdict = grade_citation_content_match(
+        AnswerPayload.model_construct(
+            query_id=uuid4(),
+            question="вопрос",
+            summary="",
+            findings=[finding],
+            conflicts=[],
+            knowledge_gaps=[],
+            degradation_reasons=[],
+        )
+    )
+    assert verdict is not None
+    assert verdict.ratio == 0.0
+
+
+def test_content_match_skipped_for_empty_answer() -> None:
+    assert grade_citation_content_match(_answer([])) is None
+
+
+def test_judge_is_an_extra_component_and_gates_passed() -> None:
     """Судья добавляется в композит явно и гейтит `passed`, только когда измерен."""
     answer = _answer(["Обеднение шлака даёт 70 % извлечения меди"])
 
     strict = EvaluationHarness().assess(answer, judge=_StubJudge(quality=0.5))
     assert strict.judge is not None
     assert strict.judge_quality == 0.5
-    assert strict.run.metrics.overall == round((1.0 + 1.0 + 1.0 + 0.5) / 4, 3)
+    # Компоненты: цитаты, числа, подтверждённость выводов, содержимое цитат, судья.
+    assert strict.components == 5
+    assert strict.run.metrics.overall == round((1.0 + 1.0 + 1.0 + 1.0 + 0.5) / 5, 3)
     assert strict.run.passed is False
 
     ok = EvaluationHarness().assess(answer, judge=_StubJudge(quality=0.9))
-    assert ok.run.metrics.overall == round((1.0 + 1.0 + 1.0 + 0.9) / 4, 3)
+    assert ok.run.metrics.overall == round((1.0 + 1.0 + 1.0 + 1.0 + 0.9) / 5, 3)
     assert ok.run.passed is True
     assert ok.run.metrics.overall >= OVERALL_FLOOR
 
@@ -240,6 +401,8 @@ def test_self_reported_confidence_never_enters_composite() -> None:
 def _case(
     expected_answer: str | None = None,
     expected_answer_source: str | None = None,
+    expected_conflicts: list[str] | None = None,
+    expected_gaps: list[str] | None = None,
 ) -> GoldCaseWithAnswer:
     return GoldCaseWithAnswer(
         id="real-corpus-01",
@@ -249,6 +412,8 @@ def _case(
         expected_source_titles=["Обеднение_шлаков"],
         expected_answer=expected_answer,
         expected_answer_source=expected_answer_source,
+        expected_conflicts=expected_conflicts or [],
+        expected_gaps=expected_gaps or [],
     )
 
 
@@ -305,6 +470,214 @@ def test_correctness_scores_numbers_and_claims_of_expected_statement() -> None:
     assessment = EvaluationHarness().assess(dropped, case=case)
     assert assessment.run.passed is False
     assert assessment.correctness is not None
+
+
+# ── Дифференциаторы: противоречия и пробелы ─────────────────────────────
+
+
+def _differential_answer(
+    conflicts: list[str],
+    gaps: list[str],
+) -> AnswerPayload:
+    """Ответ с названными противоречиями и пробелами (тезисы те же, что в `_answer`)."""
+    answer = _answer(["Обеднение шлака даёт 70 % извлечения меди"])
+    return answer.model_copy(update={"conflicts": conflicts, "knowledge_gaps": gaps})
+
+
+def test_conflict_and_gap_recall_measured_from_expectations() -> None:
+    """Полнота дифференциаторов считается по ожиданиям кейса и наказывается за промах."""
+    case = _case(
+        expected_conflicts=[
+            "извлечение меди 70 % при обжиге против 95 % при электролизе",
+            "содержание серы 0.3 % против 0.5 %",
+        ],
+        expected_gaps=["нет данных по расходу реагента для сподумена"],
+    )
+    answer = _differential_answer(
+        conflicts=["Обжиг даёт извлечение меди 70 %, электролиз — 95 %"],
+        gaps=["Расход реагента для сподумена в корпусе не приведён"],
+    )
+
+    verdict = grade_differential_recall(answer, case)
+    assert verdict is not None
+    assert verdict.conflict_recall == 0.5
+    assert verdict.gap_recall == 1.0
+    assert verdict.missed_conflicts == ["содержание серы 0.3 % против 0.5 %"]
+
+    assessment = EvaluationHarness().assess(answer, case=case)
+    assert assessment.conflict_recall == 0.5
+    assert assessment.gap_recall == 1.0
+    # Промах по противоречиям валит прогон, даже когда трассировка тезисов идеальная.
+    assert assessment.run.passed is False
+
+
+def test_conflict_and_gap_recall_are_skipped_without_corpus_expectations() -> None:
+    """Без корпуса дифференциаторы не измеримы: skips с «не измерено», а не 0.0.
+
+    Иначе пустой «Источники информации/» валил бы любой прогон за «не найденные
+    противоречия», которых никто не обещал, и метрика стала бы шумом.
+    """
+    answer = _answer(["Обеднение шлака даёт 70 % извлечения меди"])
+    assessment = EvaluationHarness().assess(answer, case=_case())
+
+    assert assessment.conflict_recall is None
+    assert assessment.gap_recall is None
+    assert grade_differential_recall(answer, _case()) is None
+    assert any(
+        "conflict_recall" in note and "не измерены" in note for note in assessment.skips
+    )
+    # Пропуск метрики не меняет композит: прогон по-прежнему принят.
+    assert assessment.run.passed is True
+
+
+def test_differential_recall_for_plain_goldcase_is_not_measured() -> None:
+    """Контрактный ``GoldCase`` ожиданий не выражает — метрика обязана быть пропущена."""
+    plain = GoldCase(
+        id="plain-1",
+        language="ru",
+        question="вопрос",
+        source_path="Обзоры/Обеднение_шлаков.docx",
+        expected_source_titles=["Обеднение_шлаков"],
+    )
+    answer = _answer(["Обеднение шлака даёт 70 % извлечения меди"])
+    assert grade_differential_recall(answer, plain) is None
+    notes = EvaluationHarness().assess(answer, case=plain).skips
+    assert any("контракт GoldCase" in note for note in notes)
+
+
+def test_differential_verdict_gates_passed_only_when_measured() -> None:
+    """Пустые ожидания не могут «спасти» прогон и не могут его валить молча."""
+    case = _case(expected_conflicts=["температура 1350 °C против 1280 °C"])
+    silent = _differential_answer(conflicts=[], gaps=[])
+    assessment = EvaluationHarness().assess(silent, case=case)
+    assert assessment.conflict_recall == 0.0
+    assert assessment.run.passed is False
+    assert assessment.gap_recall is None  # пробелов не ждали — метрики нет
+
+
+# ── Два носителя gold-кейсов: сверка наборов ────────────────────────────
+
+
+def test_reconcile_gold_cases_names_divergence() -> None:
+    """Сверка называет расхождение, а не выбирает «первый попавшийся» эталон."""
+    manifest = [
+        {"path": "Обзоры/Обеднение_шлаков.docx", "gold_question": "Вопрос А?"},
+        {"path": "Обзоры/Очистка от Fe 2020.docx", "gold_question": "Вопрос Б?"},
+    ]
+    real = [
+        # совпадение по источнику и вопросу
+        RealGoldCase(query="Вопрос А?", source_documents=["Обеднение_шлаков"], category="c"),
+        # тот же источник, другой вопрос
+        RealGoldCase(
+            query="Как удаляют Fe?",
+            source_documents=["Очистка от Fe 2020"],
+            category="c",
+        ),
+        # источник, которого в манифесте нет
+        RealGoldCase(query="Новый вопрос?", source_documents=["Сподумен"], category="c"),
+    ]
+
+    report = reconcile_gold_cases(manifest, real)
+    assert report.matched == 1
+    assert report.manifest_total == 2
+    assert report.benchmark_total == 3
+    assert report.balanced is False
+    assert "Обеднение_шлаков" in report.matched_sources
+    assert "Очистка от Fe 2020" in report.manifest_only
+    assert "Новый вопрос?" in report.benchmark_only
+    assert any("Очистка от Fe 2020" in line for line in report.describe())
+
+
+def test_reconcile_gold_cases_accepts_equal_sets() -> None:
+    """Совпадающие наборы не порождают диагностик: гейт не должен кричать впустую."""
+    manifest = [{"path": "Обзоры/A.docx", "gold_question": "Вопрос?"}]
+    real = [RealGoldCase(query="Вопрос?", source_documents=["A"], category="c")]
+    report = reconcile_gold_cases(manifest, real)
+    assert report.balanced is True
+    assert report.describe() == [
+        "наборы gold-кейсов совпадают: 1 источник(ов), манифест 1, бенчмарк 1"
+    ]
+
+
+def test_real_gold_cases_diverge_from_manifest_and_say_so() -> None:
+    """Актуальное расхождение двух носителей зафиксировано тестом, а не забыто.
+
+    В манифесте 10 кейсов, в ``REAL_GOLD_CASES`` — 12, и формулировка вопроса про
+    хлорное выщелачивание различается. Это значит, что «recall по gold-кейсам» в
+    CLI и в ``/api/v1/benchmark/retrieval`` считаются по разным наборам; тест
+    ловит любое новое расхождение (добавили кейс, поменяли вопрос) и требует
+    назвать его, а не делать вид, что эталон один.
+    """
+    report = EvaluationHarness.reconcile_gold_cases()
+
+    assert report.manifest_total == len(EvaluationHarness.gold_cases()) == 10
+    assert report.benchmark_total == len(REAL_GOLD_CASES) == 12
+    # Известное расхождение: два «дополнительных» кейса бенчмарка поверх манифеста
+    # и другой вопрос у хлорного выщелачивания.
+    assert report.balanced is False
+    assert len(report.benchmark_only) == report.benchmark_total - report.matched
+    assert any("хлорного выщелачивания" in line for line in report.describe())
+    # Каждый заголовок бенчмарка обязан существовать в манифесте: новый источник без
+    # файла корпуса — это не gold-кейс, а невыполнимое измерение.
+    manifest_titles = {
+        Path(str(item["path"])).stem
+        for item in json.loads(
+            (Path(__file__).parents[1] / "src" / "scientific_tangle" / "preload_manifest.json")
+            .read_text("utf-8")
+        )
+    }
+    assert {title for case in REAL_GOLD_CASES for title in case.source_documents} == (
+        manifest_titles
+    )
+
+
+# ── Выборка: n у каждого числа и честный p95 ───────────────────────────
+
+
+def test_latency_report_refuses_pseudo_percentile_on_three_samples() -> None:
+    """p95 из трёх замеров — не перцентиль: отдаётся наихудший прогон с оговоркой."""
+    report = latency_sample_report([100.0, 200.0, 900.0])
+
+    assert report.samples == 3
+    assert report.is_percentile is False
+    assert report.p95_ms == 900.0
+    assert "недостаточная выборка" in report.note
+
+    enough = latency_sample_report([100.0, 200.0, 300.0, 400.0, 900.0])
+    assert enough.samples == 5
+    assert enough.is_percentile is True
+    assert enough.p95_ms == 900.0
+    assert enough.note == "p95 по n=5 замеров."
+
+    nothing = latency_sample_report([])
+    assert nothing.samples == 0
+    assert nothing.p95_ms == 0.0
+    assert "ни одного" in nothing.note
+
+
+def test_run_benchmark_latency_marks_small_sample() -> None:
+    """CLI той же мерой честит малую выборку: p95 не выдаётся за перцентиль."""
+    small = bench.latency_stats([0.1, 0.2, 0.9])
+    assert small.samples == 3
+    assert small.percentile_measured is False
+    assert small.p95 == pytest.approx(0.9)
+    assert "недостаточная выборка" in small.note
+
+    big = bench.latency_stats([float(value) / 10 for value in range(MIN_SAMPLES_FOR_P95 + 3)])
+    assert big.percentile_measured is True
+    assert big.samples == MIN_SAMPLES_FOR_P95 + 3
+
+
+def test_aggregate_reports_the_sample_behind_every_mean() -> None:
+    """Среднее по переменному числу кейсов: знаменатель — свои кейсы, и n виден."""
+    case_metrics = [
+        {"recall@10": 1.0, "mrr": 1.0},
+        {"recall@10": 0.0, "mrr": 0.5},
+        {"recall@10": 1.0},
+    ]
+    assert aggregate(case_metrics) == {"mrr": 0.75, "recall@10": 0.667}
+    assert aggregate_samples(case_metrics) == {"recall@10": 3, "mrr": 2}
+    assert aggregate([]) == {}
 
 
 # ── CLI-гейт: коды выхода, эталон и сырые метрики ──────────────────────

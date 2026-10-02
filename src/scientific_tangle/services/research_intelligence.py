@@ -16,6 +16,7 @@ from scientific_tangle.domain.intelligence import (
     ResearchClaim,
     ResearchSpace,
     ScopeDimension,
+    conflict_candidate_id,
 )
 from scientific_tangle.domain.models import NumericObservation
 
@@ -150,12 +151,15 @@ class ResearchIntelligenceService:
                 same_source = left.finding_id == right.finding_id
                 conflicts.append(
                     ConflictCandidate(
+                        id=conflict_candidate_id(
+                            left.id, right.id, left.value.property_name, shared_scope
+                        ),
                         left_claim_id=left.id,
                         right_claim_id=right.id,
                         property_name=left.value.property_name,
                         shared_scope=shared_scope,
                         reason=(
-                            f"{_format_range(left.value)} против {_format_range(right.value)} "
+                            f"{format_range(left.value)} против {format_range(right.value)} "
                             + (
                                 "внутри одного тезиса — источник приводит противоречивые числа."
                                 if same_source
@@ -250,7 +254,8 @@ class ResearchIntelligenceService:
         ]
 
 
-def _format_range(value: object) -> str:
+def format_range(value: object) -> str:
+    """Диапазон с единицей словами: «0,2–0,3 г/л» либо одно значение «70 %»."""
     low = getattr(value, "min_value", 0.0)
     high = getattr(value, "max_value", 0.0)
     unit = getattr(value, "unit", "")

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -59,6 +60,32 @@ class ConflictCandidate(BaseModel):
     shared_scope: list[ScopeDimension]
     reason: str
     status: Literal["candidate", "confirmed", "dismissed"] = "candidate"
+
+
+# Пространство имён для отпечатка пары: детекция запускается на каждый
+# исследовательский запрос, а решение эксперта привязано к идентификатору пары.
+# Случайный uuid4 на каждом прогоне означал бы, что очередь «забыла» все
+# подтверждённые противоречия, и `/conflicts` показывал бы одно и то же
+# расхождение новыми строками.
+CONFLICT_NAMESPACE = uuid5(NAMESPACE_URL, "urn:scientific-tangle:conflict-pair")
+
+
+def conflict_candidate_id(
+    left_claim_id: str,
+    right_claim_id: str,
+    property_name: str,
+    shared_scope: Sequence[ScopeDimension],
+) -> UUID:
+    """Отпечаток пары «субъект × свойство × условия применимости».
+
+    Порядок тезисов в группе зависит от обхода каталога, поэтому ключ
+    нормализуется сортировкой id: переставленные местами левый и правый тезисы
+    дают тот же идентификатор.
+    """
+    first, second = sorted((left_claim_id, right_claim_id))
+    ordered = sorted(shared_scope, key=lambda item: item.name)
+    scope = ";".join(f"{item.name}={item.value}" for item in ordered)
+    return uuid5(CONFLICT_NAMESPACE, f"{first}|{second}|{property_name}|{scope}")
 
 
 class ResearchSpace(BaseModel):

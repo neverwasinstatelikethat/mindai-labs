@@ -5,16 +5,16 @@ import logging
 import operator
 import re
 from collections.abc import AsyncIterator, Collection, Mapping, Sequence
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
 from uuid import UUID, uuid4
 
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from scientific_tangle.agents.tools import ResearchToolExecutor
-from scientific_tangle.config import Settings, get_settings
+from scientific_tangle.agents.tools import ResearchToolExecutor, RunBudget
+from scientific_tangle.config import CHARS_PER_TOKEN_RU, Settings, get_settings
 from scientific_tangle.domain.contracts import (
     AgentActionPlan,
     AgentControlDecision,
@@ -22,6 +22,8 @@ from scientific_tangle.domain.contracts import (
     AnswerPayload,
     CritiqueResult,
     Finding,
+    GraphEdge,
+    GraphNode,
     GraphSnapshot,
     IntentClassification,
     PlanningBundle,
@@ -40,7 +42,12 @@ from scientific_tangle.services.context_budget import (
     to_prompt_json,
 )
 from scientific_tangle.services.knowledge import InMemoryKnowledgeBase, KnowledgeBase
-from scientific_tangle.services.provider import ModelProvider, ModelUnavailableError, build_provider
+from scientific_tangle.services.provider import (
+    ModelProvider,
+    ModelUnavailableError,
+    build_provider,
+    redact_provider_error,
+)
 
 DOMAIN_BRIEF = (
     "Платформа MindAI работает с горно-металлургической отраслью: добыча руд, "
@@ -140,6 +147,34 @@ _MAX_RESUMED_TURNS = 5
 # доказательства бесполезны, если ревизия не видит, что именно проверять.
 _MIN_REASONING_SHARE = 0.35
 
+# ── Бюджеты времени узла и чекпоинтера ───────────────────────────────────────
+# Провайдер считает транспортный таймаут одной попытки делением ВСЕГО дедлайна на
+# попытки одного обращения (GigaChatProvider._call_timeout), и худший путь одного
+# узла — сотни секунд: planning-узел выжигал бюджет, и остальные узлы не стартовали.
+# Сигнатуру провайдера рабочий процесс не меняет, поэтому доля узла ограничивается
+# снаружи через asyncio.timeout. Доля от ОСТАТКА (а не от всего дедлайна) даёт
+# сходящуюся сумму: каждый узел берёт не больше половины того, что ещё осталось,
+# значит прогон гарантированно не выходит за agent_deadline_seconds. Потолок одного
+# узла настраивается (AGENT_NODE_BUDGET_SECONDS), потому что он зависит от модели.
+_NODE_BUDGET_SHARE = 0.5
+# Пол держится ниже любого осмысленного дедлайна: иначе тестовый бюджет в 0,5 с
+# отрезал бы узел раньше общего дедлайна, и причина деградации стала бы лживой.
+_NODE_BUDGET_FLOOR_SECONDS = 3.0
+
+# Обращения к чекпоинтеру (Postgres) лежат ВНЕ дедлайна прогона: ожидание недоступной
+# БД вешало запрос раньше, чем успевал начаться отсчёт времени исследования.
+_CHECKPOINT_BUDGET_SHARE = 0.25
+_CHECKPOINT_BUDGET_CAP_SECONDS = 10.0
+_CHECKPOINT_BUDGET_FLOOR_SECONDS = 0.5
+
+# ── Бюджет контекста синтеза ─────────────────────────────────────────────────
+# Провайдер дописывает к системному промпту инструкцию structured-output и форму
+# экземпляра (provider.build_instance_instruction), а параметры complete_model этого
+# не позволяют — оверхд считается оценкой и вычитается из бюджета заранее.
+_PROMPT_SHAPE_OVERHEAD_TOKENS = 700
+# Сколько доказательств допускается рассмотреть в одном промпте синтеза.
+_MAX_EVIDENCE_ITEMS = 10
+
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
 _CYRILLIC_LETTERS = re.compile(r"[а-яё]")
 _LATIN_LETTERS = re.compile(r"[a-z]")
@@ -171,8 +206,113 @@ class WorkflowNodeError(RuntimeError):
         self.detail = detail
 
 
+class ModelFailureError(WorkflowNodeError):
+    """Модель отказала, когда часть доказательства уже собрана.
+
+    Отличие от ``ModelUnavailableError`` именно в накопленном состоянии: 503
+    выбрасывал бы уже найденные находки и trace, а аналитик получал пустой экран
+    там, где честен неполный ответ с ``degradation_reasons``.
+    """
+
+
+class NodeBudgetExceededError(RuntimeError):
+    """Узел превысил свою долю остатка дедлайна.
+
+    Причина отделена от общего ``TimeoutError``: «узел X выжигает бюджет» чинится
+    долей узла, а «время исследования вышло» — всем дедлайном, и в метриках это
+    разные события.
+    """
+
+    def __init__(self, node: str, budget_seconds: float, remaining_seconds: float) -> None:
+        super().__init__(
+            f"{node}: обращений превысило долю бюджета {budget_seconds:.1f} с "
+            f"из {remaining_seconds:.1f} с остатка дедлайна"
+        )
+        self.node = node
+        self.budget_seconds = budget_seconds
+        self.remaining_seconds = remaining_seconds
+
+
+class EvidenceBudgetError(RuntimeError):
+    """Доказательства не влезли в бюджет контекста: синтез вслепую запрещён.
+
+    Reasoner/Critic/Improver обязаны ссылаться на ``finding_ids`` из секции
+    FINDINGS. Когда секция отброшена целиком, три оплаченных обращения гарантированно
+    дают неподтверждённый ответ — вместо него отдаётся деградация с названием причины.
+    """
+
+    def __init__(self, pool_size: int, budget_tokens: int) -> None:
+        super().__init__(
+            f"ни одно из {pool_size} доказательств не помещается в бюджет контекста "
+            f"({budget_tokens} токенов) вместе с системным промптом и служебными секциями"
+        )
+        self.pool_size = pool_size
+        self.budget_tokens = budget_tokens
+
+
+class NoAnswerError(RuntimeError):
+    """Прогон завершился без ответа: тот же путь деградации, что и раньше, с ``RuntimeError``."""
+
+
+# Что рабочий процесс превращает в неполный ответ, а не в 500/503. Сюда намеренно
+# входит ``ValidationError``: редьюсеры каналов (``merge_graphs``) вызываются
+# движком LangGraph вне ``_instrument``, и их ошибка раньше уходила наружу сырым
+# исключением. Отменяться (``CancelledError``) под этот список нельзя — это не сбой.
+_DEGRADABLE: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    GraphRecursionError,
+    WorkflowNodeError,
+    NodeBudgetExceededError,
+    EvidenceBudgetError,
+    ValidationError,
+)
+
+
+def _has_collected_evidence(state: Mapping[str, Any]) -> bool:
+    """Собрано ли что-нибудь, ради чего отказ модели стоит ответа, а не 503."""
+    return bool(state.get("findings") or state.get("observations") or state.get("reasoning"))
+
+
+def _attach_notes(answer: AnswerPayload, notes: Sequence[str]) -> AnswerPayload:
+    """Дописывает системные метки деградации в уже собранный ответ."""
+    if not notes:
+        return answer
+    return answer.model_copy(
+        update={
+            "degradation_reasons": _unique([*answer.degradation_reasons, *notes]),
+        }
+    )
+
+
 class _Identified(Protocol):
     id: str
+
+
+def _coerce_items[T: BaseModel](kind: type[T], values: Any) -> tuple[list[T], int]:
+    """Значения канала в экземпляры схемы: счётчик отброшенного вместо исключения.
+
+    Редьюсеры LangGraph вызываются вне ``_instrument``, и ``ValidationError`` отсюда
+    уходил наружу как сырое 500: прогон терял и ответ, и уже собранное доказательство.
+    Запись, пришедшую из чекпоинта словарём, можно восстановить — её валидируем;
+    то, что не валидируется, отбрасывается и считается деградацией.
+    """
+    kept: list[T] = []
+    dropped = 0
+    for value in values or ():
+        if isinstance(value, kind):
+            kept.append(value)
+            continue
+        try:
+            kept.append(kind.model_validate(value))
+        except (ValidationError, TypeError, ValueError):
+            dropped += 1
+    return kept, dropped
+
+
+def _observe_reducer_loss(channel: str, dropped: int) -> None:
+    """Наблюдаемость редьюсера: код с ограниченной cardinality, а не свободный текст."""
+    logger.error("Редьюсер %s: отброшено невалидных записей: %d", channel, dropped)
+    agent_metrics.observe_degradation(f"reducer:{channel}")
 
 
 def _merge_by_id[T: _Identified](left: list[T], right: list[T]) -> list[T]:
@@ -187,15 +327,56 @@ def _merge_by_id[T: _Identified](left: list[T], right: list[T]) -> list[T]:
 
 
 def merge_findings(left: list[Finding], right: list[Finding]) -> list[Finding]:
-    return _merge_by_id(left, right)
+    nodes, dropped = _coerce_items(Finding, left)
+    additions, second = _coerce_items(Finding, right)
+    if dropped + second:
+        _observe_reducer_loss("findings", dropped + second)
+    return _merge_by_id(nodes, additions)
 
 
 def merge_graphs(left: GraphSnapshot, right: GraphSnapshot) -> GraphSnapshot:
-    return GraphSnapshot(
-        nodes=_merge_by_id(left.nodes, right.nodes),
-        edges=_merge_by_id(left.edges, right.edges),
-        communities=extend_unique(left.communities, right.communities),
-    )
+    merged, dropped = _merge_graph_values(left, right)
+    if dropped:
+        _observe_reducer_loss("graph", dropped)
+    return merged
+
+
+def _merge_graph_values(left: GraphSnapshot, right: GraphSnapshot) -> tuple[GraphSnapshot, int]:
+    """Сборка графа без права бросить исключение: (результат, число отброшенного).
+
+    Возвращается и число, потому что узел tools может сказать об этом аналитику —
+    редьюсеру путь в ``degradation_reasons`` закрыт (он возвращает только значение).
+    """
+    dropped = 0
+    try:
+        nodes, lost = _coerce_items(GraphNode, left.nodes)
+        dropped += lost
+        edges, lost = _coerce_items(GraphEdge, left.edges)
+        dropped += lost
+        more_nodes, lost = _coerce_items(GraphNode, right.nodes)
+        dropped += lost
+        more_edges, lost = _coerce_items(GraphEdge, right.edges)
+        dropped += lost
+        communities = [
+            item
+            for item in extend_unique(
+                list(left.communities or ()), list(right.communities or ())
+            )
+            if isinstance(item, str)
+        ]
+        dropped += len(left.communities or ()) + len(right.communities or ()) - len(communities)
+        return (
+            GraphSnapshot(
+                nodes=_merge_by_id(nodes, more_nodes),
+                edges=_merge_by_id(edges, more_edges),
+                communities=communities,
+            ),
+            dropped,
+        )
+    except (ValidationError, TypeError, ValueError, AttributeError) as error:
+        # Аварийный вариант: держим то, что уже было, иначе прогон падает на 500.
+        logger.error("Редьюсер graph деградировал до прежнего значения: %s", type(error).__name__)
+        return GraphSnapshot(nodes=[], edges=[], communities=[]), dropped + 1
 
 
 def extend_unique(left: list[str], right: list[str]) -> list[str]:
@@ -203,6 +384,30 @@ def extend_unique(left: list[str], right: list[str]) -> list[str]:
 
 
 EMPTY_GRAPH = GraphSnapshot(nodes=[], edges=[], communities=[])
+
+
+def _fit_policy(settings: Settings, policy: str) -> tuple[str, str]:
+    """Кладёт candidate policy в системный промпт с явным потолком.
+
+    Политика растёт вместе с принятыми правками EvolutionService и вставлялась в
+    каждый системный промпт без ограничения — раздутый промпт вытеснял доказательства
+    из ``context_token_budget``. Второе значение — строка деградации: усечение не
+    смеет быть молчаливым, оно обязано дойти до аналитика.
+    """
+    text = policy.strip()
+    if not text:
+        return "", ""
+    cap_tokens = max(int(settings.policy_max_tokens), 1)
+    tokens = estimate_tokens(text)
+    if tokens <= cap_tokens:
+        return text, ""
+    limit = int(cap_tokens * CHARS_PER_TOKEN_RU)
+    omitted = tokens - cap_tokens
+    return (
+        text[:limit].rstrip(),
+        f"CANDIDATE POLICY усечена до {cap_tokens} токенов (не передано ~{omitted} токенов "
+        "активной политики): принятые правки применены к промптам частично.",
+    )
 
 
 class ResearchState(TypedDict, total=False):
@@ -213,6 +418,9 @@ class ResearchState(TypedDict, total=False):
     language: str
     requested_mode: str
     run_id: str
+    # Момент (monotonic), после которого прогон обязан остановиться: узлы считают
+    # из него свою долю остатка, а не полагаются на таймаут провайдера.
+    deadline_at: float
     allowed_data_classes: set[DataClass] | None
     # Подпись прав предыдущего прогона: по ней ветка отказывается наследовать
     # чужой вывод, если уровень доступа изменился.
@@ -255,7 +463,9 @@ class ResearchWorkflow:
         self.tool_executor = ResearchToolExecutor(self.knowledge)
         self.metrics = metrics or agent_metrics
         self.checkpointer = checkpointer
-        self.extra_policy = extra_policy.strip()
+        # Политика укладывается в промпт сразу здесь: факт усечения известен до
+        # первого узла и отмечается один раз на прогон, а не «на глаз».
+        self.extra_policy, self._policy_note = _fit_policy(self.settings, extra_policy)
         self.graph = self._build()
 
     # ── Вспомогательное ─────────────────────────────────────────────────────
@@ -267,6 +477,12 @@ class ResearchWorkflow:
         if not self.extra_policy:
             return base
         return f"{base}\n\nCANDIDATE POLICY:\n{self.extra_policy}"
+
+    def _policy_degradation(self) -> list[str]:
+        """Усечённая политика обязана быть видна: молча «почти применённая»
+        candidate policy меняет ответ и не оставляла бы аналитику способа это
+        обнаружить."""
+        return [self._policy_note] if self._policy_note else []
 
     @staticmethod
     def _sanitize_action_plan(plan: AgentActionPlan, fallback_query: str) -> AgentActionPlan:
@@ -310,45 +526,139 @@ class ResearchWorkflow:
             f"- {turn.question} → {turn.summary}" for turn in state.get("research_history", [])
         )
 
-    def _evidence_context(
-        self, state: ResearchState, *, budget_tokens: int | None = None
-    ) -> BudgetedContext:
-        findings = select_relevant(state.get("findings", []), state["question"], 10)
+    # ── Бюджеты времени ─────────────────────────────────────────────────────
+
+    def _node_budget(self, state: ResearchState) -> float:
+        """Доля ОСТАТКА дедлайна, разрешённая одному узлу.
+
+        Провайдер принимает таймаут сам (сигнатура ``complete_model`` его не имеет),
+        поэтому узел ограничивается снаружи: ``asyncio.timeout`` в ``_instrument``.
+        Доля считается от остатка, а не от полного дедлайна — сумма по узлам
+        сходится к ``agent_deadline_seconds`` и медленный узел не оставляет
+        остальные без времени.
+        """
+        deadline_at = state.get("deadline_at")
+        remaining = (
+            float(deadline_at) - monotonic()
+            if deadline_at is not None
+            else float(self.settings.agent_deadline_seconds)
+        )
+        share = max(remaining, 0.0) * _NODE_BUDGET_SHARE
+        return min(
+            self.settings.agent_node_budget_seconds,
+            max(_NODE_BUDGET_FLOOR_SECONDS, share),
+        )
+
+    def _checkpoint_budget(self) -> float:
+        """Потолок одного обращения к чекпоинтеру вне дедлайна прогона.
+
+        ``_open_thread``/``_commit_thread`` идут до и после ``asyncio.timeout``
+        рабочего процесса: без собственной границы недоступный Postgres вешал
+        запрос на неопределённое время без всякой деградации.
+        """
+        bounded = self.settings.agent_deadline_seconds * _CHECKPOINT_BUDGET_SHARE
+        return min(_CHECKPOINT_BUDGET_CAP_SECONDS, max(_CHECKPOINT_BUDGET_FLOOR_SECONDS, bounded))
+
+    def _synthesis_budget(self, system: str) -> int:
+        """Бюджет контекста синтеза за вычетом служебной части промпта.
+
+        Провайдер дописывает к системному промпту текст инструкции и форму
+        экземпляра — параметров это не принимает, поэтому оверхд моделируется
+        оценкой токенов системного промпта плюс константа на JSON-форму.
+        """
+        overhead = estimate_tokens(self._system(system)) + _PROMPT_SHAPE_OVERHEAD_TOKENS
+        return max(self.settings.context_token_budget - overhead, 1)
+
+    def _evidence_sections(
+        self, state: ResearchState, findings: Sequence[Finding]
+    ) -> list[tuple[str, str]]:
+        """Секции доказательственного контекста в порядке убывания приоритета."""
         observations = state.get("observations", [])
-        history = self._history_lines(state)
+        return [
+            ("ВОПРОС", state["question"]),
+            ("ИСТОРИЯ ВЕТКИ", self._history_lines(state)),
+            ("QUERY PLAN", to_prompt_json(state["query_plan"])),
+            (
+                "FINDINGS",
+                "\n".join(to_prompt_json(finding) for finding in findings) or "нет",
+            ),
+            (
+                "COMMUNITIES",
+                "\n".join(state.get("community_summaries", [])[:6]) or "нет",
+            ),
+            ("CONFLICTS", "\n".join(state.get("intelligence_conflicts", [])) or "нет"),
+            ("GAPS", "\n".join(state.get("intelligence_gaps", [])) or "нет"),
+            (
+                "TOOL OBSERVATIONS",
+                "\n".join(to_prompt_json(observation) for observation in observations)
+                or "нет",
+            ),
+        ]
+
+    def _fit_findings(
+        self, state: ResearchState, *, budget_tokens: int
+    ) -> tuple[list[Finding], int]:
+        """Крупнейший по релевантности префикс доказательств, влезающий в бюджет.
+
+        ``fit_sections`` при переполнении сбрасывает целые нижние секции, и FINDINGS
+        уходил целиком — синтез получал три оплаченных обращения заведомо по
+        неподтверждённому контексту. Отбор детерминирован: те же доказательства,
+        тот же порядок, та же граница.
+        """
+        ranked = select_relevant(
+            state.get("findings", []), state["question"], _MAX_EVIDENCE_ITEMS
+        )
+        if not ranked:
+            return [], 0
+        others = sum(
+            estimate_tokens(f"{label}\n{body}")
+            for label, body in self._evidence_sections(state, [])
+            if label != "FINDINGS"
+        )
+        remaining = budget_tokens - others - 1
+        if remaining <= 0:
+            return [], len(ranked)
+        fitted: list[Finding] = []
+        spent = 0
+        for finding in ranked:
+            cost = estimate_tokens(to_prompt_json(finding)) + 1
+            if cost > remaining - spent:
+                break
+            fitted.append(finding)
+            spent += cost
+        return fitted, len(ranked)
+
+    def _evidence_context(
+        self,
+        state: ResearchState,
+        *,
+        budget_tokens: int | None = None,
+        findings: Sequence[Finding] | None = None,
+    ) -> BudgetedContext:
+        budget = (
+            self.settings.context_token_budget
+            if budget_tokens is None
+            else max(budget_tokens, 1)
+        )
+        if findings is None:
+            findings, _ = self._fit_findings(state, budget_tokens=budget)
         return self._budget(
             state,
-            [
-                ("ВОПРОС", state["question"]),
-                ("ИСТОРИЯ ВЕТКИ", history),
-                ("QUERY PLAN", to_prompt_json(state["query_plan"])),
-                (
-                    "FINDINGS",
-                    "\n".join(to_prompt_json(finding) for finding in findings) or "нет",
-                ),
-                (
-                    "COMMUNITIES",
-                    "\n".join(state.get("community_summaries", [])[:6]) or "нет",
-                ),
-                ("CONFLICTS", "\n".join(state.get("intelligence_conflicts", [])) or "нет"),
-                ("GAPS", "\n".join(state.get("intelligence_gaps", [])) or "нет"),
-                (
-                    "TOOL OBSERVATIONS",
-                    "\n".join(to_prompt_json(observation) for observation in observations)
-                    or "нет",
-                ),
-            ],
-            budget_tokens=budget_tokens,
+            self._evidence_sections(state, findings),
+            budget_tokens=budget,
         )
 
     def _revision_context(
-        self, state: ResearchState, *, critique: CritiqueResult | None = None
+        self, state: ResearchState, *, system: str, critique: CritiqueResult | None = None
     ) -> tuple[str, BudgetedContext]:
         """Укладывает доказательство в остаток бюджета после черновика и замечаний.
 
         Раньше доказательственная секция получала весь бюджет, а вместе с черновиком
         композиция всегда переполнялась, и fit_sections сбрасывала хвост — то есть
-        как раз DRAFT у Critic и CRITIQUE у Improver.
+        как раз DRAFT у Critic и CRITIQUE у Improver. ``system`` участвует в расчёте,
+        потому что служебная часть промпта (инструкция structured-output и форма
+        экземпляра) дописывается провайдером поверх бюджета и рабочему процессу
+        недоступна как параметр — только как оценка.
         """
         draft = to_prompt_json(state["reasoning"])
         reasoning_sections: list[tuple[str, str]] = [("DRAFT", draft)]
@@ -357,7 +667,7 @@ class ResearchWorkflow:
         reasoning_tokens = sum(
             estimate_tokens(f"{label}\n{body}") for label, body in reasoning_sections
         )
-        budget = self.settings.context_token_budget
+        budget = self._synthesis_budget(system)
         evidence_budget = max(
             budget - reasoning_tokens - len(reasoning_sections),
             int(budget * _MIN_REASONING_SHARE),
@@ -406,6 +716,16 @@ class ResearchWorkflow:
         }
 
     async def tool_executor_node(self, state: ResearchState) -> dict[str, object]:
+        deadline_at = state.get("deadline_at")
+        # Retrieval отменяется по границе САМОГО УЗЛА (и не позднее дедлайна прогона):
+        # после того как asyncio.timeout узла сработает, результат действия уже никто
+        # не прочитает, а worker-поток с драйвером Neo4j/ES останется занят.
+        node_deadline = monotonic() + self._node_budget(state)
+        budget_deadline = (
+            min(float(deadline_at), node_deadline)
+            if deadline_at is not None
+            else node_deadline
+        )
         result = await self.tool_executor.execute(
             state["action_plan"],
             state["query_plan"],
@@ -413,16 +733,26 @@ class ResearchWorkflow:
             # Пул доказательств всех предыдущих раундов: конфликт — это пара, и
             # без него пары между раундами не замечаются вовсе.
             prior_findings=state.get("findings", []),
+            budget=RunBudget(deadline_at=budget_deadline),
         )
+        # Граф собирается здесь же, а не только в редьюсере: узел может назвать
+        # отброшенные записи аналитику, редьюсер — только отписать в метрику.
+        graph, dropped = _merge_graph_values(state.get("graph", EMPTY_GRAPH), result.graph)
+        degradation = list(result.degradation_reasons)
+        if dropped:
+            degradation.append(
+                f"Доказательный граф ужат: {dropped} записей не прошли проверку схемы, "
+                "в ответ они не попали."
+            )
         return {
             "observations": result.observations,
             "findings": result.findings,
-            "graph": result.graph,
+            "graph": graph,
             "community_summaries": result.community_summaries,
             "intelligence_conflicts": result.conflicts,
             "intelligence_gaps": result.gaps,
             "gaps_omitted": result.gaps_omitted,
-            "degradation_reasons": result.degradation_reasons,
+            "degradation_reasons": degradation,
             "action_round": 1,
             "trace": [
                 self._event(
@@ -523,19 +853,34 @@ class ResearchWorkflow:
         }
 
     async def reasoner(self, state: ResearchState) -> dict[str, object]:
-        context = self._evidence_context(state)
+        budget = self._synthesis_budget(REASONER_SYSTEM)
+        fitted, pool_size = self._fit_findings(state, budget_tokens=budget)
+        pool_total = len(state.get("findings", []))
+        if pool_total and not fitted:
+            # Синтез вслепую запрещён: без единого доказательства в промпте Reasoner,
+            # Critic и Improver заплатили бы три обращения за ответ, который нечем
+            # подтвердить. Причина уходит в деградацию, а найденное — в ответ.
+            raise EvidenceBudgetError(pool_size, budget)
+        context = self._evidence_context(state, budget_tokens=budget, findings=fitted)
+        notes = _context_degradation("Reasoner", context)
+        if len(fitted) < pool_total:
+            notes.append(
+                f"Reasoner: доказательная база срезана детерминированно до {len(fitted)} "
+                f"из {pool_total} записей — остаток не влезает в бюджет контекста "
+                f"({budget} токенов с учётом служебной части промпта)."
+            )
         reasoning = await self.provider.complete_model(
             self._system(REASONER_SYSTEM), context.text, ReasoningResult
         )
         return {
             "reasoning": reasoning,
-            "degradation_reasons": _context_degradation("Reasoner", context),
+            "degradation_reasons": notes,
             "trace": [self._event("reasoner", "Собран answer на подтверждённых findings")],
         }
 
     async def critic(self, state: ResearchState) -> dict[str, object]:
         draft = state["reasoning"]
-        prompt, budget = self._revision_context(state)
+        prompt, budget = self._revision_context(state, system=CRITIC_SYSTEM)
         critique = await self.provider.complete_model(
             self._system(CRITIC_SYSTEM), prompt, CritiqueResult
         )
@@ -588,7 +933,9 @@ class ResearchWorkflow:
         }
 
     async def improver(self, state: ResearchState) -> dict[str, object]:
-        prompt, budget = self._revision_context(state, critique=state["critique"])
+        prompt, budget = self._revision_context(
+            state, system=IMPROVER_SYSTEM, critique=state["critique"]
+        )
         reasoning = await self.provider.complete_model(
             self._system(IMPROVER_SYSTEM), prompt, ReasoningResult
         )
@@ -636,15 +983,26 @@ class ResearchWorkflow:
             cited = set(reasoning.finding_ids)
             unknown_cited = sorted(cited - {finding.id for finding in findings})
             selected = [finding for finding in findings if finding.id in cited]
+            # «Пусто» и «модель не вернула секцию» — разные случаи: во втором нельзя
+            # обвинять модель в отсутствии ссылок. Метод добавляет другой контур
+            # (толерантные формы), поэтому вызов защитный.
+            absent_hook = getattr(reasoned, "absent_list_sections", None)
+            absent = absent_hook() if callable(absent_hook) else set()
             if not selected:
                 # Цитат нет или они не совпадают с пулом: показываем весь собранный
                 # evidence, но честно помечаем ответ как неподтверждённый.
                 selected = findings
                 untraced = True
-                degradation.append(
-                    "Reasoner не сослался на подтверждённые findings: ответ дан по всему "
-                    "собранному доказательству без точечной трассировки."
-                )
+                if "finding_ids" in absent:
+                    degradation.append(
+                        "Reasoner не вернул секцию finding_ids: ответ дан по всему "
+                        "собранному доказательству без точечной трассировки."
+                    )
+                else:
+                    degradation.append(
+                        "Reasoner не сослался на подтверждённые findings: ответ дан по "
+                        "всему собранному доказательству без точечной трассировки."
+                    )
             if unknown_cited:
                 degradation.append(
                     "Ответ ссылается на finding IDs, которых нет среди собранных "
@@ -787,14 +1145,43 @@ class ResearchWorkflow:
         async def wrapped(state: ResearchState) -> dict[str, object]:
             started = perf_counter()
             logger.info("Агент '%s': начало выполнения", agent)
+            budget = self._node_budget(state)
             try:
-                update = cast(dict[str, object], await node(state))
-            except ModelUnavailableError:
-                # Ошибка провайдера уже безопасна для клиента и отображается в 503:
-                # заворачивать её в WorkflowNodeError нельзя, иначе статус потеряется.
-                self.metrics.observe(agent, (perf_counter() - started) * 1000, False)
+                # Доля остатка дедлайна ограничивается здесь: провайдер считает
+                # транспортный таймаут сам и принять её в сигнатуру не может.
+                async with asyncio.timeout(budget):
+                    update = cast(dict[str, object], await node(state))
+            except ModelUnavailableError as error:
+                duration_ms = (perf_counter() - started) * 1000
+                self.metrics.observe(agent, duration_ms, False)
                 logger.error("Агент '%s': модель недоступна", agent, exc_info=True)
+                if _has_collected_evidence(state):
+                    # Находки и trace уже собраны: 503 выбрасывал бы их вместе с
+                    # ответом. Дальше идёт та же деградация, что по дедлайну.
+                    raise ModelFailureError(
+                        agent, redact_provider_error(error, context="модель")
+                    ) from error
+                # Девать нечего: просить пользователя поверить в «неполный ответ»,
+                # где не собрано ни одного доказательства, нельзя — остаётся 503.
                 raise
+            except EvidenceBudgetError as error:
+                # Узел сам отказался синтезировать: это не внутренняя ошибка узла,
+                # а честный отказ от оплаченного ответа без доказательств.
+                self.metrics.observe(agent, (perf_counter() - started) * 1000, False)
+                logger.error("Агент '%s': доказательства не влезли в бюджет: %s", agent, error)
+                raise
+            except TimeoutError as error:
+                duration_ms = (perf_counter() - started) * 1000
+                self.metrics.observe(agent, duration_ms, False)
+                remaining = float(state.get("deadline_at", monotonic())) - monotonic()
+                if remaining <= 0:
+                    # Истёк общий дедлайн прогона: пусть его ловит run()/stream() —
+                    # подмена причины на «долю узла» была бы неправдой.
+                    raise
+                logger.error(
+                    "Агент '%s': превышен бюджет узла %.1f с (%.0fms)", agent, budget, duration_ms
+                )
+                raise NodeBudgetExceededError(agent, budget, max(remaining, 0.0)) from error
             except Exception as exc:
                 duration_ms = (perf_counter() - started) * 1000
                 self.metrics.observe(agent, duration_ms, False)
@@ -803,6 +1190,14 @@ class ResearchWorkflow:
             duration_ms = (perf_counter() - started) * 1000
             logger.info("Агент '%s': завершён за %.0fms", agent, duration_ms)
             self.metrics.observe(agent, duration_ms, True)
+            # Candidate policy отмечается один раз (канал extend_unique схлопнет
+            # повтор), и сделать это надо в узле: у nodes своя сборка дельты.
+            policy_note = self._policy_degradation()
+            if policy_note:
+                update["degradation_reasons"] = [
+                    *cast(Any, update.get("degradation_reasons", [])),
+                    *policy_note,
+                ]
             trace = update.get("trace")
             if isinstance(trace, list) and trace and isinstance(trace[-1], AgentEvent):
                 update["trace"] = [
@@ -821,6 +1216,7 @@ class ResearchWorkflow:
         run_id: UUID,
         allowed_data_classes: set[DataClass] | None,
         research_history: list[ResearchTurn] | None = None,
+        degradation: Sequence[str] = (),
     ) -> ResearchState:
         return cast(
             ResearchState,
@@ -829,9 +1225,13 @@ class ResearchWorkflow:
                 "language": request.language,
                 "requested_mode": request.mode,
                 "run_id": str(run_id),
+                # Точка отсчёта для долей узла: состояние приходит в каждый узел,
+                # поэтому часам процесса больше не нужно общее изменяемое состояние.
+                "deadline_at": monotonic() + self.settings.agent_deadline_seconds,
                 "allowed_data_classes": allowed_data_classes,
                 "acl_scope": _acl_scope(allowed_data_classes),
                 "research_history": research_history or [],
+                "degradation_reasons": list(degradation),
                 "graph": EMPTY_GRAPH,
                 "trace": [],
             },
@@ -861,18 +1261,36 @@ class ResearchWorkflow:
         Накопительные каналы редьюсеры сливают вход с состоянием прошлого прогона
         (findings и observations удваивались бы), поэтому чекпоинты ветки перед
         стартом удаляются: ResearchTurn остаётся сжатым следом последних ходов.
+
+        Обращение в Postgres ограничено отдельно: оно лежит ВНЕ дедлайна прогона,
+        и при бое БД запрос висел бы неопределённо, не доходя до деградации.
         """
         if self.checkpointer is None:
             return self._initial_state(request, run_id, allowed)
+        budget = self._checkpoint_budget()
         try:
-            snapshot = await self.graph.aget_state(self._config(request))
-            previous = snapshot.values if snapshot is not None else {}
-            history = _compact_history(previous)
-            if str(previous.get("acl_scope", "")) != _acl_scope(allowed):
-                # Чужой или более широкий вывод в контекст не тащим: права меняются —
-                # меняется и ветка.
-                history = []
-            await self.checkpointer.adelete_thread(str(request.thread_id))
+            async with asyncio.timeout(budget):
+                snapshot = await self.graph.aget_state(self._config(request))
+                previous = snapshot.values if snapshot is not None else {}
+                history = _compact_history(previous)
+                if str(previous.get("acl_scope", "")) != _acl_scope(allowed):
+                    # Чужой или более широкий вывод в контекст не тащим: права меняются —
+                    # меняется и ветка.
+                    history = []
+                await self.checkpointer.adelete_thread(str(request.thread_id))
+        except TimeoutError:
+            logger.warning(
+                "Ветка %s не открыта за %g с: прогон без истории", request.thread_id, budget
+            )
+            return self._initial_state(
+                request,
+                run_id,
+                allowed,
+                degradation=[
+                    f"Ветка исследования не открыта за {budget:g} с: память ветки "
+                    "не использована, follow-up потеряет предысторию."
+                ],
+            )
         except Exception as error:  # noqa: BLE001 — чекпоинтер опционален и на входе
             logger.warning(
                 "Ветка %s недоступна, прогон без истории: %s", request.thread_id, error
@@ -880,26 +1298,40 @@ class ResearchWorkflow:
             return self._initial_state(request, run_id, allowed)
         return self._initial_state(request, run_id, allowed, history)
 
-    async def _commit_thread(self, request: QueryRequest, state: ResearchState) -> None:
-        """Оставляет в ветке только сжатый след последних ходов.
+    async def _commit_thread(self, request: QueryRequest, state: ResearchState) -> list[str]:
+        """Оставляет в ветке только сжатый след последних ходов; возвращает метки деградации.
 
         Без этого шаги прогона (findings, observations, граф на каждый супершаг)
         оседали бы в Postgres навсегда: thread_id по умолчанию уникален на запрос,
-        и следующий запуск эту ветку уже не открывает.
+        и следующий запуск эту ветку уже не открывает. Работает под собственным
+        потолком: ответ уже собран, и вешать из-за чистки весь HTTP-запрос нельзя.
         """
         if self.checkpointer is None:
-            return
+            return []
+        budget = self._checkpoint_budget()
         try:
-            await self.checkpointer.adelete_thread(str(request.thread_id))
-            await self.graph.aupdate_state(
-                self._config(request),
-                {
-                    "research_history": _compact_history(state),
-                    "acl_scope": str(state.get("acl_scope", "")),
-                },
+            async with asyncio.timeout(budget):
+                await self.checkpointer.adelete_thread(str(request.thread_id))
+                await self.graph.aupdate_state(
+                    self._config(request),
+                    {
+                        "research_history": _compact_history(state),
+                        "acl_scope": str(state.get("acl_scope", "")),
+                    },
+                )
+        except TimeoutError:
+            logger.warning(
+                "Ветка %s не записана за %g с: память ветки не обновлена",
+                request.thread_id,
+                budget,
             )
+            return [
+                f"Чекпоинтер ветки не принят за {budget:g} с: следующий вопрос того же "
+                "исследования не увидит этот прогон в памяти ветки."
+            ]
         except Exception as error:  # noqa: BLE001 — ответ уже собран, чистка не важнее
             logger.warning("Ветка %s не почищена: %s", request.thread_id, error)
+        return []
 
     async def _drive(
         self, state: ResearchState, config: dict[str, Any]
@@ -930,18 +1362,24 @@ class ResearchWorkflow:
         run_id = uuid4()
         allowed = None if allowed_data_classes is None else set(allowed_data_classes)
         final_state = await self._open_thread(request, run_id, allowed)
+        notes: list[str] = []
+        answer: AnswerPayload
         try:
             async with asyncio.timeout(self.settings.agent_deadline_seconds):
                 async for values, _ in self._drive(final_state, self._config(request)):
                     final_state = values
-        except (TimeoutError, GraphRecursionError, WorkflowNodeError) as error:
-            return self._degraded(request, run_id, final_state, error)
+        except _DEGRADABLE as error:
+            answer = self._degraded(request, run_id, final_state, error)
+        else:
+            answer = final_state.get("answer") or self._degraded(
+                request, run_id, final_state, NoAnswerError()
+            )
         finally:
-            await self._commit_thread(request, final_state)
-        answer = final_state.get("answer")
-        if answer is None:
-            return self._degraded(request, run_id, final_state, RuntimeError("нет ответа"))
-        return answer
+            # Запись следа обязана случиться и при отказе узла, и при отмене клиента:
+            # она ограничена собственным таймаутом, чтобы недоступный Postgres не
+            # держал HTTP-запрос после собранного ответа.
+            notes.extend(await self._commit_thread(request, final_state))
+        return _attach_notes(answer, notes)
 
     async def stream(
         self,
@@ -958,6 +1396,7 @@ class ResearchWorkflow:
         run_id = uuid4()
         allowed = set(allowed_data_classes) if allowed_data_classes is not None else None
         state = await self._open_thread(request, run_id, allowed)
+        notes: list[str] = []
         try:
             async with asyncio.timeout(self.settings.agent_deadline_seconds):
                 async for values, update in self._drive(state, self._config(request)):
@@ -968,13 +1407,16 @@ class ResearchWorkflow:
             if answer is None:
                 # Паритет с run(): без ответа стрим отдаёт тот же минимально
                 # допустимый ответ, а не молча оборванный SSE.
-                yield "finalize", {
-                    "answer": self._degraded(request, run_id, state, RuntimeError("нет ответа"))
-                }
-        except (TimeoutError, GraphRecursionError, WorkflowNodeError) as error:
+                degraded = self._degraded(request, run_id, state, NoAnswerError())
+                yield "finalize", {"answer": degraded}
+        except _DEGRADABLE as error:
             yield "finalize", {"answer": self._degraded(request, run_id, state, error)}
         finally:
-            await self._commit_thread(request, state)
+            notes.extend(await self._commit_thread(request, state))
+        if notes:
+            # Деградация записи ветки видна и в SSE: память ветки не обновилась —
+            # это касается follow-up, а не уже отданных узлов.
+            yield "degradation", {"degradation_reasons": notes}
 
     def _degraded(
         self,
@@ -1039,6 +1481,16 @@ def _degradation_code(error: BaseException) -> str:
         return "timeout"
     if isinstance(error, GraphRecursionError):
         return "recursion_limit"
+    if isinstance(error, ModelFailureError):
+        # Отказ модели отдельно от «узел упал по багу»: чинится он провайдером,
+        # а не кодом рабочего процесса.
+        return f"model_unavailable:{error.node}"
+    if isinstance(error, NodeBudgetExceededError):
+        return f"node_budget:{error.node}"
+    if isinstance(error, EvidenceBudgetError):
+        return "context_budget"
+    if isinstance(error, ValidationError):
+        return "state_schema"
     if isinstance(error, WorkflowNodeError):
         return f"node:{error.node}"
     return "no_answer"
@@ -1049,6 +1501,25 @@ def _describe_failure(error: BaseException) -> str:
         return "превышен бюджет времени исследования"
     if isinstance(error, GraphRecursionError):
         return "достигнут предел шагов рабочего процесса"
+    if isinstance(error, ModelFailureError):
+        return (
+            f"модель недоступна на узле {error.node} ({error.detail}); ответ собран по "
+            "уже найденным доказательствам"
+        )
+    if isinstance(error, NodeBudgetExceededError):
+        return (
+            f"узел {error.node} превысил свою долю бюджета времени "
+            f"({error.budget_seconds:.1f} с из {error.remaining_seconds:.1f} с остатка): "
+            "прогон остановлен, чтобы остальные узлы не остались без времени"
+        )
+    if isinstance(error, EvidenceBudgetError):
+        return (
+            f"доказательства не поместились в бюджет контекста ({error}): синтез не "
+            "вызывался, ответ собран по найденным доказательствам без вывода модели"
+        )
+    if isinstance(error, ValidationError):
+        # Сырой текст pydantic содержит значения полей — наружу только класс ошибки.
+        return "состояние прогона не прошло проверку схемы (часть данных отброшена)"
     if isinstance(error, WorkflowNodeError):
         return f"узел {error.node} завершился ошибкой ({error.detail})"
     return "рабочий процесс не вернул ответ"

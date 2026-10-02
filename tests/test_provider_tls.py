@@ -19,7 +19,14 @@ import pytest
 from pydantic import ValidationError
 
 from scientific_tangle.config import Settings
-from scientific_tangle.domain.contracts import IngestionBundle, PlanningBundle
+from scientific_tangle.domain.contracts import (
+    AgentActionPlan,
+    CritiqueResult,
+    ExtractionResult,
+    IngestionBundle,
+    PlanningBundle,
+    ReasoningResult,
+)
 from scientific_tangle.services.agent_metrics import AgentMetricsRegistry
 from scientific_tangle.services.provider import (
     GigaChatProvider,
@@ -159,6 +166,24 @@ def test_structured_prompt_shows_a_shape_not_a_schema() -> None:
         ):
             assert keyword not in shape, f"{schema.__name__}: {keyword}"
         assert json.loads(shape), schema.__name__
+
+
+def test_tolerance_signals_are_not_asked_from_the_model() -> None:
+    """Приведение и следы отсечённого — служебное процесса, в форме их быть не должно.
+
+    Приватные атрибуты толерантных форм (список отсечённых действий, счётчик
+    брака) не попадают ни в JSON Schema, ни в форму экземпляра: просить модель
+    вернуть то, чего она знать не может, — значит получать выдумку вместо ответа.
+    """
+    for schema in (AgentActionPlan, ExtractionResult, ReasoningResult, CritiqueResult):
+        shape = _instance_shape(schema)
+        for keyword in ("dropped", "absent", "llm_dropped"):
+            assert keyword not in shape, f"{schema.__name__}: {keyword}"
+        assert json.loads(shape), schema.__name__
+
+    # Данные при этом остаются в форме: без `actions` план нечем собирать.
+    assert "actions" in _instance_shape(AgentActionPlan)
+    assert "tool" in _instance_shape(AgentActionPlan)
 
 
 def test_repair_hint_is_capped_and_still_carries_paths() -> None:

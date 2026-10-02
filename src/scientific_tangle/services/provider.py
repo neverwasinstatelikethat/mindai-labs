@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
+import re
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from time import monotonic, perf_counter
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, cast
 
 import httpx
 from gigachat import GigaChat
@@ -38,9 +40,57 @@ StructuredOutput = TypeVar("StructuredOutput", bound=BaseModel)
 # transport-повторы при этом не перемножаются — они считаются внутри SDK.
 _SCHEMA_REPAIR_ATTEMPTS = 3
 
+# Ответ с `finish_reason == "length"` оборван не из-за качества модели, а из-за
+# бюджета вывода: с тем же лимитом он оборвался бы снова, а платить нужно за
+# каждую попытку. Поэтому просим бо́льший лимит и останавливаемся на втором
+# обрыве — третья оплата заведомо ничего не добавляет.
+_TRUNCATION_ATTEMPT_LIMIT = 2
+_OUTPUT_TOKENS_STEP = 2
+# 4096 = ×2 от рабочего GIGACHAT_MAX_OUTPUT_TOKENS (2048): выше — только счёт
+# провайдера растёт, а оборванный JSON это не спасает.
+_OUTPUT_TOKENS_CEILING = 4096
+
 
 class ModelUnavailableError(RuntimeError):
     """LLM недоступен или вернул не-экземпляр схемы после всех попыток."""
+
+
+# ── Сокрытие сбоя провайдера в пользовательских текстах ────────────────────────
+
+_HTTP_MEANINGS: dict[int, str] = {
+    400: "провайдер отклонил запрос модели",
+    401: "ключ провайдера не принят",
+    402: "тариф провайдера не оплачен",
+    403: "провайдер запретил обращение",
+    404: "метод провайдера не найден",
+    408: "провайдер не ответил вовремя",
+    429: "превышен лимит запросов провайдера",
+}
+
+_REDACT_LIMIT = 120
+_STATUS_PREFIX = re.compile(r"(?<!\d)([1-5]\d{2})(?!\d)")
+_URL = re.compile(r"(https?://|bolt://|redis://|postgresql(?:\+psycopg)?://)\S+")
+
+
+def redact_provider_error(error: BaseException | str, *, context: str = "провайдер") -> str:
+    """Называет сбой провайдера для аналитика, не показывая сырой ответ.
+
+    ``gigachat.ResponseError`` приводит к строке вида
+    ``402 https://…: b'{\"status\":402}', Headers({'x-request-id': …})``: тело ответа,
+    заголовки, адреса и идентификаторы запроса. Аналитику нужен смысл отказа, а не
+    разведданные о контуре; полный текст остаётся в журнале процесса.
+    """
+    raw = str(error)
+    match = _STATUS_PREFIX.search(raw[:24])
+    if match:
+        code = int(match.group(1))
+        meaning = _HTTP_MEANINGS.get(code)
+        if meaning is None:
+            meaning = "провайдер недоступен" if code >= 500 else "провайдер отклонил обращение"
+        return f"{context}: {meaning} (HTTP {code})"
+    cleaned = _URL.sub(f"{context}:", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return f"{context}: {cleaned[:_REDACT_LIMIT]}"
 
 
 # ── Кэш structured output (в пределах процесса) ─────────────────────────────────
@@ -51,16 +101,18 @@ class ModelUnavailableError(RuntimeError):
 # ограничен по числу записей (LRU) и по времени жизни (TTL).
 #
 # Почему совместный кэш безопасен на мультипользовательском контуре:
-# 1. Ключ — sha256 от (id модели, имя схемы, полный системный промпт, полный
-#    пользовательский промпт). Права пользователя (ACL) и история ветки попадают
-#    в ТЕКСТ промпта на его сборке (см. ``agents/workflow.py``: секции
-#    ``ИСТОРИЯ ВЕТКИ`` и ``FINDINGS`` формируются из уже отфильтрованного по
-#    ``allowed_data_classes`` retrieval-слоя). Значит, у пользователей с разным
-#    видимым содержанием ключи различаются, и попасть на чужую запись можно
-#    только с идентичным промптом — т. е. с тем же самым доказательством.
-# 2. Значение — сериализованный JSON валидированной модели; на попадании
-#    ``schema.model_validate`` собирает НОВЫЙ экземпляр, Pydantic-объект
-#    никогда не разделяется между вызывающими.
+# 1. Ключ — sha256 от (id модели, путь к классу и полный instance-shape схемы,
+#    полный системный промпт, полный пользовательский промпт). Права пользователя
+#    (ACL) и история ветки попадают в ТЕКСТ промпта на его сборке (см.
+#    ``agents/workflow.py``: секции ``ИСТОРИЯ ВЕТКИ`` и ``FINDINGS`` формируются из
+#    уже отфильтрованного по ``allowed_data_classes`` retrieval-слоя). Значит, у
+#    пользователей с разным видимым содержанием ключи различаются, и попасть на
+#    чужую запись можно только с идентичным промптом — т. е. с тем же самым
+#    доказательством.
+# 2. Значение — сериализованный JSON валидированной модели (только поля,
+#    пришедшие от модели: иначе «секция не вернула» на попадании стало бы «секция
+#    пуста»); на попадании ``schema.model_validate`` собирает НОВЫЙ экземпляр,
+#    Pydantic-объект никогда не разделяется между вызывающими.
 # 3. Ошибки, недоступная модель и промежуточные schema-repair ответы не
 #    кэшируются: запись происходит только после валидного результата.
 # 4. ``llm_cache_ttl_seconds`` <= 0 выключает кэш полностью — путь выполнения
@@ -112,14 +164,46 @@ def _report_llm_timeout(metrics: object, schema_name: str) -> None:
         hook(schema_name)
 
 
+def _accepts_keyword(observer: object, keyword: str) -> bool:
+    """Принимает ли наблюдатель именованный параметр (или `**kwargs`).
+
+    Имя инициализации провайдера спрашивает это у реестра один раз: параметр
+    добавляет другой агент в ``AgentMetricsRegistry``, а вызов неподдерживаемого
+    аргумента в ``finally`` упал бы TypeError поверх уже потраченного обращения
+    к модели.
+    """
+    try:
+        parameters = inspect.signature(cast("Callable[..., object]", observer)).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
 def _llm_cache_key(model: str, schema: type[BaseModel], system: str, user: str) -> str:
     """Ключ, чувствительный ко всему, что меняет ответ.
 
     Разделитель ``\\x1f`` исключает склейку-амбивигуитет: пары строк, которые
     без разделителя дали бы один и тот же материал (переносы внутри промпта),
     не должны давать один sha256.
+
+    Имени класса в ключе мало: ``schema.__name__`` живёт в двух модулях
+    одновременно (тестовый `Answer` и продуктовый `Answer`), а pydantic с
+    `extra="ignore"` спокойно переводивалидировал бы payload одной схемы
+    экземпляром другой — валидный ответ одного контракта уезжал бы в другой.
+    Поэтому в ключе полный instance-shape и путь к классу; ни TTL, ни LRU это
+    не меняет.
     """
-    material = "\x1f".join((model, schema.__name__, system, user))
+    material = "\x1f".join(
+        (
+            model,
+            f"{schema.__module__}.{schema.__qualname__}",
+            _instance_shape(schema),
+            system,
+            user,
+        )
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -343,6 +427,12 @@ class GigaChatProvider:
         self._waiting = 0
         self._client: GigaChat | None = None
         self._client_lock = asyncio.Lock()
+        # Различает ли реестр отмену и отказ в одном учёте (см. ``finally`` в
+        # ``_complete_model_uncached``): параметр `cancelled` добавляет зона
+        # метрик, до его выкатки отмену считаем отдельным наблюдателем.
+        self._reports_cancelled = _accepts_keyword(
+            getattr(self._metrics, "observe_llm", None), "cancelled"
+        )
         self._metrics.set_llm_capacity(self._slots)
 
     async def _get_client(self) -> GigaChat:
@@ -414,9 +504,14 @@ class GigaChatProvider:
         return result
 
     def _cache_result(self, key: str, result: BaseModel) -> None:
-        """Сериализует валидный ответ для кэша; несериализуемое — не кэшируется."""
+        """Сериализует валидный ответ для кэша; несериализуемое — не кэшируется.
+
+        `exclude_unset` записывает только поля, которые пришли от модели: иначе
+        на попадании «модель не вернула секцию» превращалось бы в «секция пуста»,
+        и причина деградации исчезала бы из кэшированного ответа.
+        """
         try:
-            payload = result.model_dump_json()
+            payload = result.model_dump_json(exclude_unset=True)
         except (TypeError, ValueError):
             return
         _llm_cache_put(
@@ -445,10 +540,22 @@ class GigaChatProvider:
         prompt_tokens = 0
         completion_tokens = 0
         success = False
+        cancelled = False
+        # Бюджет вывода поднимаем только по признаку обрезки, поэтому базовое
+        # значение остаётся настройкой, а не ещё одной настройкой.
+        base_limit = self._settings.gigachat_max_output_tokens
+        output_limit = base_limit
+        truncations = 0
         try:
             for attempt in range(_SCHEMA_REPAIR_ATTEMPTS):
                 try:
-                    response = await self._request(messages)
+                    # Лимит передаём только когда он поднят: базовый вызов
+                    # `_request` остаётся одноаргументным.
+                    response = (
+                        await self._request(messages)
+                        if output_limit == base_limit
+                        else await self._request(messages, max_tokens=output_limit)
+                    )
                 except (GigaChatException, httpx.TransportError) as exc:
                     # Транспортная ошибка и таймаут обязаны попасть в отдельный
                     # счётчик: иначе «модель не ответила за 90 с» неотличима от
@@ -468,8 +575,7 @@ class GigaChatProvider:
                 except json.JSONDecodeError as exc:
                     parsed = None
                     last_defect = (
-                        f"вывод обрезан на лимите max_tokens="
-                        f"{self._settings.gigachat_max_output_tokens}"
+                        f"вывод обрезан на лимите max_tokens={output_limit}"
                         if truncated
                         else f"ответ не является JSON ({exc.msg} на позиции {exc.pos})"
                     )
@@ -479,6 +585,18 @@ class GigaChatProvider:
                     try:
                         result = schema.model_validate(parsed)
                     except ValidationError as exc:
+                        if truncated:
+                            # Неполный JSON ломает валидацию по другой причине, чем
+                            # мусор: подсказка «исправь схему» тут бесполезна.
+                            messages, output_limit, truncations = self._retry_after_truncation(
+                                instruction,
+                                user,
+                                schema,
+                                limit=output_limit,
+                                truncations=truncations,
+                                defect=last_defect,
+                            )
+                            continue
                         defects = _defect_summary(exc.errors())
                         last_defect = defects
                         if attempt == _SCHEMA_REPAIR_ATTEMPTS - 1:
@@ -495,10 +613,30 @@ class GigaChatProvider:
                         messages = self._repair_messages(instruction, user, content, defects)
                         self._metrics.observe_llm_retry(schema.__name__)
                         continue
+                    if truncated:
+                        # Провайдер сам заявил обрезку, а схема прошла только
+                        # потому, что усечённый хвост оказался необязательным:
+                        # молча выдавать такой ответ за полный нельзя.
+                        logger.warning(
+                            "GigaChat: %s прошёл валидацию с finish_reason=length "
+                            "(max_tokens=%d) — ответ может быть неполным",
+                            schema.__name__,
+                            output_limit,
+                        )
                     # Успех засчитывается только на валидированном результате;
                     # учёт расходования (duration, токены) закроет ``finally``.
                     success = True
                     return result
+                if truncated:
+                    messages, output_limit, truncations = self._retry_after_truncation(
+                        instruction,
+                        user,
+                        schema,
+                        limit=output_limit,
+                        truncations=truncations,
+                        defect=last_defect,
+                    )
+                    continue
                 if not isinstance(parsed, dict):
                     last_defect = (
                         "ответ не является JSON-объектом"
@@ -525,27 +663,37 @@ class GigaChatProvider:
             # Отмена (клиент закрыл вкладку) — не ошибка модели: её видит
             # отдельный наблюдатель, а ``finally`` ниже честно закрывает учёт
             # уже потраченных токенов. Never swallow, never convert.
+            cancelled = True
             _report_llm_cancelled(self._metrics, schema.__name__)
             raise
         finally:
             # Ровно один учёт на вызов: раньше каждая ветка отказа звала
             # observe_llm сама, и отмена посреди обращения оставляла потраченные
             # провайдером токены неучтёнными.
+            account: dict[str, object] = {
+                "success": success,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+            if cancelled and self._reports_cancelled:
+                # Отмена не должна попадать в `status="failure"`: доля отказов
+                # модели перестала бы зависеть от закрытой вкладки клиента.
+                account["cancelled"] = True
             self._metrics.observe_llm(
                 schema.__name__,
                 self._elapsed(started),
-                success=success,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                **account,  # type: ignore[arg-type]
             )
 
-    async def _request(self, messages: Sequence[Messages]) -> ChatCompletion:
+    async def _request(
+        self, messages: Sequence[Messages], *, max_tokens: int | None = None
+    ) -> ChatCompletion:
         client = await self._get_client()
         request = Chat(
             model=self._settings.gigachat_model,
             messages=list(messages),
             temperature=0.1,
-            max_tokens=self._settings.gigachat_max_output_tokens,
+            max_tokens=max_tokens or self._settings.gigachat_max_output_tokens,
         )
         logger.debug("GigaChat: запрос к модели %s", self._settings.gigachat_model)
         # Ожидание слота считается один раз на обращение: инкремент на каждое
@@ -626,6 +774,58 @@ class GigaChatProvider:
                 ),
             ),
         ]
+
+    @staticmethod
+    def _truncation_messages(instruction: str, user: str, limit: int) -> list[Messages]:
+        """Повтор после обрезки: тот же запрос, бо́льший лимит, без оборванного хвоста.
+
+        Дописывать оборванный JSON в repair-промпт — увеличивать вход при
+        неизменном выходе: модель обрезала бы ответ на том же месте, а промпт
+        ещё и съедал бы бюджет контекста.
+        """
+        return [
+            Messages(role=MessagesRole.SYSTEM, content=instruction),
+            Messages(
+                role=MessagesRole.USER,
+                content=(
+                    f"{user}\n\nПредыдущий ответ оборвался на лимите вывода. "
+                    f"Верни полный JSON целиком, без пояснений (max_tokens={limit})."
+                ),
+            ),
+        ]
+
+    def _retry_after_truncation(
+        self,
+        instruction: str,
+        user: str,
+        schema: type[StructuredOutput],
+        *,
+        limit: int,
+        truncations: int,
+        defect: str,
+    ) -> tuple[list[Messages], int, int]:
+        """Второй заход при `finish_reason == "length"`: больше лимит, не больше оплат.
+
+        Обрыв по длине — не мусор модели, а нехватка места, поэтому повтор с тем
+        же `max_tokens` давал бы тот же исход на третьей оплаченной попытке и
+        503 вместо ответа. Дальше второго обрыва не идём: контракт деградации
+        (`ModelUnavailableError` → `degradation_reasons`) честнее третьего платёжа.
+        """
+        attempts = truncations + 1
+        raised = min(limit * _OUTPUT_TOKENS_STEP, _OUTPUT_TOKENS_CEILING)
+        if attempts >= _TRUNCATION_ATTEMPT_LIMIT or raised <= limit:
+            raise ModelUnavailableError(
+                f"GigaChat: structured output оборван на лимите вывода "
+                f"({schema.__name__}, max_tokens={limit}, попыток {attempts}): {defect}"[:400]
+            )
+        self._metrics.observe_llm_retry(schema.__name__)
+        logger.warning(
+            "GigaChat: %s обрезан на max_tokens=%d, повтор с лимитом %d",
+            schema.__name__,
+            limit,
+            raised,
+        )
+        return self._truncation_messages(instruction, user, raised), raised, attempts
 
     @staticmethod
     def _elapsed(started: float) -> float:

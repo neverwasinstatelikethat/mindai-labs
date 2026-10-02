@@ -15,10 +15,27 @@
 
 Пороги приёмки снимаются флагами (значения по умолчанию — текущие нормы):
 ``--min-recall-at-10`` (0.90), ``--max-p95-seconds`` (3.0),
-``--require-hybrid-beats-lexical`` (по умолчанию требовать),
-``--max-regression`` (5 % относительного падения headline-метрики).
-``--json-out`` пишет сырые метрики для архива CI, ``--write-baseline`` сохраняет
-эталон, ``--baseline`` сравнивает текущий прогон с прошлым.
+``--require-hybrid-beats-lexical`` (по умолчанию требовать), ``--max-regression``
+(5 % относительного падения headline-метрики). ``--json-out`` пишет сырые метрики
+для архива CI, ``--write-baseline`` сохраняет эталон, ``--baseline`` сравнивает
+текущий прогон с прошлым.
+
+Эталон обязателен для гейта, а не опциональна украшением: он пишется только
+принятым прогоном на полном корпусе (``--write-baseline``), кладётся в репозиторий
+или в CI-артефакт, и путь к нему задаётся переменной ``BENCHMARK_BASELINE`` в
+``.gitlab-ci.yml``. Пока эталон не установлен, CI-гейт называется явным
+неустановленным (job ``benchmark:baseline-gate``), а не зелёным: сравнения нет,
+и притворяться проверкой оно не вправе.
+
+Выборка и честность чисел
+-------------------------
+Каждое агрегатное число обязано называть, по сколько кейсов в него вошло:
+``aggregate`` делит по числу кейсов с самой метрикой (а не по первому ключу),
+``aggregate_samples`` и поле ``samples`` у критерия приёмки показывают этот n, а
+``latency_stats`` возвращает ``LatencySample``: ниже ``MIN_SAMPLES_FOR_P95`` = 5
+замеров перцентиль не считается, в ``p95_seconds`` кладётся наихудшее наблюдение
+(консервативнее перцентиля) и ``p95_is_percentile: false`` — «недостаточная
+выборка» вместо псевдостатистики.
 
 Регрессионная проверка воспроизводит форму A/B-сравнения из
 ``api/app.py`` (``run_evolution_experiment``): метрики качества не должны падать,
@@ -35,6 +52,7 @@ import os
 import re
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -49,7 +67,11 @@ if str(_SRC) not in sys.path:
 # checkout без установки пакета.
 from scientific_tangle.domain.contracts import DocumentRequest, Finding  # noqa: E402
 from scientific_tangle.domain.models import EvidenceLocator  # noqa: E402
-from scientific_tangle.evaluation.gold_cases import REAL_GOLD_CASES  # noqa: E402
+from scientific_tangle.evaluation.gold_cases import (  # noqa: E402
+    REAL_GOLD_CASES,
+    GoldCaseReconciliation,
+    reconcile_gold_cases,
+)
 from scientific_tangle.services.document_parser import parse_document  # noqa: E402
 from scientific_tangle.services.knowledge import stable_uuid  # noqa: E402
 
@@ -80,6 +102,9 @@ TOP_K_VALUES = [3, 5, 10]
 MIN_RECALL_AT_10 = 0.90
 MAX_P95_SECONDS = 3.0
 MAX_RELATIVE_REGRESSION = 0.05
+# Ниже этой выборки перцентиль не является перцентилем: p95 из трёх замеров —
+# максимум под чужим именем, и отчёт обязан об этом сказать.
+MIN_SAMPLES_FOR_P95 = 5
 
 EXIT_OK = 0
 EXIT_NOT_ACCEPTED = 1
@@ -543,21 +568,83 @@ def compute_case_metrics(
 
 
 def aggregate(case_metrics: list[dict[str, float]]) -> dict[str, float]:
+    """Среднее по каждой метрике — только по тем кейсам, где она реально посчитана.
+
+    Прежняя версия брала ключи первого кейса и делила сумму на ``len(case_metrics)``:
+    отсутствующий ключ ронял прогон на KeyError, а метрика, посчитанная не у всех
+    кейсов, получала в числителе ноль вместо «нет значения» и занижала среднее.
+    Теперь ключи — объединение, знаменатель — число кейсов с этой метрикой
+    (оно видно в ``aggregate_samples``).
+    """
     if not case_metrics:
         return {}
-    n = len(case_metrics)
-    return {k: round(sum(m[k] for m in case_metrics) / n, 3) for k in case_metrics[0]}
+    measured: dict[str, list[float]] = {}
+    for metrics in case_metrics:
+        for key, value in metrics.items():
+            measured.setdefault(key, []).append(value)
+    return {
+        key: round(sum(values) / len(values), 3)
+        for key, values in sorted(measured.items())
+        if values
+    }
+
+
+def aggregate_samples(case_metrics: list[dict[str, float]]) -> dict[str, int]:
+    """Сколько кейсов дали значение каждой метрики: среднее без n не статистика."""
+    samples: dict[str, int] = {}
+    for metrics in case_metrics:
+        for key in metrics:
+            samples[key] = samples.get(key, 0) + 1
+    return samples
 
 
 # ── Головные метрики, пороги и эталон ──────────────────────────────────
 
 
-def latency_stats(latencies: list[float]) -> tuple[float, float]:
-    """Среднее и p95 в секундах — та же формула, что была в отчёте."""
-    average = sum(latencies) / max(len(latencies), 1)
+@dataclass(frozen=True, slots=True)
+class LatencySample:
+    """Замер латентности с размером выборки: «p95» без n нельзя сравнить с порогом."""
+
+    average: float
+    p95: float
+    samples: int
+    percentile_measured: bool
+
+    @property
+    def note(self) -> str:
+        if not self.samples:
+            return "латентность не измерена: ни одного замера"
+        if not self.percentile_measured:
+            return (
+                f"p95 не измерен (недостаточная выборка n={self.samples} < "
+                f"{MIN_SAMPLES_FOR_P95}): показан наихудший наблюдаемый замер"
+            )
+        return f"p95 по n={self.samples} замеров"
+
+
+def latency_stats(latencies: list[float]) -> LatencySample:
+    """Среднее, «p95» и размер выборки в секундах.
+
+    ``p95`` из трёх замеров — не перцентиль: ниже ``MIN_SAMPLES_FOR_P95`` отдаём
+    наихудшее наблюдение (консервативнее перцентиля, поэтому порогу он не помогает)
+    и явную отметку ``percentile_measured=False``, чтобы отчёт не врал про хвост.
+    """
+    samples = len(latencies)
+    average = sum(latencies) / samples if samples else 0.0
     ordered = sorted(latencies)
-    p95 = ordered[int(len(ordered) * 0.95)] if ordered else 0.0
-    return average, p95
+    if not samples:
+        return LatencySample(average=0.0, p95=0.0, samples=0, percentile_measured=False)
+    if samples < MIN_SAMPLES_FOR_P95:
+        return LatencySample(
+            average=average,
+            p95=ordered[-1],
+            samples=samples,
+            percentile_measured=False,
+        )
+    index = min(round((samples - 1) * 0.95), samples - 1)
+    return LatencySample(
+        average=average, p95=ordered[index], samples=samples, percentile_measured=True
+    )
 
 
 
@@ -567,11 +654,11 @@ def headline_metrics(
     latencies: list[float],
 ) -> dict[str, float]:
     """Плоская карта метрик, по которой сверяется эталон."""
-    average, p95 = latency_stats(latencies)
+    stats = latency_stats(latencies)
     metrics = {f"hybrid_{key}": value for key, value in hybrid.items()}
     metrics.update({f"lexical_{key}": value for key, value in lexical.items()})
-    metrics["average_seconds"] = round(average, 6)
-    metrics["p95_seconds"] = round(p95, 6)
+    metrics["average_seconds"] = round(stats.average, 6)
+    metrics["p95_seconds"] = round(stats.p95, 6)
     return metrics
 
 
@@ -585,13 +672,17 @@ def evaluate_acceptance(
     lexical: dict[str, float],
     latencies: list[float],
     thresholds: argparse.Namespace,
+    case_count: int = 0,
 ) -> dict[str, dict[str, Any]]:
     """Критерии приёмки с порогами из аргументов, а не с зашитыми числами.
 
     Не проверенный критерий получает ``checked: False`` и прочерк в отчёте: снятие
-    проверки флагом не должно выглядеть как выполненная проверка.
+    проверки флагом не должно выглядеть как выполненная проверка. Критерий p95 при
+    недостаточной выборке остаётся проверенным, но в описании прямо сказано, что
+    сравнивается наихудший наблюдаемый замер, а не перцентиль. Поле ``samples`` у
+    каждого критерия — размер выборки, на которой считаетось значение.
     """
-    _, p95 = latency_stats(latencies)
+    stats = latency_stats(latencies)
     recall10 = hybrid.get("recall@10", 0.0)
     hybrid_mrr = hybrid.get("mrr", 0.0)
     lexical_mrr = lexical.get("mrr", 0.0)
@@ -602,13 +693,22 @@ def evaluate_acceptance(
             "threshold": thresholds.min_recall_at_10,
             "passed": recall10 >= thresholds.min_recall_at_10,
             "checked": True,
+            "samples": case_count,
         },
         "p95_latency": {
-            "description": f"p95 латентности ранжирования <= {thresholds.max_p95_seconds:.2f} c",
-            "value": round(p95, 3),
+            "description": (
+                f"p95 латентности ранжирования <= {thresholds.max_p95_seconds:.2f} c"
+                if stats.percentile_measured
+                else (
+                    f"латентность ранжирования <= {thresholds.max_p95_seconds:.2f} c — "
+                    f"{stats.note}"
+                )
+            ),
+            "value": round(stats.p95, 3),
             "threshold": thresholds.max_p95_seconds,
-            "passed": p95 <= thresholds.max_p95_seconds,
+            "passed": stats.p95 <= thresholds.max_p95_seconds,
             "checked": True,
+            "samples": stats.samples,
         },
     }
     require_beats_lexical = bool(thresholds.require_hybrid_beats_lexical)
@@ -622,6 +722,7 @@ def evaluate_acceptance(
         "threshold": round(lexical_mrr, 3),
         "passed": (hybrid_mrr > lexical_mrr) if require_beats_lexical else True,
         "checked": require_beats_lexical,
+        "samples": case_count,
     }
     return criteria
 
@@ -748,8 +849,19 @@ def parse_corpus(
 
 def run_retrieval_benchmark(
     findings: list[Finding],
-) -> tuple[dict[str, float], dict[str, float], list[dict[str, Any]], list[float]]:
-    """Прогон hybrid против lexical baseline по всем gold-кейсам."""
+) -> tuple[
+    dict[str, float],
+    dict[str, float],
+    list[dict[str, Any]],
+    list[float],
+    list[dict[str, float]],
+]:
+    """Прогон hybrid против lexical baseline по всем gold-кейсам.
+
+    Пятый элемент — метрики каждого кейса гибридного прогона: по ним видно, сколько
+    значений собрала каждая агрегатная метрика (``aggregate_samples``), а не только
+    «среднее по неизвестно чему».
+    """
     stmt_tokens = [tokenize(f.statement) for f in findings]
     ev_tokens = [tokenize(f.evidence[0].quote) for f in findings]
     bm25_stmt = BM25Index(stmt_tokens)
@@ -786,7 +898,13 @@ def run_retrieval_benchmark(
                 "passed": bool(h_metrics["recall@10"] >= 1.0),
             }
         )
-    return aggregate(hybrid_case_metrics), aggregate(lexical_case_metrics), case_details, latencies
+    return (
+        aggregate(hybrid_case_metrics),
+        aggregate(lexical_case_metrics),
+        case_details,
+        latencies,
+        hybrid_case_metrics,
+    )
 
 
 def verified_answer_cases() -> int:
@@ -795,6 +913,18 @@ def verified_answer_cases() -> int:
         1
         for case in REAL_GOLD_CASES
         if case.expected_answer and case.expected_answer_source
+    )
+
+
+def differential_expectation_cases() -> int:
+    """Сколько кейсов имеют ожидания противоречий или пробелов.
+
+    Это потолок измеримости ``conflict_recall``/``gap_recall``: без подтверждённых
+    корпусом ожиданий дифференциаторы продукта не измеряются ни в каком прогоне,
+    и отчёт обязан говорить это, а не молчать про 0.0.
+    """
+    return sum(
+        1 for case in REAL_GOLD_CASES if case.expected_conflicts or case.expected_gaps
     )
 
 
@@ -811,8 +941,10 @@ def build_payload(
     regressions: list[str] | None,
     baseline_path: str | None,
     max_relative: float,
+    metric_samples: dict[str, int] | None = None,
+    reconciliation: GoldCaseReconciliation | None = None,
 ) -> dict[str, Any]:
-    average, p95 = latency_stats(latencies)
+    stats = latency_stats(latencies)
     return {
         "version": PAYLOAD_VERSION,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -829,18 +961,38 @@ def build_payload(
             "findings": findings_count,
             "gold_cases": len(case_details),
             "answer_correctness_cases": verified_answer_cases(),
+            # 0 = конфликтных и пробельных ожиданий в gold-кейсах нет вообще,
+            # поэтому conflict_recall/gap_recall в этом прогоне не измеримы.
+            "differential_expectation_cases": differential_expectation_cases(),
         },
         "metrics": {
             "hybrid": hybrid,
             "lexical": lexical,
             "latency": {
-                "average_seconds": round(average, 6),
-                "p95_seconds": round(p95, 6),
+                "average_seconds": round(stats.average, 6),
+                "p95_seconds": round(stats.p95, 6),
+                "samples": stats.samples,
+                "p95_is_percentile": stats.percentile_measured,
+                "note": stats.note,
             },
+            # Среднее по какой выборке: у метрик разного набора кейсов знаменатель
+            # разный, и без этого числа агрегат неотличим от «среднего по одному».
+            "samples": metric_samples or {},
         },
         "headline": headline_metrics(hybrid, lexical, latencies),
         "cases": case_details,
         "acceptance": criteria,
+        "gold_case_reconciliation": (
+            None
+            if reconciliation is None
+            else {
+                "balanced": reconciliation.balanced,
+                "manifest_total": reconciliation.manifest_total,
+                "benchmark_total": reconciliation.benchmark_total,
+                "matched": reconciliation.matched,
+                "diagnostics": list(reconciliation.describe()),
+            }
+        ),
         "regression": {
             "baseline": baseline_path,
             "max_relative": max_relative,
@@ -872,6 +1024,8 @@ def print_report(
     latencies: list[float],
     criteria: dict[str, dict[str, Any]],
     answer_correctness_cases: int,
+    metric_samples: dict[str, int] | None = None,
+    reconciliation: GoldCaseReconciliation | None = None,
 ) -> None:
     sep = "=" * 72
     thin = "-" * 72
@@ -887,10 +1041,21 @@ def print_report(
     print("  Ранжирование: локальные BM25/гибрид бенчмарка, не продуктовый retrieval")
     print("  Точность ответа и LLM-судья в этом прогоне не измеряются (retrieval-only)")
     print(f"  Кейсов с проверенным ожидаемым ответом: {answer_correctness_cases}")
+    print(
+        "  Кейсов с ожиданиями противоречий/пробелов: "
+        f"{differential_expectation_cases()} — при нуле conflict_recall и gap_recall"
+        " не измеримы"
+    )
     print(sep)
     print()
     print(f"  Корпус: {doc_count} документов, {findings_count} findings")
     print(f"  Gold-кейсы: {len(case_details)}")
+    if reconciliation is not None and not reconciliation.balanced:
+        # Два носителя gold-кейсов (манифест корпуса и REAL_GOLD_CASES) расходятся:
+        # без этой строки разные наборы читались бы как один и тот же замер.
+        print("  Сверка gold-кейсов: наборы РАЗЛИЧАЮТСЯ")
+        for line in reconciliation.describe():
+            print(f"    ! {line}")
     print()
 
     # ── Таблица метрик ──
@@ -898,8 +1063,11 @@ def print_report(
     print("  МЕТРИКИ")
     print(thin)
     print()
-    print(f"  {'Метрика':<20s} {'Hybrid':>10s}   {'Lexical':>10s}   {'Diff':>8s}")
-    print(f"  {'─' * 20} {'─' * 10}   {'─' * 10}   {'─' * 8}")
+    samples = metric_samples or {}
+    print(
+        f"  {'Метрика':<20s} {'Hybrid':>10s}   {'Lexical':>10s}   {'Diff':>8s}   {'n':>4s}"
+    )
+    print(f"  {'─' * 20} {'─' * 10}   {'─' * 10}   {'─' * 8}   {'─' * 4}")
 
     metric_order = [
         "recall@3",
@@ -918,7 +1086,12 @@ def print_report(
             low = lexical.get(key, 0.0)
             delta = h - low
             sign = "+" if delta >= 0 else ""
-            print(f"  {key:<20s} {_fmt(h):>10s}   {_fmt(low):>10s}   {sign}{delta:.3f}")
+            # n — сколько кейсов дали значение метрики: среднее по 12 и по 3
+            # выглядят одинаково, но сравнивать с порогом их нельзя одинаково.
+            print(
+                f"  {key:<20s} {_fmt(h):>10s}   {_fmt(low):>10s}   {sign}{delta:.3f}"
+                f"   {samples.get(key, len(case_details)):>4d}"
+            )
     print()
 
     # ── Детали по кейсам ──
@@ -950,9 +1123,12 @@ def print_report(
     print("  Замер охватывает только hybrid_retrieval: lexical и построение индексов")
     print("  в него не входят.")
     print()
-    avg_lat, p95 = latency_stats(latencies)
-    print(f"  Среднее: {avg_lat * 1000:.1f} ms")
-    print(f"  p95:     {p95 * 1000:.1f} ms")
+    avg_lat = latency_stats(latencies)
+    print(f"  Среднее: {avg_lat.average * 1000:.1f} ms   (n={avg_lat.samples})")
+    label = "p95:" if avg_lat.percentile_measured else "макс:"
+    print(f"  {label}    {avg_lat.p95 * 1000:.1f} ms   (n={avg_lat.samples})")
+    if not avg_lat.percentile_measured:
+        print(f"  ! {avg_lat.note}")
     print()
 
     # ── Критерии приёмки ──
@@ -964,7 +1140,7 @@ def print_report(
         mark = "—" if not item["checked"] else ("✓" if item["passed"] else "✗")
         print(
             f"  {mark}  {item['description']}: значение {_fmt(item['value'])}, "
-            f"порог {_fmt(item['threshold'])}"
+            f"порог {_fmt(item['threshold'])}, n={item.get('samples', 0)}"
         )
     print(f"  hit@10 (хотя бы один источник): {_fmt(hybrid.get('hit@10', 0.0))} — "
           "справочно, порога не имеет")
@@ -973,7 +1149,10 @@ def print_report(
     print()
 
 
-def print_not_measured(problems: list[str]) -> None:
+def print_not_measured(
+    problems: list[str],
+    reconciliation: GoldCaseReconciliation | None = None,
+) -> None:
     """Отчёт о том, что измерение не состоялось — и никаких цифр вместо него."""
     sep = "=" * 72
     print()
@@ -983,6 +1162,12 @@ def print_not_measured(problems: list[str]) -> None:
     print()
     for problem in problems:
         print(f"  ! {problem}")
+    if reconciliation is not None and not reconciliation.balanced:
+        print()
+        print("  Gold-кейсы манифеста и бенчмарка различаются (сверить нужно и после")
+        print("  монтирования корпуса):")
+        for line in reconciliation.describe():
+            print(f"    ~ {line}")
     print()
     print("  Метрики retrieval, критерии приёмки и сравнение с эталоном НЕ считались.")
     print("  Зелёного отчёта не будет: недоступный корпус — это не «качество ок».")
@@ -1135,8 +1320,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # 1. Можно ли вообще измерять. Нет корпуса — нет и отчёта о метриках.
     manifest, problems = preflight(manifest_path, source_root)
+    # Два носителя gold-кейсов (манифест прелоада и REAL_GOLD_CASES) сверяются,
+    # как только манифест прочитан: разный набор меняет смысл recall независимо от
+    # того, состоялся ли прогон.
+    reconciliation = reconcile_gold_cases(manifest) if manifest else None
     if problems:
-        print_not_measured(problems)
+        print_not_measured(problems, reconciliation)
         return EXIT_NOT_MEASURED
 
     # 2. Парсинг документов и извлечение findings
@@ -1147,14 +1336,20 @@ def main(argv: list[str] | None = None) -> int:
             [
                 f"не извлечено ни одной находки из {len(manifest)} документов корпуса",
                 *([f"сбои разбора: {failures[0]}"[:120]] if failures else []),
-            ]
+            ],
+            reconciliation,
         )
         return EXIT_NOT_MEASURED
 
     # 3. Прогон retrieval
-    hybrid, lexical, case_details, latencies = run_retrieval_benchmark(findings)
-    criteria = evaluate_acceptance(hybrid, lexical, latencies, args)
-    _, p95 = latency_stats(latencies)
+    hybrid, lexical, case_details, latencies, hybrid_case_metrics = run_retrieval_benchmark(
+        findings
+    )
+    metric_samples = aggregate_samples(hybrid_case_metrics)
+    criteria = evaluate_acceptance(
+        hybrid, lexical, latencies, args, case_count=len(case_details)
+    )
+    stats = latency_stats(latencies)
     print_report(
         len(findings),
         len(doc_titles),
@@ -1164,6 +1359,8 @@ def main(argv: list[str] | None = None) -> int:
         latencies,
         criteria,
         verified_answer_cases(),
+        metric_samples,
+        reconciliation,
     )
 
     # 4. Регрессионный контроль: нечитаемый эталон срывает гейт кодом 2, а не
@@ -1198,11 +1395,17 @@ def main(argv: list[str] | None = None) -> int:
         regressions=regressions,
         baseline_path=None if args.baseline is None else str(args.baseline),
         max_relative=args.max_regression,
+        metric_samples=metric_samples,
+        reconciliation=reconciliation,
     )
     payload["accepted"] = accepted
     if args.json_out is not None:
         write_payload(args.json_out, payload)
-        print(f"  Метрики прогона записаны: {args.json_out} (p95 {p95:.3f} c)")
+        tail = "p95" if stats.percentile_measured else "макс"
+        print(
+            f"  Метрики прогона записаны: {args.json_out} "
+            f"({tail} {stats.p95:.3f} c при n={stats.samples})"
+        )
     if baseline_error is not None:
         print(f"  РЕГРЕССИОННЫЙ КОНТРОЛЬ НЕ ВЫПОЛНЕН: {baseline_error}")
         print("  Retrieval измерен, но сравнивать нечем: приёмка не подтверждена.")

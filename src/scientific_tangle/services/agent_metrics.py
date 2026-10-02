@@ -4,6 +4,7 @@ import threading
 from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Literal
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -90,6 +91,12 @@ LLM_QUEUE_WAITS = Counter(
     "mindai_llm_queue_waits_total",
     "Обращения к LLM, которым пришлось ждать освобождения слота провайдера",
 )
+STORAGE_THREADS = Gauge(
+    "mindai_storage_pool_threads",
+    "Блокирующие обращения к хранилищу: in_flight — исполняются, queued — ждут "
+    "потока, limit — размер именованного пула",
+    ["state"],
+)
 
 
 @dataclass(slots=True)
@@ -105,6 +112,11 @@ class LlmRunUsage:
 
     calls: int = 0
     failures: int = 0
+    # Отмена и таймаут — расход токенов без отказа модели: их учитывают отдельные
+    # счётчики, иначе «доля отказов» стала бы зависеть от того, закрыл ли
+    # пользователь вкладку.
+    cancelled: int = 0
+    timeouts: int = 0
     retries: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -128,12 +140,22 @@ def current_llm_usage() -> LlmRunUsage:
     return _RUN_USAGE.get() or LlmRunUsage()
 
 
+LLM_CALL_OUTCOMES = ("success", "failure", "cancelled", "timeout")
+LlmOutcome = Literal["success", "failure", "cancelled", "timeout"]
+
+
 class AgentMetricsRegistry:
     """Потокобезопасный реестр агентных и LLM-метрик.
 
     Различает попытки (retry) и прогоны (run): в метрики агента попадает только
     исход последней попытки, а повторы считаются на уровне обращений к модели —
     иначе success_rate смешивался бы с retry-политикой.
+
+    Исход обращения — четыре значения, а не два (``LLM_CALL_OUTCOMES``): отказ
+    модели, отмена клиента и таймаут провайдера чинятся разным, и в Prometheus они
+    обязаны идти отдельными сериями
+    ``mindai_llm_calls_total{status="cancelled"|"timeout"}``, а не набираться в
+    ``status="failure"``.
 
     Каждый наблюдатель сначала обновляет внутреннее состояние (из него собирается
     ``/api/v1/agents/metrics``), а затем зеркалит событие в Prometheus: счётчик,
@@ -290,11 +312,25 @@ class AgentMetricsRegistry:
         success: bool,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        outcome: LlmOutcome | None = None,
     ) -> None:
+        """Один учёт обращения к модели с его фактическим исходом.
+
+        ``outcome`` — то, чем закончился вызов: ``"cancelled"`` (отмена клиента,
+        оборванный SSE, агентный дедлайн) и ``"timeout"`` (таймаут провайдера) не
+        являются отказами модели. Без него исход выводится из ``success`` — так
+        работают вызовы, которые ещё не размечают исход: провайдер передаёт
+        ``outcome=`` рядом с ``observe_llm_cancelled``/``observe_llm_timeout``, и
+       series ``status="failure"`` перестаёт быть суммой трёх разных причин.
+
+        Счётчики ``cancelled``/``timeouts`` инкрементируют только именные методы:
+        учёт здесь их бы удвоил.
+        """
+        resolved: LlmOutcome = outcome or ("success" if success else "failure")
         with self._lock:
             self._llm_calls[schema] += 1
             self._llm_duration[schema].append(duration_ms)
-            if not success:
+            if resolved == "failure":
                 self._llm_failures[schema] += 1
             self._prompt_tokens += prompt_tokens
             self._completion_tokens += completion_tokens
@@ -304,9 +340,13 @@ class AgentMetricsRegistry:
                 usage.latency_ms += duration_ms
                 usage.prompt_tokens += prompt_tokens
                 usage.completion_tokens += completion_tokens
-                if not success:
+                if resolved == "failure":
                     usage.failures += 1
-        LLM_CALLS.labels(schema=schema, status="success" if success else "failure").inc()
+                elif resolved == "cancelled":
+                    usage.cancelled += 1
+                elif resolved == "timeout":
+                    usage.timeouts += 1
+        LLM_CALLS.labels(schema=schema, status=resolved).inc()
         LLM_DURATION.labels(schema=schema).observe(duration_ms / 1000)
         if prompt_tokens:
             LLM_TOKENS.labels(kind="prompt").inc(prompt_tokens)

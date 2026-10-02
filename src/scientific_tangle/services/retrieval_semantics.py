@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
 from scientific_tangle.domain.contracts import Finding
@@ -46,6 +46,11 @@ RETRIEVAL_TOP_K = 6
 # выбирать: без запаса ограничение по году срезало бы выдачу до нуля.
 CANDIDATE_FANOUT = 3
 CONSTRAINED_CANDIDATE_FANOUT = 6
+
+# Кооперативная отмена retrieval: предикат «идти дальше некуда», который вызывается
+# на границе каждой фазы. Хранилище не знает ни про дедлайн прогона, ни про его
+# отмену клиентом — только про функцию, иначе сервисный слой зависит от агента.
+AbortCheck = Callable[[], bool]
 
 # Топонимы планировщик возвращает и кодом, и названием; сверяем по нормализованной
 # форме, иначе «RU» никогда не совпадёт с «Россия».
@@ -341,6 +346,23 @@ def global_context_notes(requested: bool, briefs: Sequence[str]) -> list[str]:
         "Запрошен глобальный контекст, но сообщества графа не построены: "
         "сводки по кластерам отсутствуют, ответ опирается только на найденные доказательства."
     ]
+
+
+def is_aborted(abort: AbortCheck | None) -> bool:
+    """Прогон отменён (или его время вышло) — новую работу начинать нельзя.
+
+    Драйверы Neo4j и Elasticsearch синхронные, поэтому worker-поток нельзя
+    выдернуть из середины запроса: остаётся только не начинать следующую фазу.
+    """
+    return abort is not None and abort()
+
+
+def abort_note(phase: str) -> str:
+    """Пропущенная из-за отмены фаза обязана быть названа в ответе."""
+    return (
+        f"Прогон отменён, фаза «{phase}» не исполнялась: выдача собрана по уже "
+        "выполненным веткам и неполная по построению."
+    )
 
 
 def candidate_window(plan: QueryPlan, top_k: int = RETRIEVAL_TOP_K) -> int:

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from time import monotonic
+
+from pydantic import BaseModel, ValidationError
 
 from scientific_tangle.domain.contracts import (
     AgentActionPlan,
@@ -19,6 +23,7 @@ from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import QueryPlan
 from scientific_tangle.domain.relations import resolve_relations
 from scientific_tangle.services.knowledge import KnowledgeBase, RetrievalContext
+from scientific_tangle.services.provider import redact_provider_error
 from scientific_tangle.services.research_intelligence import (
     DEFAULT_GAP_LIMIT,
     MAX_VALUES_PER_DIMENSION,
@@ -41,6 +46,49 @@ OMITTED_NOTE_PREFIX = "Не показано"
 # считается повторным, только если совпадают и инструмент, и все его аргументы.
 ActionKey = tuple[str, str, tuple[str, ...], tuple[str, ...], int]
 
+# Запас кооперативной отмены: действие не начинается, если остатка уже нет. Значение
+# маленькое нарочно — смысл проверки в том, чтобы не запускать новую работу в
+# отменённом или истёкшем прогоне, а не в том, чтобы угадывать длительность retrieval.
+_MIN_ACTION_SECONDS = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class RunBudget:
+    """Остаток дедлайна прогона для кооперативной отмены retrieval.
+
+    Драйверы Neo4j/Elasticsearch синхронные и прервать их нельзя, поэтому
+    единственный доступный механизм — не начинать новую работу, когда времени уже
+    нет: проверка при диспетчеризации, вторая — прямо перед вызовом ``retrieve``
+    в worker-потоке, третья — на границе платных фаз внутри самого retrieval.
+
+    Флаг ``stop()`` поднимает снятие прогона (ушёл клиент или сработал общий
+    дедлайн): ожидающая задача уже не получит результат, а поток, в котором сидит
+    ``to_thread``, живёт дальше и без сигнала досчитал бы обход графа и оплатил бы
+    эмбеддинги для ответа, который никто не ждёт.
+    """
+
+    deadline_at: float
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+    def remaining_seconds(self) -> float:
+        return self.deadline_at - monotonic()
+
+    def exhausted(self, reserve: float = _MIN_ACTION_SECONDS) -> bool:
+        return self.cancelled.is_set() or self.remaining_seconds() <= reserve
+
+    def stop(self) -> None:
+        """Прогон снят: все ещё не начатые фазы retrieval обязаны остановиться."""
+        self.cancelled.set()
+
+    @property
+    def aborted(self) -> bool:
+        """Предикат для хранилища: резерв здесь нулевой — время вышло или прогон снят."""
+        return self.exhausted(reserve=0.0)
+
+
+class _ActionSkippedError(RuntimeError):
+    """Действие не исполнено: бюджет прогона исчерпан до диспетчеризации."""
+
 
 @dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
@@ -60,9 +108,51 @@ class _ActionOutcome:
     context: RetrievalContext | None
     error: Exception | None
     rejected_relations: tuple[str, ...] = ()
+    # Действие не исполнялось вовсе (бюджет прогона исчерпан) — это не сбой retrieval,
+    # и перепутать их нельзя ни в наблюдении, ни в деградации.
+    skipped: bool = False
+    # Сколько запис хранилища не прошли схему: битая запись обязана быть названа,
+    # а не превратиться в AttributeError на `.id` и уехать сырым 500.
+    invalid_records: int = 0
 
 
 Observer = Callable[[ToolAction, QueryPlan, RetrievalContext, Sequence[Finding]], ToolObservation]
+
+
+def _coerce_records[T: BaseModel](kind: type[T], values: Sequence[object]) -> tuple[list[T], int]:
+    """Записи хранилища в форме схемы и число отброшенного.
+
+    Граница retrieval: репозитории (особенно neo4j-строки после смены схемы) могут
+    вернуть словарь вместо модели. Молча брать у такого `.id` значит уронить прогон
+    сырым ``AttributeError`` — вместо этого запись отбрасывается и считается.
+    """
+    kept: list[T] = []
+    dropped = 0
+    for value in values:
+        if isinstance(value, kind):
+            kept.append(value)
+            continue
+        try:
+            kept.append(kind.model_validate(value))
+        except (ValidationError, TypeError, ValueError):
+            dropped += 1
+    return kept, dropped
+
+
+def _sanitize_context(context: RetrievalContext) -> tuple[RetrievalContext, int]:
+    """Чистит выдачу действия до того, как из неё складываются пул и граф."""
+    findings, dropped = _coerce_records(Finding, context.findings)
+    nodes, lost = _coerce_records(GraphNode, context.graph.nodes)
+    dropped += lost
+    edges, lost = _coerce_records(GraphEdge, context.graph.edges)
+    dropped += lost
+    communities = [item for item in context.community_summaries if isinstance(item, str)]
+    dropped += len(context.community_summaries) - len(communities)
+    graph = context.graph.model_copy(update={"nodes": nodes, "edges": edges})
+    return (
+        replace(context, findings=findings, graph=graph, community_summaries=communities),
+        dropped,
+    )
 
 
 class ResearchToolExecutor:
@@ -96,6 +186,7 @@ class ResearchToolExecutor:
         allowed_data_classes: set[DataClass] | None = None,
         *,
         prior_findings: Sequence[Finding] = (),
+        budget: RunBudget | None = None,
     ) -> ToolExecutionResult:
         """Исполняет план; ``prior_findings`` — доказательства всех предыдущих раундов.
 
@@ -103,6 +194,9 @@ class ResearchToolExecutor:
         мог подключиться к нему в любом порядке: без него поведение не меняется
         (анализ идёт по найденному в этом раунде), с ним conflict/gap видят пары
         между действиями разных раундов.
+
+        ``budget`` обязателен по смыслу, но не по сигнатуре: вне рабочего процесса
+        (тесты, bench-контуры) действия исполняются без ограничения по времени.
         """
         # Одинаковые действия исполняются один раз: дубль в плане не должен
         # удваивать ни retrieval, ни счётчики конфликтов и пробелов.
@@ -127,12 +221,19 @@ class ResearchToolExecutor:
             owner = first_position.setdefault(key, position)
             owners.append(owner)
         first_positions = set(owners)
-        unique_outcomes = await asyncio.gather(
-            *(
-                self._run_action(plan.actions[position], query_plan, allowed_data_classes)
-                for position in sorted(first_positions)
+        try:
+            unique_outcomes = await asyncio.gather(
+                *(
+                    self._run_action(
+                        plan.actions[position], query_plan, allowed_data_classes, budget=budget
+                    )
+                    for position in sorted(first_positions)
+                )
             )
-        )
+        except asyncio.CancelledError:
+            if budget is not None:
+                budget.stop()
+            raise
         outcome_by_position = dict(zip(sorted(first_positions), unique_outcomes, strict=True))
         outcomes: list[_ActionOutcome] = []
         for position, owner in enumerate(owners):
@@ -145,6 +246,7 @@ class ResearchToolExecutor:
                     context=outcome.context,
                     error=outcome.error,
                     rejected_relations=outcome.rejected_relations,
+                    skipped=outcome.skipped,
                 )
             outcomes.append(outcome)
         pool = _merge_pool(prior_findings, outcomes)
@@ -159,13 +261,22 @@ class ResearchToolExecutor:
         degradation: list[str] = []
         gaps_omitted = 0
         failures = 0
+        invalid_records = 0
+        skipped: list[str] = []
         rejected: list[str] = []
 
         for position, outcome in enumerate(outcomes):
             action = outcome.action
             rejected.extend(outcome.rejected_relations)
+            if position in first_positions:
+                # Дубликат исполняется один раз, поэтому и счётчик битых записей
+                # ведётся только по первому исполнению действия.
+                invalid_records += outcome.invalid_records
             if outcome.context is None:
-                failures += 1
+                if outcome.skipped:
+                    skipped.append(action.tool)
+                else:
+                    failures += 1
                 observations.append(self._error_observation(action, outcome.error))
                 continue
             context = outcome.context
@@ -206,6 +317,19 @@ class ResearchToolExecutor:
         if failures:
             degradation.append(f"{failures} из {len(outcomes)} действий tools завершились ошибкой.")
 
+        if skipped:
+            degradation.append(
+                f"Не исполнено действий из-за исчерпанного бюджета времени прогона: "
+                f"{', '.join(_dedupe(skipped))} — доказательств по ним нет не потому, что "
+                "их нет в корпусе, а потому, что запрос не успел до них дойти."
+            )
+
+        if invalid_records:
+            degradation.append(
+                f"Выдача хранилища ужата: {invalid_records} записей не прошли проверку "
+                "схем домена и не попали в граф доказательств."
+            )
+
         snapshot = GraphSnapshot(
             nodes=list(nodes.values()),
             edges=list(edges.values()),
@@ -227,21 +351,70 @@ class ResearchToolExecutor:
         action: ToolAction,
         query_plan: QueryPlan,
         allowed_data_classes: set[DataClass] | None,
+        *,
+        budget: RunBudget | None = None,
     ) -> _ActionOutcome:
         relations, rejected = resolve_relations(action.relation_types)
+        if budget is not None and budget.exhausted():
+            # Отменённый или истёкший прогон не имеет права запускать новую работу:
+            # to_thread ставит задачу в общий пул потоков, и отозвать её уже нельзя.
+            return _ActionOutcome(
+                action=action,
+                context=None,
+                error=_ActionSkippedError("бюджет времени прогона исчерпан"),
+                rejected_relations=tuple(rejected),
+                skipped=True,
+            )
         try:
             context = await asyncio.to_thread(
-                self._knowledge.retrieve,
+                self._retrieve_checked,
+                action,
                 query_plan,
-                self._retrieval_plan(action, query_plan, relations=relations),
                 allowed_data_classes,
+                relations,
+                budget,
+            )
+        except _ActionSkippedError as error:
+            # Вторая проверка — уже в worker-потоке: между диспетчеризацией и
+            # вызовом драйвера задача могла ждать своей очереди на исполнителе.
+            return _ActionOutcome(
+                action=action,
+                context=None,
+                error=error,
+                rejected_relations=tuple(rejected),
+                skipped=True,
             )
         except Exception as error:  # noqa: BLE001 - граница действия: фиксируем и деградируем
             logger.warning("Tool %s failed: %s", action.tool, error, exc_info=True)
             return _ActionOutcome(action=action, context=None, error=error,
                                   rejected_relations=tuple(rejected))
+        context, invalid = _sanitize_context(context)
         return _ActionOutcome(
-            action=action, context=context, error=None, rejected_relations=tuple(rejected)
+            action=action,
+            context=context,
+            error=None,
+            rejected_relations=tuple(rejected),
+            invalid_records=invalid,
+        )
+
+    def _retrieve_checked(
+        self,
+        action: ToolAction,
+        query_plan: QueryPlan,
+        allowed_data_classes: set[DataClass] | None,
+        relations: Sequence[str],
+        budget: RunBudget | None,
+    ) -> RetrievalContext:
+        """Точка невозврата в потоке: до неё ещё можно не идти, после — уже нет."""
+        if budget is not None and budget.exhausted():
+            raise _ActionSkippedError("бюджет времени прогона исчерпан")
+        return self._knowledge.retrieve(
+            query_plan,
+            self._retrieval_plan(action, query_plan, relations=relations),
+            allowed_data_classes,
+            # Дальше полагаться не на что: начатый вызов retrieval поток не отдаст,
+            # поэтому остаток прогона читается на границе каждой платной фазы.
+            abort=None if budget is None else (lambda: budget.aborted),
         )
 
     @staticmethod
@@ -289,13 +462,37 @@ class ResearchToolExecutor:
 
     @staticmethod
     def _error_observation(action: ToolAction, error: Exception | None) -> ToolObservation:
+        """Наблюдение об отказе действия.
+
+        ``root_cause_hint`` читает planner/controller (он уходит в промпт) и след
+        ответа, поэтому сырой ``str(error)`` недопустим: в нём строки подключения
+        (``bolt://``, ``postgresql://``, URL Elasticsearch) и идентификаторы
+        запроса. Остаётся нейтральное название сбоя от ``redact_provider_error`` —
+        оно же ограничивает длину.
+        """
+        skipped = isinstance(error, _ActionSkippedError)
+        hint = (
+            "retrieval: действие не исполнено — бюджет времени прогона исчерпан"
+            if skipped
+            else redact_provider_error(error, context="retrieval")
+            if error is not None
+            else "retrieval: неизвестная причина"
+        )
         return ToolObservation(
             action_id=action.id,
             tool=action.tool,
             status="error",
-            summary=f"Tool execution failed: {type(error).__name__ if error else 'unknown'}",
-            next_actions=["Перепланировать запрос с более узкими аргументами"],
-            root_cause_hint=(str(error)[:300] if error else "unknown") or type(error).__name__,
+            summary=(
+                f"Tool execution skipped: {type(error).__name__ if error else 'unknown'}"
+                if skipped
+                else f"Tool execution failed: {type(error).__name__ if error else 'unknown'}"
+            ),
+            next_actions=(
+                ["Повторить действие отдельным запросом при свободном бюджете времени"]
+                if skipped
+                else ["Перепланировать запрос с более узкими аргументами"]
+            ),
+            root_cause_hint=hint,
             safe_retry="Повторить один раз с меньшим max_hops и узким entity anchor.",
             stop_condition="Остановить tool loop после второго неуспешного раунда.",
         )

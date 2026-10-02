@@ -130,8 +130,14 @@ class AgentRunAdmission:
 def agent_run_limit(settings: Settings) -> int:
     """Потолок одновременных исследований из ``Settings``.
 
-    Потолок держат ниже пропускной способности модели: 4 параллельных
-    исследования при одном LLM-слоте — это ~32 ожидающих обращения, дальше
-    растёт только очередь. Значение валидирует ``config.py`` (``ge=1``).
+    Раньше сюда шло голое ``AGENT_MAX_CONCURRENT_RUNS``: четыре слота приёма при
+    ``GIGACHAT_MAX_CONCURRENT=1`` означали ~32 ожидающих обращения на один слот
+    модели, и прогон съедал собственный дедлайн в очереди — то есть ровно то, от
+    чего этот слой обязан защищать. Эффективный потолок производен от способности
+    модели (``Settings.effective_agent_admission_limit``), а явный
+    ``AGENT_ADMISSION_LIMIT`` остаётся способом перекрыть эвристику осознанно.
+
+    Смысл отказа не меняется: сверх потолка — сразу ``AdmissionRefusedError`` (429
+    + Retry-After), очереди нет.
     """
-    return settings.agent_max_concurrent_runs
+    return settings.effective_agent_admission_limit

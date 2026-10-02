@@ -42,11 +42,62 @@ def _refused_for_good(error: BaseException) -> bool:
     отказ тарифа в минуты ожидания: новичок получал «модель не ответила» там, где
     корпус просто не успевал отдать лексическую ветку.
     """
+    status = _status_code(error)
+    return isinstance(status, int) and 400 <= status < 500 and status not in _RETRYABLE_STATUSES
+
+
+def _status_code(error: BaseException) -> int | None:
+    """HTTP-статус отказа — для названия сбоя в деградации, без тела ответа."""
     status = getattr(error, "status_code", None)
     if status is None:
         response = getattr(error, "response", None)
         status = getattr(response, "status_code", None)
-    return isinstance(status, int) and 400 <= status < 500 and status not in _RETRYABLE_STATUSES
+    return status if isinstance(status, int) else None
+
+
+class _TerminalRefusalGate:
+    """Короткий негативный кэш терминального отказа /embeddings.
+
+    При живом 402 каждый новый текст вопроса платил полный round-trip, да ещё и
+    под глобальным замком: отказ тарифа превращался в очередь всего процесса.
+    Пауза короче TTL мемо и обнуляется успешным ответом, поэтому «починенный»
+    тариф снова работает сам, без перезапуска.
+    """
+
+    def __init__(self, cooldown_seconds: float) -> None:
+        self._cooldown = max(float(cooldown_seconds), 0.0)
+        self._lock = threading.Lock()
+        self._blocked_until = 0.0
+        self._reason = ""
+
+    @property
+    def enabled(self) -> bool:
+        return self._cooldown > 0
+
+    def trip(self, error: BaseException) -> None:
+        if not self.enabled:
+            return
+        status = _status_code(error)
+        reason = (
+            f"HTTP {status}" if status is not None else type(error).__name__
+        )
+        with self._lock:
+            self._blocked_until = time.monotonic() + self._cooldown
+            self._reason = reason
+
+    def clear(self) -> None:
+        with self._lock:
+            self._blocked_until = 0.0
+            self._reason = ""
+
+    def remaining(self) -> float:
+        """Сколько ещё длится пауза; <= 0 — рубильник уже отпущен."""
+        with self._lock:
+            return self._blocked_until - time.monotonic()
+
+    def describe(self) -> str:
+        with self._lock:
+            return self._reason
 
 
 class EmbeddingClient(Protocol):
@@ -121,7 +172,8 @@ class GigaChatEmbeddingClient:
     TTL-мемоизация входа (повторный текст не идёт в сеть вообще) и бюджет
     ``gigachat_timeout_seconds`` на всю последовательность попыток — раньше четыре
     сетевые попытки с полным таймаутом и backoff 2+4+8 могли приковать замок на
-    минуты, заблокировав и вопрос аналитика, и индексацию.
+    минуты, заблокировав и вопрос аналитика, и индексацию. Замок теперь удерживается
+    только на время самой сетевой попытки: пауза backoff идёт вне его.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -150,6 +202,7 @@ class GigaChatEmbeddingClient:
             ttl_seconds=settings.embedding_cache_ttl_seconds,
             max_entries=_MEMO_MAX_ENTRIES,
         )
+        self._refusals = _TerminalRefusalGate(settings.embedding_refusal_cooldown_seconds)
         self._lock = threading.Lock()
 
     @property
@@ -203,49 +256,66 @@ class GigaChatEmbeddingClient:
         call_slice = self._retry_budget_seconds / _MAX_ATTEMPTS
         deadline = time.monotonic() + self._retry_budget_seconds
         last_error: Exception | None = None
-        with self._lock:
-            for attempt in range(_MAX_ATTEMPTS):
-                remaining = deadline - time.monotonic()
-                if attempt and remaining < call_slice:
-                    # Бюджета на полноценную попытку не осталось: честнее
-                    # деградировать сейчас, чем держать замок ещё один таймаут.
-                    break
-                try:
+        for attempt in range(_MAX_ATTEMPTS):
+            paused = self._refusals.remaining()
+            if paused > 0:
+                # Рубильник по терминальному отказу: новый текст не платит round-trip
+                # и не берёт замок, пока пауза не истекла.
+                raise EmbeddingError(
+                    f"Эмбеддинги недоступны: {self._refusals.describe()} "
+                    f"— повтор через {paused:.0f} с (лексическая ветка работает)"
+                )
+            remaining = deadline - time.monotonic()
+            if attempt and remaining < call_slice:
+                # Бюджета на полноценную попытку не осталось: честнее
+                # деградировать сейчас, чем держать замок ещё один таймаут.
+                break
+            try:
+                # Замок держит ровно одну сетевую попытку. Сон backoff — вне его:
+                # раньше одна цепочка повторов приковывала эмбеддинги всего процесса
+                # на 2+4+8 с, а вместе с ними и вопрос аналитика.
+                with self._lock:
                     response = self._client.embeddings(payload, model=self._model)
-                    ordered = sorted(response.data, key=lambda item: item.index)
-                    vectors = [[float(value) for value in item.embedding] for item in ordered]
-                    if not vectors:
-                        raise EmbeddingError("GigaChat вернул пустой список эмбеддингов")
-                    self._reconcile_dimensions(len(vectors[0]))
-                    return vectors
-                except (
-                    GigaChatException,
-                    EmbeddingError,
-                    httpx.HTTPError,
-                    OSError,
-                    ValueError,
-                ) as error:
-                    # Граница сети: наружу уходит только EmbeddingError, чтобы
-                    # отказ эмбеддингов деградировал векторную ветку, а не валил
-                    # индексацию целиком. Ошибка в мемо не попадает никогда.
-                    last_error = error
-                    if _refused_for_good(error) or attempt == _MAX_ATTEMPTS - 1:
-                        break
-                    pause = min(2.0 ** (attempt + 1), 8.0)
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    # Пауза отрезается остатком бюджета: сумма sleep + attempts
-                    # остаётся внутри gigachat_timeout_seconds.
-                    time.sleep(min(pause, remaining))
-            raise EmbeddingError(f"Эмбеддинги недоступны: {last_error}") from last_error
+                ordered = sorted(response.data, key=lambda item: item.index)
+                vectors = [[float(value) for value in item.embedding] for item in ordered]
+                if not vectors:
+                    raise EmbeddingError("GigaChat вернул пустой список эмбеддингов")
+                self._reconcile_dimensions(len(vectors[0]))
+                self._refusals.clear()
+                return vectors
+            except (
+                GigaChatException,
+                EmbeddingError,
+                httpx.HTTPError,
+                OSError,
+                ValueError,
+            ) as error:
+                # Граница сети: наружу уходит только EmbeddingError, чтобы
+                # отказ эмбеддингов деградировал векторную ветку, а не валил
+                # индексацию целиком. Ошибка в мемо не попадает никогда.
+                last_error = error
+                if _refused_for_good(error):
+                    # Приговор аккаунта повторяется на каждом тексте: фиксируем его
+                    # на короткую паузу вместо нового обращения к сети.
+                    self._refusals.trip(error)
+                    break
+                if attempt == _MAX_ATTEMPTS - 1:
+                    break
+                pause = min(2.0 ** (attempt + 1), 8.0)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Пауза отрезается остатком бюджета: сумма sleep + attempts
+                # остаётся внутри gigachat_timeout_seconds.
+                time.sleep(min(pause, remaining))
+        raise EmbeddingError(f"Эмбеддинги недоступны: {last_error}") from last_error
 
     def _reconcile_dimensions(self, actual: int) -> None:
         """Фиксирует фактическую размерность: маппинг ES создаётся по ней.
 
-        Вызывается только из ``_embed_uncached``, где замок уже удерживается;
-        ``threading.Lock`` не реентерабелен, повторный захват остановил бы
-        индексацию навсегда.
+        Повторный захват замка больше не нужен: запись целого ``int`` атомарна под
+        GIL, а гонка двух потоков может дать только одинаковое значение и лишнюю
+        строку в журнале — маппинг индекса от этого не разъезжается.
         """
         if actual != self._dimensions:
             logger.warning(

@@ -11,6 +11,10 @@ from scientific_tangle.domain.contracts import (
 )
 from scientific_tangle.domain.models import NumericObservation
 
+# Слово-маркер несопоставимой ячейки: у ``ComparisonCell`` нет флага, а врать про
+# единую единицу измерений матрица не вправе — интерфейс читает это как текст ячейки.
+INCOMPARABLE_MARKER = "единицы измерений различаются"
+
 
 class ComparisonService:
     """Строит матрицу сравнения сущностей по числовым свойствам с evidence."""
@@ -80,11 +84,32 @@ class ComparisonService:
             return ComparisonCell()
         # Первое совпадение прятало расхождение источников: в матрице оно обязано
         # быть видно, а не заменённым наиболее удачным числом.
-        distinct = list(dict.fromkeys(cls._format_value(obs) for _, obs in matches))
+        units = {obs.normalized_unit for _, obs in matches}
+        if len(units) == 1:
+            # Одно нормализованное измерение — значения сравнимы напрямую, и
+            # расхождение вида «70 и 70000» остаётся расхождением в тексте ячейки.
+            distinct = list(dict.fromkeys(cls._format_value(obs) for _, obs in matches))
+            unit = next(iter(units))
+            value = " / ".join(distinct)
+        else:
+            # Подписывать такую ячейку единицей первого совпадения — значит прятать
+            # расхождение в разы: «0.3» в g/L и «300» в mg/L это одно число, а
+            # «70» и «70000» в разных единицах — возможно, разные величины. Каждый
+            # источник показывается со СВОЕЙ единицей, а общая единица снимается,
+            # чтобы интерфейс не выдавал несопоставимое за сопоставленное.
+            distinct = list(
+                dict.fromkeys(
+                    f"{obs.value} {obs.unit} "
+                    f"({cls._format_value(obs)} {obs.normalized_unit})"
+                    for _, obs in matches
+                )
+            )
+            unit = None
+            value = f"{INCOMPARABLE_MARKER}: {' / '.join(distinct)}"
         best = max(matches, key=lambda item: item[0].confidence)[0]
         return ComparisonCell(
-            value=" / ".join(distinct),
-            unit=matches[0][1].normalized_unit,
+            value=value,
+            unit=unit,
             evidence=(best.evidence[0].quote if best.evidence else None),
             confidence=best.confidence,
         )

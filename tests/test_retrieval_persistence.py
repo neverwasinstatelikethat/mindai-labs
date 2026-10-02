@@ -9,11 +9,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -21,25 +23,34 @@ import pytest
 
 from scientific_tangle.config import Settings
 from scientific_tangle.domain.contracts import (
+    AnswerPayload,
     DocumentFragment,
     DocumentRequest,
     ExtractedClaim,
     ExtractedEntity,
     ExtractionResult,
     Finding,
+    GraphSnapshot,
     NodeType,
     RetrievalPlan,
 )
+from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import QueryPlan
+from scientific_tangle.services import durable_state as state_module
 from scientific_tangle.services import infrastructure
 from scientific_tangle.services import knowledge as knowledge_module
 from scientific_tangle.services.infrastructure import (
     CHUNK_INDEX,
+    FINDING_DOC_SCHEMA,
     FINDING_INDEX,
+    FINDING_INDICES,
     Neo4jElasticsearchKnowledgeBase,
+    _subject_filter_value,
 )
 from scientific_tangle.services.knowledge import (
+    CHUNK_MIN_CHARS,
     InMemoryKnowledgeBase,
+    NoChunksError,
     chunk_document,
     chunk_finding,
     stable_uuid,
@@ -102,6 +113,13 @@ class FakeDriver:
     graph_nodes: list[dict[str, Any]] = field(default_factory=list)
     graph_edges: list[dict[str, Any]] = field(default_factory=list)
     anchors: list[dict[str, Any]] = field(default_factory=list)
+    # Сколько совпадений действительно нашёл бы запрос: потолок якорей обязан
+    # называться вслух, и проверить это можно только по числу «всего», а не по
+    # длине возвращённого списка.
+    anchor_matched: int = 0
+    substring_anchors: list[dict[str, Any]] = field(default_factory=list)
+    substring_matched: int = 0
+    edges_matched: int = 0
     expanded: list[dict[str, Any]] = field(default_factory=list)
     traversed_edges: list[dict[str, Any]] = field(default_factory=list)
     document_exists: bool = False
@@ -127,16 +145,31 @@ class FakeDriver:
         if "collect(properties(node))" in query:
             return {"nodes": self.graph_nodes, "total": len(self.graph_nodes)}
         if "type(rel) <> 'HAS_CHUNK'" in query:
-            return {"edges": self.graph_edges}
+            return {
+                "edges": self.graph_edges,
+                "total": self.edges_matched or len(self.graph_edges),
+            }
+        # Точная ветка якорей проверяется раньше общей: оба запроса содержат
+        # ``MATCH (anchor:Entity)``, а различаются они именно способом совпадения.
+        if "anchor.label IN $labels" in query:
+            return {"nodes": self.anchors, "matched": self.anchor_matched or len(self.anchors)}
         if "MATCH (anchor:Entity)" in query:
-            return {"nodes": self.anchors}
+            return {
+                "nodes": self.substring_anchors,
+                "matched": self.substring_matched or len(self.substring_anchors),
+            }
         if "UNWIND $frontier AS fid" in query:
             return {"nodes": self.expanded, "reached": len(self.expanded)}
         if "UNWIND $ids AS id" in query:
-            return {"edges": self.traversed_edges}
+            return {"edges": self.traversed_edges, "matched": len(self.traversed_edges)}
         if "coalesce(d.semantic_extracted, false)" in query:
             if self.semantic_extracted:
                 return {"id": params["id"]}
+            return None
+        if "MERGE (d:Entity {id: $id})" in query and "d.type = 'publication'" in query:
+            # Как в реальном Neo4j: после структурного MERGE узел документа есть,
+            # и следующий поток обязан получить «duplicate», а не писать заново.
+            self.document_exists = True
             return None
         if "RETURN d.id AS id" in query:
             return {"id": params["id"]} if self.document_exists else None
@@ -151,6 +184,12 @@ class FakeDriver:
         if "RETURN count(n) AS count" in query:
             return {"count": 0}
         return None
+
+
+# Индексы, которые продукт вообще называет. Подделка проверяет по этому списку:
+# запрос с именем, собранным по одному символу из «a,b», на реальном кластере
+# читал бы и правил чужие данные, а молча проходит сквозь заглушку.
+KNOWN_INDICES = {FINDING_INDEX, CHUNK_INDEX, FINDING_INDICES}
 
 
 @dataclass
@@ -187,11 +226,25 @@ class FakeES:
     searches: list[dict[str, Any]] = field(default_factory=list)
     mgets: list[tuple[str, list[str]]] = field(default_factory=list)
     chunk_count: int = 0
+    # ``hits.total`` отдаётся только когда проверющий задал полное число: иначе
+    # старые проверки читают ровно то же, что читали до появления окна каталога.
+    total: int | None = None
+    # Имена индексов вне продуктового списка — сигнал о том, что код обратился не
+    # туда. Не чистится вместе с журналом запросов: обращение видно и на прогреве.
+    violations: list[str] = field(default_factory=list)
 
     def search(self, **kwargs: Any) -> dict[str, Any]:
         self.searches.append(kwargs)
         index = str(kwargs["index"])
-        return {"hits": {"hits": self.hits.get(index, [])}}
+        if index not in KNOWN_INDICES:
+            # Ошибку ловит сам продукт (отказ индекса — штатная деградация), поэтому
+            # нарушение ещё и записывается: проверка может требовать пустого списка.
+            self.violations.append(index)
+            raise AssertionError(f"Запрос к неизвестному индексу: {index!r}")
+        hits: dict[str, Any] = {"hits": self.hits.get(index, [])}
+        if self.total is not None:
+            hits["total"] = {"value": self.total, "relation": "eq"}
+        return {"hits": hits}
 
     def mget(self, index: str, ids: list[str]) -> dict[str, Any]:
         self.mgets.append((index, list(ids)))
@@ -225,13 +278,18 @@ class FakeHelpers:
     fail_indexes: set[str] = field(default_factory=set)
     scan_rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     bulks: list[list[dict[str, Any]]] = field(default_factory=list)
+    violations: list[str] = field(default_factory=list)
 
     def bulk(self, client: Any, actions: Any, **kwargs: Any) -> tuple[int, list[Any]]:
         payload = list(actions)
         self.bulks.append(payload)
         for action in payload:
-            if action.get("_index") in self.fail_indexes:
-                raise RuntimeError(f"Elasticsearch отверг запись в {action['_index']}")
+            index = str(action.get("_index"))
+            if index not in KNOWN_INDICES:
+                self.violations.append(index)
+                raise AssertionError(f"Запись в неизвестный индекс: {index!r}")
+            if index in self.fail_indexes:
+                raise RuntimeError(f"Elasticsearch отверг запись в {index}")
         return len(payload), []
 
     def scan(self, client: Any, index: str | None = None, **kwargs: Any) -> Any:
@@ -382,6 +440,24 @@ def structural_document(text: str = "", title: str = "Отчёт по обесс
     )
 
 
+def thin_document() -> DocumentRequest:
+    """Файл, который парсер пропускает, а чанкинг не порождает: 30 символов текста.
+
+    Порог разбора — 20 символов суммарного текста, порог куска — 40. Документ из
+    одного короткого фрагмента проходит в ``index_document`` и раньше возвращал
+    ``created`` при нуле чанков.
+    """
+    body = "Песок 0,2 мм по гранулометрии."
+    assert CHUNK_MIN_CHARS > len(body) >= 20
+    return DocumentRequest(
+        title="Заметка лаборатории",
+        text=body,
+        year=2021,
+        geography="Мурманская область",
+        fragments=[DocumentFragment(text=body, page=1)],
+    )
+
+
 def query_plan(question: str = "обессоливание шахтных вод") -> QueryPlan:
     return QueryPlan(question=question, language="ru", mode="hybrid")
 
@@ -454,6 +530,49 @@ def test_neo4j_index_document_publishes_chunks_to_index_and_catalog(
     # Чанк живёт в CHUNK_INDEX: в индекс находок он не пишется и не должен там
     # появляться пустой копией.
     assert harness.helpers.actions(FINDING_INDEX) == []
+
+
+def test_memory_structural_import_refuses_document_without_chunks() -> None:
+    """Импорт без чанков — отказ с причиной, а не «создано».
+
+    Иначе файл считается покрытым (статистика корпуса, ``created`` в отчёте
+    компиляции), но в окне поиска его нет: аналитик получает «в корпусе такого
+    нет» на собственный текст.
+    """
+    knowledge = InMemoryKnowledgeBase()
+    # Каталог memory-бэкенда стартует с демо-сеятелем: сравнивать надо с собой
+    # до импорта, а не с пустотой.
+    before = {finding.id for finding in knowledge.all_findings()}
+
+    with pytest.raises(NoChunksError):
+        knowledge.index_document(thin_document(), "/data/sources/note.docx")
+
+    assert {finding.id for finding in knowledge.all_findings()} == before
+    # Отказ не должен отравлять хранилище: следующий нормальный документ импортируется.
+    receipt = knowledge.index_document(structural_document(), "/data/sources/pilot.docx")
+    assert receipt.status == "created"
+    assert receipt.chunks > 0
+
+
+def test_neo4j_structural_import_refuses_document_without_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_backend(monkeypatch)
+    before = {finding.id for finding in harness.knowledge.all_findings()}
+
+    with pytest.raises(NoChunksError):
+        harness.knowledge.index_document(thin_document(), "/data/sources/note.docx")
+
+    # Ни записей в индексе, ни узлов в графе: пустой импорт не оставляет узла
+    # документа, который статистика посчитала бы покрытием. В драйвере остаётся
+    # только чтение дедуп-проверки.
+    written = "\n".join(
+        str(item[0] if isinstance(item, tuple) else item)
+        for item in harness.driver.queries
+    )
+    assert "MERGE" not in written.upper()
+    assert harness.helpers.actions(CHUNK_INDEX) == []
+    assert {finding.id for finding in harness.knowledge.all_findings()} == before
 
 
 def test_neo4j_restores_chunks_from_index_after_restart(
@@ -913,8 +1032,113 @@ def test_schema_creates_only_indexes_used_by_queries(
     assert any("CREATE CONSTRAINT entity_id" in query for query in schema)
     assert any("REQUIRE n.id IS UNIQUE" in query for query in schema)
     assert any("CREATE INDEX entity_type" in query for query in schema)
-    # Создание убрано, но в уже поднятой базе индекс остаётся: он снимается явно.
-    assert any("DROP INDEX entity_label IF EXISTS" in query for query in schema)
+    # Индекс по метке создаётся ровно потому, что точная ветка подбора якорей
+    # (`anchor.label IN $labels`) его читает: «индекс, который никто не запрашивает»
+    # — это расходы на запись и ложное впечатление настроенного поиска.
+    assert any("CREATE INDEX entity_label" in query for query in schema)
+    assert any("ON (n.label)" in query for query in schema)
+    assert not [query for query in schema if query.strip().startswith("DROP")]
+
+
+def test_anchor_lookup_prefers_indexed_exact_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Точное совпадение метки закрывает якоря без поиска подстрокой.
+
+    Подстрока (`CONTAINS`) не обслуживается ни одним индексом Neo4j, поэтому она
+    идёт второй веткой и только когда точных совпадений не хватило до потолка.
+    """
+    harness = build_backend(monkeypatch)
+    # Ровно потолок MAX_ANCHORS точных совпадений: только в этом случае запасная
+    # ветка поиска подстрокой не нужна по построению обхода.
+    harness.driver.anchors = [neo_node(f"n-{index}", f"Метка {index}") for index in range(5)]
+
+    nodes, notes = harness.knowledge._traverse(
+        retrieval_plan("обратный осмос", use_local_graph=True), None
+    )
+
+    exact = harness.driver.issued_containing("anchor.label IN $labels")
+    substring = harness.driver.issued_containing("toLower(anchor.label) CONTAINS")
+    assert exact and len(nodes.nodes) == 5
+    assert substring == [], "поиск подстрокой не нужен, когда точных якорей хватило до потолка"
+    assert notes == []
+
+
+def test_anchor_truncation_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Потолок MAX_ANCHORS называется вслух: часть якорей — потерянные связи."""
+    harness = build_backend(monkeypatch)
+    harness.driver.anchors = [neo_node("n-1", "Обратный осмос")]
+    harness.driver.anchor_matched = 40
+
+    _, notes = harness.knowledge._traverse(
+        retrieval_plan("обратный осмос", use_local_graph=True), None
+    )
+
+    assert any("MAX_ANCHORS" in note and "40" in note for note in notes)
+
+
+def test_full_graph_edge_ceiling_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Рёбра полного снимка ограничены потолком, и достижение его видно в ответе.
+
+    Узлы были ограничены 600 с честной заметкой; рёбра читались «сколько есть».
+    Проверка держит обе пары: потолок не должен отменить прежнюю честность.
+    """
+    harness = build_backend(monkeypatch, graph_nodes=[neo_node("n-1", "Обратный осмос")])
+    harness.driver.graph_edges = [
+        {
+            "id": f"e-{index}",
+            "source": "n-1",
+            "target": "n-1",
+            "relation": "CONTAINS",
+            "confidence": 0.9,
+            "data_class": "public",
+        }
+        for index in range(3)
+    ]
+    harness.driver.edges_matched = 5000
+
+    harness.knowledge.full_graph()
+    notes = harness.knowledge._graph_window_notes()
+
+    assert any("GRAPH_EDGE_LIMIT" in note and "5000" in note for note in notes)
+    context = harness.knowledge.retrieve(query_plan(), retrieval_plan("обратный осмос"))
+    assert any("GRAPH_EDGE_LIMIT" in reason for reason in context.degradation_reasons)
+
+
+def test_full_graph_note_names_nodes_the_traversal_actually_sees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Раскрытие обязано называть узлы обхода, а не размер сырого среза.
+
+    Живой замер 2026-10-02 (`.agents/graph-ceiling-probe.py`, 1501 узел на
+    одноразовом контуре): потолок срезал 600, а фильтр связности оставил 120 —
+    заметка при этом говорила «600 из 1501», то есть недооценивала потерю в пять раз
+    ровно там, где её надо назвать.
+    """
+    harness = build_backend(
+        monkeypatch,
+        graph_nodes=[
+            neo_node("n-1", "Обратный осмос"),
+            neo_node("n-2", "Шахтная вода"),
+            neo_node("n-3", "Сульфаты"),
+        ],
+    )
+    harness.driver.graph_edges = [
+        {
+            "id": "e-1",
+            "source": "n-1",
+            "target": "n-2",
+            "relation": "CONTAINS",
+            "confidence": 0.9,
+            "data_class": "public",
+        }
+    ]
+
+    snapshot = harness.knowledge.full_graph()
+    notes = harness.knowledge._graph_window_notes()
+
+    # Третий узел не связан — обход его не видит.
+    assert {node.id for node in snapshot.nodes} == {"n-1", "n-2"}
+    assert any("узлов 2 из 3" in note for note in notes), notes
+
 
 
 # ── 5. ``use_global_context`` и ``semantic_query`` влияют на результат ──────
@@ -1032,3 +1256,528 @@ def test_chunk_id_and_locator_are_computed_once_for_both_backends() -> None:
     assert finding.evidence[0].char_start == 0
     assert finding.evidence[0].char_end == len(pieces[0].text[:1200])
     assert finding.scope == {SCOPE_YEAR: "2019", SCOPE_GEOGRAPHY: "Мурманская область"}
+
+
+# ─ 6. Каталог читается окном, а не целиком (узкое место 4) ─────────────────
+
+
+def test_neo4j_findings_window_pushes_filters_into_the_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Фильтры списка уходят предикатами запроса, а не вырезаются из окна.
+
+    Маршруты ``/findings`` и ``/conflicts`` читают окно хранилища, поэтому
+    ``status`` и ``subject`` обязан исполнять индекс. Субъект ищется подстрокой без
+    регистра — в точности как in-memory-отбор, иначе два контура начали бы отвечать
+    на один и тот же фильтр по-разному.
+    """
+    harness = build_backend(monkeypatch)
+    harness.es.hits = {FINDING_INDICES: []}
+
+    harness.knowledge.findings_window(limit=5, offset=0, status="disputed", subject="обесс*")
+
+    filters = harness.es.searches[-1]["query"]["bool"]["filter"]
+    assert {"term": {"status": "disputed"}} in filters
+    wildcard = next(item["wildcard"]["subject"] for item in filters if "wildcard" in item)
+    # Маски из строки пользователя экранируются: «обесс*» — буквальные символы.
+    assert wildcard["value"] == "*обесс\\**"
+    assert wildcard["case_insensitive"] is True
+
+
+def test_subject_filter_ignores_case_on_both_sides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Регистр строки отбора не должен решать, найдёт ли индекс русскую запись.
+
+    `case_insensitive` у wildcard по keyword в Elasticsearch складывается по ASCII:
+    на живом контуре «*Мембрана*» находило записи, а «*мемб*» — ноль, то есть
+    фильтр аналитика на кириллице молча терял находки. Поэтому регистр снимается
+    и в строке запроса, и в записываемом поле отбора (`_subject_filter_value`),
+    а не оставляется анализатору.
+    """
+    harness = build_backend(monkeypatch)
+    harness.es.hits = {FINDING_INDICES: []}
+
+    harness.knowledge.findings_window(limit=5, subject="ОбЕсс")
+
+    filters = harness.es.searches[-1]["query"]["bool"]["filter"]
+    wildcard = next(item["wildcard"]["subject"] for item in filters if "wildcard" in item)
+    assert wildcard["value"] == "*обесс*"
+    assert _subject_filter_value("Мембрана обратного осмоса") == "мембрана обратного осмоса"
+    assert _subject_filter_value(None) == ""
+
+
+def test_memory_findings_window_applies_the_same_filters() -> None:
+    """In-memory-контур отвечает на те же фильтры тем же набором находок."""
+    knowledge = InMemoryKnowledgeBase()
+    first = make_finding("f-a", "Задержание солей 97 процентов.").model_copy(
+        update={"status": "disputed"}
+    )
+    second = make_finding("f-b", "Сухой остаток 800 мг/л.").model_copy(
+        update={"subject": "Обессоливание"}
+    )
+    knowledge._findings.update({first.id: first, second.id: second})
+
+    disputed = knowledge.findings_window(status="disputed")
+    obess = knowledge.findings_window(subject="обесс")
+
+    # Срез seed-каталога в in-memory контуре намеренно остаётся в выдаче, поэтому
+    # проверяется предикат, а не состав списка целиком.
+    assert first.id in [finding.id for finding in disputed.findings]
+    assert second.id not in [finding.id for finding in disputed.findings]
+    assert all(finding.status == "disputed" for finding in disputed.findings)
+    assert second.id in [finding.id for finding in obess.findings]
+    assert all("обесс" in (finding.subject or "").lower() for finding in obess.findings)
+    both = knowledge.findings_window(status="disputed", subject="обесс")
+    assert all(
+        finding.status == "disputed" and "обесс" in (finding.subject or "").lower()
+        for finding in both.findings
+    )
+
+
+def test_neo4j_findings_window_reads_the_page_from_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Страница каталога приходит из Elasticsearch запросом с окном и сортировкой.
+
+    Прежний путь отдавал списку маршруту глубокие копии всего RAM-каталога, а сам
+    каталог поднимался из индексов целиком. Здесь проверяется именно окно: смещение
+    и размер уходят в запрос, порядок задан детерминированно, а наружу копируется
+    страница.
+    """
+    first = make_finding("f-a", "Задержание солей 97 процентов.")
+    harness = build_backend(monkeypatch)
+    harness.es.hits = {FINDING_INDICES: [{"_id": first.id, "_source": as_source(first)}]}
+    harness.es.total = 137
+
+    window = harness.knowledge.findings_window(limit=1, offset=2)
+    call = harness.es.searches[-1]
+
+    assert call["index"] == FINDING_INDICES
+    assert call["size"] == 1 and call["from_"] == 2
+    assert call["sort"] == [{"_seq_no": {"order": "asc"}}]
+    assert {"exists": {"field": "superseded_by"}} in call["query"]["bool"]["must_not"]
+    assert {"term": {"scope.origin": "demo"}} in call["query"]["bool"]["must_not"]
+    assert [finding.id for finding in window.findings] == [first.id]
+    assert (window.offset, window.limit, window.total) == (2, 1, 137)
+    assert window.findings[0] is not first
+
+
+def test_neo4j_findings_window_applies_access_class_and_reports_short_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Окно не отдаёт то, что скрыто политикой, и честно говорит о длине страницы.
+
+    Заменённая версия и демо-контент могут лежать в индексах, проиндексированных
+    до появления фильтруемых полей, — тогда их снимает процесс, и страница
+    обязана назвать причину, а не выглядеть молча короткой.
+    """
+    public = make_finding("f-public", "Задержание солей 97 процентов.")
+    restricted = make_finding("f-secret", "Энергия в 3–5 раз выше.")
+    restricted = restricted.model_copy(update={"data_class": DataClass.RESTRICTED})
+    replaced = make_finding("f-old", "Прежняя версия тезиса.").model_copy(
+        update={"superseded_by": "f-new"}
+    )
+    harness = build_backend(monkeypatch)
+    harness.es.hits = {
+        FINDING_INDICES: [
+            {"_id": public.id, "_source": as_source(public)},
+            {"_id": restricted.id, "_source": as_source(restricted)},
+            {"_id": replaced.id, "_source": as_source(replaced)},
+        ]
+    }
+    harness.es.total = 3
+
+    window = harness.knowledge.findings_window(limit=3, offset=0)
+
+    assert [finding.id for finding in window.findings] == [public.id, restricted.id]
+    assert window.total == 3
+    assert window.note and "limit" in window.note
+    # Класс доступа проверяется и на стороне процесса: hidden-класс не имеет права
+    # просочиться в окно, если индекс его не отфильтровал.
+    hidden = harness.knowledge.findings_window(
+        limit=3, offset=0, allowed_data_classes={DataClass.RESTRICTED}
+    )
+    assert [finding.id for finding in hidden.findings] == [restricted.id]
+    empty = harness.knowledge.findings_window(limit=3, offset=0, allowed_data_classes=set())
+    assert empty.findings == []
+
+
+def test_legacy_index_docs_get_window_filters_backfilled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Старые записи volume добирают поля, которыми окно режет выдачу.
+
+    Индексы, созданные до появления ``scope``/``superseded_by``, этих полей не
+    содержат: запрос окна не может отсечь демо-запись, первая страница пустеет
+    (запись снимается только на стороне процесса), а полное число считается по
+    предикату индекса — завышенно. Правка точечная: служебные поля, без текста и
+    без вектора, и только по продуктовым индексам.
+    """
+    demo = make_finding("f-demo", "Обратный осмос обеспечивает удаление солей.")
+    demo = demo.model_copy(
+        update={"scope": {**demo.scope, "origin": "demo"}, "subject": "Обессоливание шахтной воды"}
+    )
+    replaced = make_finding("f-old", "Прежняя версия тезиса.").model_copy(
+        update={"superseded_by": "f-new"}
+    )
+    plain = make_finding("f-plain", "Сухой остаток 800 мг/л.").model_copy(update={"scope": {}})
+    harness = build_backend(monkeypatch)
+    harness.es.hits = {
+        FINDING_INDEX: [as_hit(demo), as_hit(replaced), as_hit(plain)],
+    }
+    harness.helpers.reset()
+
+    harness.knowledge._backfill_window_filters()
+
+    actions = {action["_id"]: action for action in harness.helpers.actions(FINDING_INDEX)}
+    # Метка формы документа ставится всем старым записям: иначе выборка «кого
+    # чинить» на каждом старте совпадала бы с частично дописанными полями.
+    assert set(actions) == {demo.id, replaced.id, plain.id}
+    assert actions[demo.id]["_op_type"] == "update"
+    assert actions[demo.id]["doc"]["scope"] == {
+        "geography": "Мурманская область",
+        "year": "2019",
+        "origin": "demo",
+    }
+    assert actions[replaced.id]["doc"]["superseded_by"] == "f-new"
+    # Поле отбора по субъекту дописывается уже в нижнем регистре: регистр
+    # сохраняется в `finding_json`, а фильтр обязан находить русскую строку.
+    assert actions[demo.id]["doc"]["subject"] == "обессоливание шахтной воды"
+    # У записи без размеченных условий поля отсечения не появляются — но статус и
+    # метка формы дописываются, и субъект фильтрации тоже.
+    assert "scope" not in actions[plain.id]["doc"]
+    assert actions[plain.id]["doc"]["status"] == plain.status
+    assert all(
+        action["doc"]["schema"] == infrastructure.FINDING_DOC_SCHEMA
+        for action in actions.values()
+    )
+    # Выборка «кого чинить» — по метке формы, а не по её отсутствию: `term` не
+    # совпадает и с записью без поля, поэтому одна клазура покрывает и совсем
+    # старые записи, и записи предыдущей формы. Правка по `exists: schema` не
+    # трогала ни одной записи со старой меткой, и поднятие `FINDING_DOC_SCHEMA`
+    # не мигрировало ничего (проверено живым прогоном на одноразовом контуре:
+    # окно по «мемб» = 0 против 4 в каталоге до правки предиката).
+    assert [call["query"] for call in harness.es.searches] == [
+        {"bool": {"must_not": [{"term": {"schema": FINDING_DOC_SCHEMA}}]}}
+    ] * 2
+    assert harness.es.violations == []
+    assert harness.helpers.violations == []
+
+
+def test_neo4j_findings_window_falls_back_to_catalog_on_index_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Отказ индекса — деградация с причиной, а не пустой список находок."""
+    harness = build_backend(monkeypatch)
+    stored = make_finding("f-catalog", "Сухой остаток 800 мг/л.")
+    harness.knowledge._merge_findings([stored])
+
+    def broken(**kwargs: Any) -> dict[str, Any]:
+        harness.es.searches.append(kwargs)
+        raise ConnectionError("Elasticsearch недоступен")
+
+    monkeypatch.setattr(harness.es, "search", broken)
+
+    window = harness.knowledge.findings_window(limit=10, offset=0)
+
+    assert window.note and "Elasticsearch недоступен" in window.note
+    assert stored.id in [finding.id for finding in window.findings]
+
+
+def test_memory_findings_window_pages_and_copies_only_the_page() -> None:
+    """Окно memory-контура: тот же контракт, копия — только у возвращаемой страницы."""
+    knowledge = InMemoryKnowledgeBase()
+    knowledge.index_document(structural_document(), "/data/sources/pilot.xlsx")
+    everything = sorted(finding.id for finding in knowledge.all_findings())
+
+    window = knowledge.findings_window(limit=2, offset=1)
+
+    assert window.total == len(everything) > 2
+    assert [finding.id for finding in window.findings] == everything[1:3]
+    for finding in window.findings:
+        assert finding is not knowledge._findings[finding.id]
+    finding = window.findings[0]
+    finding.statement = "переписанный в окне тезис"
+    assert knowledge._findings[finding.id].statement != "переписанный в окне тезис"
+
+    # Ноль и отрицательное смещение не читают «сколько повезёт».
+    clamped = knowledge.findings_window(limit=0, offset=-5)
+    assert (clamped.limit, clamped.offset) == (1, 0)
+    assert knowledge.findings_window(limit=10 ** 6).limit == knowledge_module.FINDINGS_WINDOW_MAX
+
+
+# ─ 7. Гонки и производные кэши на обеих ветках ─────────────────────────────
+
+
+def test_memory_write_drops_the_llm_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Memory-контур обязан снимать кэш structured output так же, как рабочий.
+
+    Иначе в тестовом и локальном запуске закэшированный ответ модели переживает
+    импорт документа, и проверка «ответ изменился после правки источника»
+    расходится с поведением neo4j-контура.
+    """
+    from scientific_tangle.services import provider
+
+    spy: list[int] = []
+    original = provider.invalidate_llm_cache
+
+    def counted() -> None:
+        spy.append(1)
+        original()
+
+    monkeypatch.setattr(provider, "invalidate_llm_cache", counted)
+    monkeypatch.setattr(
+        provider, "_llm_cache", OrderedDict({"тест-ключ": ('{"ok": true}', time.monotonic() + 600)})
+    )
+
+    knowledge = InMemoryKnowledgeBase()
+    knowledge.index_document(structural_document(), "/data/sources/pilot.docx")
+
+    assert spy and len(provider._llm_cache) == 0  # noqa: SLF001 - подменённый кэш самого модуля
+
+
+# ─ 8. Серверное состояние: потолок на аккаунт и очистка чекпоинтов ─────────
+
+
+def stored_answer(seed: int) -> AnswerPayload:
+    """Минимальный payload для проверок буферизации: содержимое не важно, важен id."""
+    question = f"Вопрос номер {seed}"
+    return AnswerPayload(
+        query_id=UUID(int=seed + 1),
+        question=question,
+        summary="Проверка потолка серверных копий.",
+        query_plan=QueryPlan(question=question, language="ru", mode="hybrid"),
+        findings=[],
+        conflicts=[],
+        knowledge_gaps=[],
+        recommendations=[],
+        graph=GraphSnapshot(nodes=[], edges=[], communities=[]),
+        trace=[],
+        confidence=0.8,
+        model_mode="scripted",
+    )
+
+
+def test_in_memory_answer_ceiling_is_per_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Чужая активность не съедает историю аналитика: потолок считается на владельца.
+
+    Прежний общий лимит в 200 копий на весь сервис означал 404 на экспорте
+    собственного ответа при ~20 активных пользователях.
+    """
+    monkeypatch.setattr(state_module, "MAX_STORED_ANSWERS", 2)
+    state = state_module.InMemoryDurableState()
+
+    async def scenario() -> None:
+        for index in range(5):
+            await state.put_answer(stored_answer(index), owner_id="analyst-a")
+        for index in range(5, 9):
+            await state.put_answer(stored_answer(index), owner_id="analyst-b")
+        kept_a = [
+            await state.get_answer(str(UUID(int=index + 1))) is not None for index in range(5)
+        ]
+        kept_b = [
+            await state.get_answer(str(UUID(int=index + 1))) is not None for index in range(5, 9)
+        ]
+        return kept_a, kept_b
+
+    kept_a, kept_b = asyncio.run(scenario())
+
+    assert kept_a == [False, False, False, True, True]
+    assert kept_b == [False, False, True, True]
+    assert len(state._answers) == 4  # noqa: SLF001 - проверка размера журнала
+
+
+def test_in_memory_total_ceiling_still_bounds_the_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Общий предохранитель остаётся: журнал не растётся числом учётных записей."""
+    monkeypatch.setattr(state_module, "MAX_STORED_ANSWERS", 50)
+    monkeypatch.setattr(state_module, "MAX_STORED_ANSWERS_TOTAL", 3)
+    state = state_module.InMemoryDurableState()
+
+    async def scenario() -> list[str]:
+        for index in range(8):
+            await state.put_answer(stored_answer(index), owner_id=f"analyst-{index}")
+        return [item.owner_id for item in state._answers.values()]  # noqa: SLF001
+
+    owners = asyncio.run(scenario())
+
+    assert len(owners) == 3
+    # Вытесняется самое давнее обращение — то есть страдают первые записи, а не
+    # последние, которые читатель держит открытыми.
+    assert owners == ["analyst-5", "analyst-6", "analyst-7"]
+
+
+def test_recently_read_answer_survives_the_trim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ответ, перечитанный секунду назад, не вытесняется следующим же ответом.
+
+    Проверка закрывает исходный дефект: аналитик жмёт «экспорт» по старому
+    запросу, а trim снимает именно его копию как старейшую вставленную.
+    """
+    monkeypatch.setattr(state_module, "MAX_STORED_ANSWERS", 2)
+    state = state_module.InMemoryDurableState()
+
+    async def scenario() -> tuple[bool, bool]:
+        await state.put_answer(stored_answer(1), owner_id="a")
+        await state.put_answer(stored_answer(2), owner_id="a")
+        # Перечитали самый старый: он перестаёт быть кандидатом на вытеснение.
+        assert await state.get_answer(str(UUID(int=2))) is not None
+        await state.put_answer(stored_answer(3), owner_id="a")
+        return (
+            await state.get_answer(str(UUID(int=2))) is not None,
+            await state.get_answer(str(UUID(int=3))) is None,
+        )
+
+    survived, evicted = asyncio.run(scenario())
+
+    assert survived, "перечитанный ответ обязан пережить trim"
+    assert evicted, "вытеснить надо самое давнее обращение"
+
+
+def test_postgres_answer_trim_is_scoped_to_the_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Рабочая ветка: SQL вытеснения идёт по владельцу, а не по таблице целиком."""
+    state = state_module.PostgresDurableState(Settings(accounts_backend="memory"))
+    statements: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fake_execute(query: str, params: Any = ()) -> int:
+        statements.append(("write", query, tuple(params or ())))
+        return 0
+
+    async def fake_fetchone(query: str, params: Any = ()) -> dict[str, Any] | None:
+        statements.append(("read", query, tuple(params or ())))
+        if query.lstrip().startswith("SELECT query_id, owner_id"):
+            now = datetime.now(UTC)
+            return {
+                "query_id": "q-1",
+                "owner_id": "analyst-a",
+                "answer_json": stored_answer(1).model_dump_json(),
+                "created_at": now,
+                "expires_at": now + timedelta(hours=1),
+            }
+        return None
+
+    state._execute = fake_execute  # type: ignore[assignment]
+    state._fetchone = fake_fetchone  # type: ignore[assignment]
+
+    async def scenario() -> None:
+        await state.put_answer(stored_answer(1), owner_id="analyst-a")
+        await state.get_answer("q-1")
+
+    asyncio.run(scenario())
+
+    trims = [item for item in statements if "PARTITION BY owner_id" in item[1]]
+    assert trims and trims[0][2][0] == "analyst-a"
+    assert trims[0][2][1] == state_module.MAX_STORED_ANSWERS
+    global_trims = [
+        item
+        for item in statements
+        if "DELETE FROM nk_answers WHERE" in item[1]
+        and "NOT IN" in item[1]
+        and "ORDER BY created_at" in item[1]
+    ]
+    assert not global_trims, (
+        "глобальный trim по дате вставки больше не снимает чужие ответы"
+    )
+    touches = [item for item in statements if "SET last_accessed_at" in item[1]]
+    assert touches and touches[0][2][1] == "q-1"
+
+
+def test_in_memory_checkpoint_purge_reports_nothing_to_clean() -> None:
+    """Память честно говорит, что чекпоинтов у неё нет, вместо AttributeError."""
+    state = state_module.InMemoryDurableState()
+
+    async def scenario() -> state_module.CheckpointPurgeReport:
+        return await state.purge_stale_checkpoint_threads()
+
+    report = asyncio.run(scenario())
+
+    assert report.removed_threads == 0 and report.skipped_reason
+
+
+def test_postgres_checkpoint_purge_touches_only_stale_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Удаление по тредам, чей ПОСЛЕДНИЙ чекпоинт старше срока, и по дочерним таблицам.
+
+    Свежий тред (в том числе упавший на середине прогона час назад) удалён быть не
+    может: порог считан по ``max(ts)`` группы, а не по отдельной записи.
+    """
+    state = state_module.PostgresDurableState(Settings(accounts_backend="memory"))
+    statements: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fake_execute(query: str, params: Any = ()) -> int:
+        statements.append((query, tuple(params or ())))
+        return 2
+
+    async def fake_fetchall(query: str, params: Any = ()) -> list[dict[str, Any]]:
+        statements.append((query, tuple(params or ())))
+        return [{"thread_id": "thread-stale", "last_seen": None}]
+
+    async def fake_fetchone(query: str, params: Any = ()) -> dict[str, Any] | None:
+        statements.append((query, tuple(params or ())))
+        return {"table_name": "checkpoints"}
+
+    state._execute = fake_execute  # type: ignore[assignment]
+    state._fetchall = fake_fetchall  # type: ignore[assignment]
+    state._fetchone = fake_fetchone  # type: ignore[assignment]
+
+    async def scenario() -> state_module.CheckpointPurgeReport:
+        return await state.purge_stale_checkpoint_threads(older_than=timedelta(days=7))
+
+    report = asyncio.run(scenario())
+
+    assert (report.removed_threads, report.removed_rows) == (1, 6)
+    joined = " ".join(query for query, _ in statements)
+    assert "max((checkpoint->>'ts')::timestamptz) < %s" in joined
+    assert "DELETE FROM checkpoint_writes WHERE thread_id = ANY(%s)" in joined
+    assert "DELETE FROM checkpoint_blobs WHERE thread_id = ANY(%s)" in joined
+    assert "DELETE FROM checkpoints WHERE thread_id = ANY(%s)" in joined
+    # Дочерние таблицы снимаются раньше самого треда.
+    order = [index for index, (query, _) in enumerate(statements) if query.startswith("DELETE")]
+    writes = next(
+        index for index, (query, _) in enumerate(statements) if "checkpoint_writes" in query
+    )
+    deleted = next(
+        index
+        for index, (query, _) in enumerate(statements)
+        if query.startswith("DELETE FROM checkpoints")
+    )
+    assert writes < deleted and len(order) == 3
+
+
+def test_checkpoint_cleanup_loop_survives_a_failed_wave() -> None:
+    """Волна очистки не должна ронять планировщик: следующий цикл по расписанию."""
+    calls: list[timedelta] = []
+
+    class FailingState:
+        async def purge_stale_checkpoint_threads(
+            self, *, older_than: timedelta, batch_threads: int
+        ) -> state_module.CheckpointPurgeReport:
+            del batch_threads
+            calls.append(older_than)
+            raise ConnectionError("база не ответила")
+
+    async def scenario() -> bool:
+        task = asyncio.create_task(
+            state_module.run_checkpoint_cleanup(
+                FailingState(),  # type: ignore[arg-type]
+                interval_seconds=1.0,
+                older_than=timedelta(days=3),
+            )
+        )
+        await asyncio.sleep(1.3)
+        alive = not task.done()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return alive
+
+    alive = asyncio.run(scenario())
+
+    assert alive, "после сбоя цикл обязан остаться живым"
+

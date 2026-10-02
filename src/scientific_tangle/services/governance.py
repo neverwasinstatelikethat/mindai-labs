@@ -166,7 +166,14 @@ class AccessPolicyEngine:
             and edge.source in visible
             and edge.target in visible
         ]
-        return GraphSnapshot(nodes=nodes, edges=edges, communities=graph.communities)
+        # Список сообществ возвращается новым контейнером: узлы и рёбра срез
+        # собирает заново, а ``communities`` — единственное поле, которое иначе
+        # досталось бы вызывающей стороне от снимка из общего кэша хранилища.
+        # Копия здесь явная, а не «наследуются от валидации pydantic»: правка
+        # returned-списка (редьюсер графа, профиль сообщества) не должна
+        # доходить до кэша, и гарантия не должна зависеть от того, копирует ли
+        # модель списки при конструировании.
+        return GraphSnapshot(nodes=nodes, edges=edges, communities=list(graph.communities))
 
     @classmethod
     def apply_acl(cls, answer: AnswerPayload, allowed: Container[DataClass]) -> AnswerPayload:

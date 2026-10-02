@@ -43,6 +43,10 @@ services:
       AGENT_MAX_REVISIONS: ${AGENT_MAX_REVISIONS:-1}
       CONTEXT_TOKEN_BUDGET: ${CONTEXT_TOKEN_BUDGET:-5120}
       AGENT_MAX_CONCURRENT_RUNS: ${AGENT_MAX_CONCURRENT_RUNS:-4}
+      # Размер пула блокирующих чтений хранилища: без него to_thread берёт
+      # default executor цикла, посчитанный от ядер хоста, а не от ёмкости
+      # контейнера, и медленный обход графа тормозит списки находок.
+      STORAGE_THREAD_POOL_SIZE: ${STORAGE_THREAD_POOL_SIZE:-16}
       LLM_CACHE_TTL_SECONDS: ${LLM_CACHE_TTL_SECONDS:-900}
       # Пусто = /metrics открыт (локальный контур); задано — Prometheus обязан
       # присылать Bearer, потому что метрики называют содержимое корпуса.
