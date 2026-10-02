@@ -1,0 +1,66 @@
+# Одноразовый контур боевых тестов хранилищ.
+#
+# Зачем: `tests/test_live_stores.py` исполняет оконные чтения и Cypher-обход
+# настоящими драйверами, но ветка записи (`LIVE_SEED=throwaway`) требует пустого
+# хранилища — у storage-слоя нет пространства имён на прогон, а удаления документа
+# в продукте нет. Засевать боевой volume аналитиков нечем откатывать, поэтому
+# запись разрешена только сюда: свои volumes, свои порты, к боевому контуру это
+# файл не имеет отношения.
+#
+# Запуск (порты выбраны непересекающимися с `compose.yaml`: bolt 44917 и ES 42733
+# заняты рабочим контуром):
+#
+#   docker compose -f compose.live-test.yaml up -d
+#   docker compose -f compose.live-test.yaml ps        # дождаться healthy
+#   LIVE_NEO4J_URI=bolt://127.0.0.1:45917 \
+#   LIVE_NEO4J_PASSWORD=live-test-password \
+#   LIVE_ELASTICSEARCH_URL=http://127.0.0.1:43733 \
+#   LIVE_SEED=throwaway pytest tests/test_live_stores.py
+#   docker compose -f compose.live-test.yaml down -v   # volumes одноразовые
+#
+# Пароль здесь не секрет: он у локального контейнера с пустым volume, который
+# удаляется вместе с контуром. Боевые учётные данные в этот файл не попадают.
+name: mindai-live-test
+
+services:
+  neo4j:
+    image: neo4j:5.26.8-community
+    stop_grace_period: 20s
+    environment:
+      NEO4J_AUTH: neo4j/live-test-password
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    ports: ["127.0.0.1:45917:7687"]
+    volumes: ["live_test_neo4j:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p live-test-password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.6
+    stop_grace_period: 20s
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms768m -Xmx768m
+    ports: ["127.0.0.1:43733:9200"]
+    volumes: ["live_test_elastic:/usr/share/elasticsearch/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 1536M }
+
+volumes:
+  live_test_neo4j:
+  live_test_elastic:
