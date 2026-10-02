@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/state';
   import { session } from '$lib/sessionStore.svelte';
-  import { ApiError } from '$lib/api';
+  import { api, ApiError } from '$lib/api';
   import Button from '$lib/ui/Button.svelte';
   import Field from '$lib/ui/Field.svelte';
   import Notice from '$lib/ui/Notice.svelte';
@@ -38,6 +39,23 @@
   let taken = $state(false);
   let busy = $state(false);
 
+  // Сервис может работать без постоянного хранилища: тогда аккаунт живёт до
+  // перезапуска. Это называют до отправки формы, а не после потери записей.
+  let volatileStorage = $state(false);
+
+  onMount(() => {
+    void (async () => {
+      try {
+        const status = await api.status();
+        volatileStorage = status.accounts === 'in-memory' || status.state_backend === 'in-memory';
+      } catch {
+        // Показания не пришли: про хранение не говорим ничего, ложь дороже
+        // молчания.
+        volatileStorage = false;
+      }
+    })();
+  });
+
   // Ссылка на вход сохраняет куда идти после входа, если путь задан в ?next=.
   const loginHref = $derived(next === '/research' ? '/login' : `/login?next=${encodeURIComponent(next)}`);
 
@@ -45,9 +63,9 @@
   // повторяется одним действием.
   function validate(): boolean {
     const problems: Errors = {};
-    if (!email.trim()) problems.email = 'Укажите email — он же логин.';
-    else if (!EMAIL_RE.test(email.trim())) problems.email = 'Проверьте формат: похоже на analyst@example.org.';
-    if (!displayName.trim()) problems.displayName = 'Как к вам обращаться в рабочем пространстве.';
+    if (!email.trim()) problems.email = 'Укажите email: он же логин.';
+    else if (!EMAIL_RE.test(email.trim())) problems.email = 'Проверьте формат, например analyst@example.org.';
+    if (!displayName.trim()) problems.displayName = 'Укажите имя: оно будет подписью к вашим записям.';
     if (!password) problems.password = 'Придумайте пароль.';
     else if (password.length < PASSWORD_MIN)
       problems.password = `Не короче ${PASSWORD_MIN} символов.`;
@@ -75,26 +93,39 @@
       await invalidateAll();
     } catch (caught) {
       const status = caught instanceof ApiError ? caught.status : null;
+      // «Данные сохранены» про аккаунт, а не про форму: такой фразы здесь нет,
+      // потому что при отказе аккаунт не создан. Про поля говорят отдельно и
+      // только то, что форма действительно держит введённое.
       if (status === 409) {
         taken = true;
         // Факт звучит один раз: поле называет отказ, подсказка ниже — только то,
         // чего не делает кнопка входа.
-        errors = { ...errors, email: 'Такой email уже оформлен.' };
-        formError = 'Пароль меняется в профиле после входа.';
+        errors = { ...errors, email: 'Этот email уже занят.' };
+        formError = 'Пароль от занятого email меняют в профиле после входа.';
       } else if (status === 429) {
-        formError = 'Слишком много попыток подряд. Данные сохранены — повторите через минуту.';
+        formError = 'Слишком много попыток регистрации подряд, повторите позже.';
       } else if (status === 422) {
-        formError = 'Регистрация не прошла: проверьте email и длину пароля. Введённое сохранено.';
+        formError = 'Регистрация не прошла: проверьте email и длину пароля.';
       } else if (status !== null && status >= 500) {
-        formError = 'Регистрация не завершилась. Данные сохранены — повторите отправку через минуту.';
+        formError = 'Аккаунт не создан: сервис не принял запись, повторите позже.';
+      } else if (status !== null && status >= 400 && status < 500) {
+        formError = 'Сервис отклонил регистрацию: проверьте email и пароль, затем повторите.';
       } else {
-        formError = 'Регистрация не получилась. Введённые данные сохранены — повторите отправку.';
+        formError = 'Сервис не ответил, аккаунт не создан. Проверьте соединение и повторите.';
       }
     } finally {
       busy = false;
     }
   }
 </script>
+
+<svelte:head>
+  <title>Регистрация в Научном Клубке</title>
+  <meta
+    name="description"
+    content="Аккаунт Научного Клубка: вопрос к корпусу, находки с адресами в источниках, карта связей, отзывы на ответы."
+  />
+</svelte:head>
 
 <div class="page auth page--cover">
   <div class="scene" aria-hidden="true">
@@ -106,9 +137,16 @@
   <div class="wrap wrap--narrow auth__inner">
     <h1 class="display reveal">Регистрация в Клубке</h1>
     <p class="lead reveal" style="--reveal-delay: 90ms">
-      Аккаунт нужен, чтобы рабочее место оставалось вашим: история запросов, находки
-      с цитатами и адресами в источниках, ваши проверки и комментарии.
+      Аккаунт нужен, чтобы рабочее пространство оставалось вашим: история запросов, находки
+      с цитатами и адресами в источниках, ваши отзывы на ответы.
     </p>
+
+    {#if volatileStorage}
+      <Notice tone="warn" title="Сервис работает без постоянного хранилища">
+        Аккаунт и история ответов проживут до перезапуска сервиса. Постоянный контур настраивает
+        администратор.
+      </Notice>
+    {/if}
 
     <form
       class="panel reveal auth__form"
@@ -147,7 +185,7 @@
           type="password"
           autocomplete="new-password"
           maxlength={PASSWORD_MAX}
-          hint={`Не короче ${PASSWORD_MIN} символов: удобнее длинная фраза, чем короткий набор.`}
+          hint={`Не короче ${PASSWORD_MIN} символов: длинная фраза надёжнее короткого набора.`}
           placeholder="Длинный пароль, который не повторяется"
           bind:value={password}
           error={errors.password ?? ''}
@@ -165,7 +203,7 @@
       </div>
 
       {#if taken}
-        <Notice tone="error" title="Email уже зарегистрирован">
+        <Notice tone="error" title="Email уже занят">
           {formError}
           <span class="row notice__actions">
             <Button href={loginHref} variant="link" size="sm">Войти в существующий аккаунт</Button>
@@ -175,16 +213,29 @@
         <Notice tone="error" title="Регистрация не завершена">{formError}</Notice>
       {/if}
 
+      <p class="micro muted auth__consent">
+        Регистрация означает согласие на обработку указанных вами данных: email, имени и пароля.
+        Они нужны для входа и для подписи ваших записей, других целей у сервиса нет. Вопросы по
+        данным аккаунта решает администратор.
+      </p>
+
       <div class="row row--between">
-        <Button type="submit" variant="action" {busy} disabled={busy}>Создать аккаунт</Button>
+        <Button type="submit" variant="action" {busy} disabled={busy}>
+          {busy ? 'Отправляем…' : 'Создать аккаунт'}
+        </Button>
         <Button href="/login" variant="link" size="sm">Уже есть аккаунт? Войти</Button>
       </div>
 
-      <p class="small muted">
-        Сразу после регистрации открываются рабочее пространство с запросами агенту, находки,
-        карта связей, сравнение технологий и конфликты. Экспертные действия — разбор предложений
-        эволюции, аудит и закрытые данные — доступны при расширенном доступе.
-      </p>
+      <div class="stack auth__notes">
+        <p class="small muted">
+          Сразу после регистрации открываются вопрос к корпусу, находки, карта связей, сравнение
+          технологий и расхождения.
+        </p>
+        <p class="micro muted">
+          Экспертное право на разбор предложений по ответам, журнал действий и закрытые данные
+          выдаёт администратор сервиса.
+        </p>
+      </div>
     </form>
   </div>
 </div>
@@ -216,6 +267,18 @@
 
   .auth__inner .display {
     max-width: 16ch;
+  }
+
+  /* Согласие стоит над кнопкой: человек соглашается до отправки данных. */
+  .auth__consent {
+    max-width: var(--maxw-measure);
+    padding-top: var(--s1);
+    border-top: 1px solid var(--line);
+  }
+
+  .auth__notes {
+    --gap: var(--s2);
+    max-width: var(--maxw-measure);
   }
 
   .notice__actions {

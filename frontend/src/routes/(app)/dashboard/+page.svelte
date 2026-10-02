@@ -1,12 +1,21 @@
 <script lang="ts">
   import { api } from '$lib/api';
-  import { countOf, dateTime, num, pct } from '$lib/format';
+  import { dateTime, num, pct } from '$lib/format';
+  import { navLabel } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import {
+    CHECK_NOUNS,
+    CHECK_TABLE_LABELS,
     COVERAGE_LABELS,
     EVAL_METRIC_LABELS,
+    FINDING_NOUNS,
+    JOURNAL_WINDOW_WORDS,
     MODEL_MODE_LABELS,
     PROCESS_METRIC_LABELS,
+    journalIncomplete,
+    journalLoadMoreOf,
+    journalUnloaded,
+    shownSentenceOf,
     termOf,
   } from '$lib/terms';
   import type {
@@ -27,16 +36,28 @@
   // Экран отвечает на три вопроса: можно ли спросить прямо сейчас, насколько
   // велик корпус и опираются ли его ответы на источники. Всё, что объясняет,
   // как нарисована полоса, сжато в единственное раскрытие «Как это устроено»;
-  // технические числа процесса убраны под «Служебные данные».
-  const METRIC_KEYS: (keyof EvaluationRun['metrics'])[] = [
+  // технические числа процесса и идентификаторы убраны под «Служебные данные».
+  // Детерминированные метрики идут одним блоком колонок, самооценка модели
+  // подписана отдельной группой: её читают как слова модели, а не как проверку.
+  const GROUNDED_KEYS: (keyof EvaluationRun['metrics'])[] = [
     'citation_coverage',
     'numeric_support',
     'unsupported_claim_ratio',
-    'mean_finding_confidence',
     'overall',
   ];
+  const SELF_REPORTED_KEYS: (keyof EvaluationRun['metrics'])[] = ['mean_finding_confidence'];
 
   const SKELETONS = [0, 1, 2, 3, 4, 5];
+
+  // Журнал проверок читается страницей: сервер режет её по `limit`/`offset` и
+  // кладёт полное число подходящих записей в заголовок ответа. Экран называет
+  // обе величины, а не выдаёт страницу за весь журнал.
+  const RUNS_FEED_SIZE = 200;
+
+  // Покрытия считается по показанным находкам. Окно запроса названо явно,
+  // потому что полное число находок приходит отдельно: без него знаменатель
+  // был бы догадкой.
+  const COVERAGE_WINDOW = 200;
 
   let methodOpen = $state(false);
   let serviceOpen = $state(false);
@@ -57,14 +78,25 @@
   let dash = $state<DashboardData | null>(null);
   let stats = $state<CorpusStats | null>(null);
   let findings = $state<FindingListItem[] | null>(null);
+  // Полное число подходящих находок: по нему видно, что покрытие посчитано не
+  // по всему корпусу, а по показанной части.
+  let findingsTotal = $state<number | null>(null);
   let runs = $state<EvaluationRun[] | null>(null);
+  let runsTotal = $state<number | null>(null);
+  let runsOffset = $state(0);
+  let runsMoreLoading = $state(false);
+  let runsMoreError = $state('');
+  // Пустая страница при положительном остатке: смещение не сдвинулось,
+  // показывать больше нечего — кнопка тогда звала бы в никуда.
+  let runsStalled = $state(false);
+  let runsSeq = 0;
   let loading = $state(true);
   let fatal = $state('');
   // Не пришедшие разделы перечисляются человеческими строками: экран говорит,
-  // чего именно он не дочитал, без кодов ответов и путей.
+  // чего именно он не получил, без кодов ответов и путей.
   let failed = $state<string[]>([]);
-  // Состояние модели приходит из /health/ready. Сбой его чтения — не «модель
-  // мертва» и не пустая строка: экран отдельно знает, что показания не пришли.
+  // Состояние модели приходит с сервера. Сбой его чтения — не «модель мертва»
+  // и не пустая строка: экран отдельно знает, что показания не пришли.
   let health = $state<SystemStatus | null>(null);
   let healthMissing = $state(false);
 
@@ -83,15 +115,16 @@
 
   const process = $derived(dash?.agent_metrics ?? null);
 
-  // Занятость контура — одна строка вместо раздела о работе агента: по ней
-  // видно, что сервис занят и запрос может быть отклонён.
-  const capacity = $derived.by(() => {
-    if (!process) return '';
-    return `Запросов в работе ${num(process.agent_runs_active)} из ${num(process.agent_runs_limit)}, отказов приёму ${num(process.agent_runs_refused)}`;
+  // Занятость контура остаётся на экране состоянием, а не числами: по ней
+  // видно, что запрос может быть отклонён. Сами числа — под «Служебными
+  // данными».
+  const serviceBusy = $derived.by(() => {
+    if (!process) return false;
+    return process.agent_runs_limit > 0 && process.agent_runs_active >= process.agent_runs_limit;
   });
 
-  // Единственный показатель агентного контура, остающийся на читаемой части
-  // экрана: доля обращений к модели, завершившихся сбоем.
+  // Единственный показатель агентного контура, нужный при разборе обращения
+  // в сервис: доля обращений к модели, завершившихся сбоем.
   const modelCalls = $derived((process?.agents ?? []).reduce((sum, item) => sum + item.calls, 0));
   const modelFailures = $derived(
     (process?.agents ?? []).reduce((sum, item) => sum + item.failures, 0),
@@ -114,20 +147,28 @@
     ];
   });
 
+  // Идентификаторы показанных проверок: по ним ответ ищут в рабочем
+  // пространстве и при разборе обращения в сервис. В строке таблицы их нет,
+  // они живут под «Служебными данными» и ограничены тем же списком, что на
+  // экране.
+  const runRefs = $derived((runs ?? []).slice(0, 40));
+
   const corpusRows = $derived.by(() => {
     if (!dash) return [] as { key: string; label: string; value: string }[];
+    // Один падеж на весь список и ни одного служебного слова: строка называет
+    // величину, а не этап обработки корпуса.
     const rows = [
       { key: 'documents', label: 'документов', value: num(dash.documents) },
       { key: 'claims', label: 'утверждений', value: num(dash.claims) },
       { key: 'entities', label: 'сущностей', value: num(dash.entities) },
       { key: 'evidence', label: 'доказательств', value: num(dash.evidence) },
-      { key: 'conflicts', label: 'оспаривается', value: num(dash.conflicts) },
+      { key: 'conflicts', label: 'оспоренных утверждений', value: num(dash.conflicts) },
       { key: 'gaps', label: 'пробелов', value: num(dash.gaps) },
     ];
-    // Фрагменты разметки — тоже размер корпуса: отдельной строкой о том, как из
-    // них считается полоса, они не нуждаются.
+    // Фрагменты текста тоже входят в размер корпуса: отдельной строки о том, как
+    // из них считается полоса, не требуется.
     if (stats) {
-      rows.splice(3, 0, { key: 'chunks', label: 'фрагментов разметки', value: num(stats.chunks) });
+      rows.splice(3, 0, { key: 'chunks', label: 'фрагментов текста', value: num(stats.chunks) });
     }
     return rows;
   });
@@ -142,16 +183,70 @@
     return total > 0 ? Math.max(0, Math.min(100, Math.round((part / total) * 100))) : 0;
   }
 
+  // Знаменатель покрытий называется честно: доли считаются по показанным
+  // находкам, а сколько их всего в корпусе — отдельное число.
+  const coverageShown = $derived(shownSentenceOf(sample.length, findingsTotal, FINDING_NOUNS));
+  const coveragePartial = $derived(
+    findingsTotal === null && sample.length >= COVERAGE_WINDOW
+      ? journalIncomplete(FINDING_NOUNS)
+      : '',
+  );
+
+  // Сколько проверок осталось за показанной страницей: без полного числа это
+  // неизвестность, и «Показать ещё» тогда не предлагается.
+  const runsLeft = $derived(
+    runs === null || runsTotal === null ? null : Math.max(0, runsTotal - runs.length),
+  );
+  const runsUnloaded = $derived(journalUnloaded(runsTotal, CHECK_NOUNS, 'проверок'));
+  const runsShown = $derived(shownSentenceOf(runs?.length ?? 0, runsTotal, CHECK_NOUNS));
+  // Кнопка называет порцию, которую действительно добавляет: «Показать ещё
+  // 20 проверок», а не абстрактное «ещё».
+  const runsMoreLabel = $derived(
+    journalLoadMoreOf(runsLeft ?? 0, RUNS_FEED_SIZE, CHECK_NOUNS),
+  );
+  const runsPartial = $derived(
+    runsTotal === null && runs !== null && runs.length >= RUNS_FEED_SIZE
+      ? journalIncomplete(CHECK_NOUNS)
+      : '',
+  );
+
+  // Догружение по серверному смещению: показанное остаётся, отказ владеет
+  // только своей строкой. Перезапуск load() по счётчику отсекает запоздавшую
+  // страницу, иначе в обновлённый журнал примешался бы прежний срез.
+  async function loadRunsMore(): Promise<void> {
+    if (runs === null) return;
+    const call = ++runsSeq;
+    const offset = runsOffset;
+    runsMoreLoading = true;
+    runsMoreError = '';
+    try {
+      const page = await api.evaluations(RUNS_FEED_SIZE, offset);
+      if (call !== runsSeq) return;
+      runsOffset = offset + page.items.length;
+      const seen = new Set(runs.map((run) => run.id));
+      runs = [...runs, ...page.items.filter((run) => !seen.has(run.id))];
+      runsStalled = page.items.length === 0;
+      if (page.total !== null) runsTotal = page.total;
+    } catch {
+      if (call === runsSeq) runsMoreError = JOURNAL_WINDOW_WORDS.moreFailed;
+    } finally {
+      if (call === runsSeq) runsMoreLoading = false;
+    }
+  }
+
   async function load(): Promise<void> {
     loading = true;
     fatal = '';
     failed = [];
+    runsSeq += 1;
+    runsMoreError = '';
+    runsStalled = false;
 
     const [panel, corpus, log, evals, state] = await Promise.allSettled([
       api.dashboard(),
       api.corpusStats(),
-      api.findings(),
-      canEvaluate ? api.evaluations() : Promise.resolve(null),
+      api.findings(undefined, undefined, COVERAGE_WINDOW, 0),
+      canEvaluate ? api.evaluations(RUNS_FEED_SIZE, 0) : Promise.resolve(null),
       api.status(),
     ]);
 
@@ -165,18 +260,28 @@
     stats = corpus.status === 'fulfilled' ? corpus.value : null;
     if (corpus.status === 'rejected') failed.push('Показания корпуса не пришли.');
 
-    findings = log.status === 'fulfilled' ? log.value : null;
+    // Отказ опроса находок не превращается в «корпус пуст»: список остаётся
+    // null, а доли по нему не рисуются.
+    findings = log.status === 'fulfilled' ? log.value.items : null;
+    findingsTotal = log.status === 'fulfilled' ? log.value.total : null;
     if (log.status === 'rejected') failed.push('Находки корпуса не пришли.');
 
-    // Без доступа к оценке запрос не отправляется вовсе, и раздел говорит об
-    // этом прямо вместо пустой таблицы.
+    // Без доступа к проверкам запрос не отправляется вовсе, и раздел говорит об
+    // этом прямо вместо пустой таблицы. Полное число проверок приходит только
+    // заголовком ответа: длина страницы — не объём журнала.
     if (!canEvaluate) {
       runs = null;
-    } else if (evals.status === 'fulfilled') {
-      runs = evals.value ?? [];
+      runsTotal = null;
+      runsOffset = 0;
+    } else if (evals.status === 'fulfilled' && evals.value !== null) {
+      runs = evals.value.items;
+      runsTotal = evals.value.total;
+      runsOffset = evals.value.items.length;
     } else {
       runs = null;
-      failed.push('Проверки качества не пришли.');
+      runsTotal = null;
+      runsOffset = 0;
+      if (evals.status === 'rejected') failed.push('Проверки качества не пришли.');
     }
 
     health = state.status === 'fulfilled' ? state.value : null;
@@ -187,18 +292,19 @@
 
   $effect(() => {
     // Пока вход не подтверждён, доступа к показаниям нет и просить их рано.
-    // canEvaluate читается внутри load() синхронно, поэтому приход доступа с
-    // /auth/me перезапускает чтение — раздел оценки не остаётся пустым по недосмотру.
+    // canEvaluate читается внутри load() синхронно, поэтому приход права с
+    // профиля перезапускает чтение — раздел проверок не остаётся пустым по
+    // недосмотру.
     if (sessionPending) return;
     void load();
   });
 </script>
 
 <svelte:head>
-  <title>Качество корпуса и ответов — Научный Клубок</title>
+  <title>Корпус и проверки ответов: Научный Клубок</title>
   <meta
     name="description"
-    content="Размер корпуса, его покрытие и точность ответов: чем сервис отвечает сейчас и чему можно верить."
+    content="Размер корпуса, его покрытие и проверки ответов: чем сервис отвечает сейчас и что подтверждено источниками."
   />
 </svelte:head>
 
@@ -213,12 +319,16 @@
     <SectionHead
       level="1"
       eyebrow={narrow ? '' : 'качество'}
-      title="Проверить корпус и точность ответов"
-      lead="Сколько в корпусе документов, чего он не покрывает и насколько ответы опираются на источники."
+      title="Корпус и проверки ответов"
+      lead="Сколько в корпусе документов, чего он не покрывает и как прошли проверки ответов."
     >
-      <Button variant="action" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>
-        {loading ? 'Считываем…' : 'Обновить показания'}
-      </Button>
+      <div class="row dash__head-actions">
+        <Button variant="action" href="/research">Задать вопрос</Button>
+        <Button variant="quiet" href="/conflicts">Открыть «{navLabel('/conflicts')}»</Button>
+        <Button variant="ghost" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>
+          {loading ? 'Считываем…' : 'Обновить показания'}
+        </Button>
+      </div>
     </SectionHead>
 
     <!-- Можно ли спрашивать прямо сейчас: чем собирается ответ и занят ли контур. -->
@@ -232,12 +342,12 @@
           <p class="micro muted">{MODEL_MODE_LABELS[health.model_mode]}</p>
         </div>
       {:else if healthMissing && !loading}
-        <p class="micro muted dash__ready-note">
-          Состояние сервиса не прочитано — обновите показания, прежде чем делать вывод о модели.
-        </p>
+        <p class="micro muted dash__ready-note">Состояние сервиса не получено. Обновите показания.</p>
       {/if}
-      {#if capacity}
-        <p class="micro muted dash__ready-note">{capacity}.</p>
+      {#if serviceBusy}
+        <p class="micro muted dash__ready-note">
+          Сервис занят: новый вопрос может подождать или быть отклонён.
+        </p>
       {/if}
     </div>
 
@@ -247,9 +357,9 @@
           <span class="spinner" aria-hidden="true"></span>
           <p class="small">
             {#if sessionPending}
-              Подтверждаем вход — показания корпуса начнём читать сразу после.
+              Подтверждаем вход. Показания корпуса начнём читать сразу после.
             {:else}
-              Считываем показания корпуса и проверки качества ответов.
+              Считываем показания корпуса и проверки ответов.
             {/if}
           </p>
         </div>
@@ -272,13 +382,13 @@
             <Icon name="alert" size={16} />
             показания не получены
           </p>
-          <h2 class="h3">Состояние корпуса не прочитано</h2>
-          <p class="small">{fatal} Это не пустой корпус — данные просто не пришли.</p>
+          <h2 class="h3">Состояние корпуса не получено</h2>
+          <p class="small">{fatal}</p>
           <div class="row dash__actions">
             <Button variant="action" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>
               Повторить запрос
             </Button>
-            <Button variant="quiet" href="/research">Рабочее пространство</Button>
+            <Button variant="quiet" href="/research">Задать вопрос</Button>
           </div>
         </div>
       </Panel>
@@ -288,13 +398,13 @@
           {#each failed as line (line)}
             <span class="failed-line">{line}</span>
           {/each}
-          <span class="failed-line">Обновите показания — приблизительных чисел вместо них нет.</span>
+          <span class="failed-line">Обновите показания.</span>
         </Notice>
       {/if}
 
       <!-- ── Размер корпуса ─────────────────────────────────────────── -->
       <section class="dash__block dash__block--first">
-        <SectionHead level="2" eyebrow={narrow ? '' : 'состав корпуса'} title="Насколько велик корпус" />
+        <SectionHead level="2" eyebrow={narrow ? '' : 'корпус'} title="Насколько велик корпус" />
 
         <Panel>
           <dl class="dash__metrics">
@@ -313,7 +423,7 @@
           {/if}
         </Panel>
 
-        <div class="stack dash__ratios">
+        <div class="grid grid--2 dash__ratios">
           {#if stats}
             <Panel>
               <div class="dash__ratio">
@@ -330,20 +440,17 @@
                       style="width: {share(stats.semantic_documents, stats.documents)}%;"></span>
                   </div>
                   <p class="micro muted">
-                    Разобрано <span class="num">{num(stats.semantic_documents)}</span> из
+                    <span class="num">{num(stats.semantic_documents)}</span> из
                     <span class="num">{num(stats.documents)}</span> документов.
                   </p>
                 {:else}
-                  <p class="micro muted">
-                    Документов в корпусе нет — показать долю разбора не на чем. Загрузите документ.
-                  </p>
+                  <p class="micro muted">Документов в корпусе нет. Загрузите документ.</p>
                 {/if}
               </div>
             </Panel>
           {:else}
             <Notice tone="warn" title="Показания корпуса не пришли">
-              Долю семантического разбора не показать: цифры не получены, а не равны нулю. Обновите
-              показания.
+              Долю разбора не посчитать. Обновите показания.
             </Notice>
           {/if}
 
@@ -363,25 +470,35 @@
                     </div>
                     <p class="micro muted">
                       <span class="num">{num(row.part)}</span> из
-                      <span class="num">{num(sample.length)}</span>
+                      <span class="num">{num(sample.length)}</span> находок.
                     </p>
                   </div>
                 {/each}
-                <p class="micro muted dash__legend">
-                  Считано по находкам, доступным вашему аккаунту:
-                  {countOf(sample.length, 'находка', 'находки', 'находок')}{#if !canRestricted}, без
-                  закрытого класса{/if}.
-                </p>
+                <!-- Знаменатель называется прямо: доля относится к показанной
+                     части списка находок, а не ко всему корпусу. Каждая
+                     величина стоит своей подписанной строкой. -->
+                <div class="stack dash__notes">
+                  <p class="micro muted">Доли посчитаны по показанным находкам.</p>
+                  <p class="micro muted">{coverageShown}.</p>
+                  {#if coveragePartial}
+                    <p class="micro muted">{coveragePartial}.</p>
+                  {/if}
+                  {#if !canRestricted}
+                    <p class="micro muted">Закрытые находки в подсчёт не входят.</p>
+                  {/if}
+                </div>
               {:else}
                 <p class="micro muted">
-                  Доступных вам находок пока нет — доли по ним показать не на чем. Задайте вопрос или
-                  пополните корпус.
+                  Доступных вашему аккаунту находок пока нет. Доли по ним не посчитать.
                 </p>
+                <div class="row dash__actions">
+                  <Button variant="quiet" href="/research">Задать вопрос</Button>
+                </div>
               {/if}
             </Panel>
           {:else}
             <Notice tone="warn" title="Находки не пришли">
-              Доли по находкам не посчитаны: список не получен, а не пуст. Обновите показания.
+              Доли по находкам не посчитать. Обновите показания.
             </Notice>
           {/if}
         </div>
@@ -401,16 +518,14 @@
           {#if methodOpen}
             <div class="acc__body" id="dash-method">
               <p>
-                Документы, утверждения, сущности и доказательства измеряют разное, поэтому их доли не
+                Документы, утверждения, сущности и доказательства измеряют разное: их доли не
                 складываются в одну ось.
               </p>
+              <p>Доля не рисуется, когда считать не с чего. Экран различает пустой корпус и не
+                пришедшие показания.</p>
               <p>
-                Доля не рисуется, когда считать не с чего. Пустой корпус и не пришедшие цифры — разные
-                состояния, и экран называет каждое своими словами.
-              </p>
-              <p>
-                Оспориваемое — про величину, по которой источники расходятся; пробел — по паре «свойство
-                и объект», которую корпус не закрыл.
+                Оспаривается: по этому утверждению источники дают разные числа. Пробелом называем
+                пару «свойство и объект», которую корпус не закрыл.
               </p>
             </div>
           {/if}
@@ -420,33 +535,34 @@
           <Empty
             icon="layers"
             title="В корпусе нет ни документов, ни утверждений"
-            body="Загрузите документы в рабочем пространстве — показания обновятся, как только разбор завершится."
+            body="Загрузите документы в разделе «Вопрос». Показания обновятся после разбора."
           >
             {#snippet action()}
               <div class="row">
-                <Button variant="action" href="/research">Открыть рабочее пространство</Button>
-                <Button variant="quiet" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>Прочитать снова</Button>
+                <Button variant="action" href="/research">Задать вопрос</Button>
+                <Button variant="quiet" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>Обновить показания</Button>
               </div>
             {/snippet}
           </Empty>
         {/if}
       </section>
 
-      <!-- ── Качество ответов ───────────────────────────────────────── -->
+      <!-- ── Проверки ответов ───────────────────────────────────────── -->
       <section class="dash__block">
         <SectionHead
           level="2"
-          eyebrow={narrow ? '' : 'качество ответов'}
-          title="Насколько ответы опираются на источники"
+          eyebrow={narrow ? '' : 'ответы'}
+          title="Проверки ответов"
+          lead="Проверка считает ответ по источнику. Что о себе сказала модель, показано отдельной колонкой."
         />
 
         {#if !canEvaluate}
           <Panel tone="lav">
-            <p class="eyebrow"><Icon name="shield" size={16} /> расширенный доступ</p>
+            <p class="eyebrow"><Icon name="shield" size={16} /> раздел закрыт</p>
             <p class="small">
-              Метрики точности ответов этому аккаунту не открыты. Запрос, находки и обратная связь
-              работают как обычно.
+              Проверки ответов этому аккаунту не открыты. Право выдаёт администратор сервиса.
             </p>
+            <p class="small">Вопрос, находки и отзывы на ответ работают как обычно.</p>
             <div class="row dash__actions">
               <Button variant="action" href="/research">Задать вопрос</Button>
             </div>
@@ -455,7 +571,7 @@
           <Panel tone="coral">
             <div class="dash__fault">
               <p class="eyebrow"><Icon name="alert" size={16} /> проверки не получены</p>
-              <p class="small">Журнал проверок не прочитан. Обновите показания.</p>
+              <p class="small">Журнал проверок не пришёл. Обновите показания.</p>
               <div class="row dash__actions">
                 <Button variant="action" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>
                   Повторить
@@ -464,44 +580,77 @@
             </div>
           </Panel>
         {:else if !runs.length}
-          <Empty
-            icon="gauge"
-            title="Проверки качества ещё не считались"
-            body="Проверка ставится на ответ исследовательского запроса. Пока её нет, процентов точности на экране нет тоже."
-          >
-            {#snippet action()}
-              <Button variant="action" href="/research">Задать вопрос</Button>
-            {/snippet}
-          </Empty>
+          <!-- Пустая таблица при ненулевом или неизвестном полном числе — это
+               незагруженный журнал, а не «проверки не считались». -->
+          {#if runsUnloaded}
+            <Panel tone="coral">
+              <div class="dash__fault">
+                <p class="eyebrow"><Icon name="alert" size={16} /> проверки не загружены</p>
+                <p class="small"><strong>{runsUnloaded.title}.</strong> {runsUnloaded.body}</p>
+                <div class="row dash__actions">
+                  <Button variant="action" icon="refresh" busy={loading} disabled={loading} onclick={() => void load()}>
+                    Повторить запрос
+                  </Button>
+                </div>
+              </div>
+            </Panel>
+          {:else}
+            <Empty
+              icon="gauge"
+              title="Проверки ответов ещё не считались"
+              body="Проверка считается по каждому ответу раздела «Вопрос». Пока ответов не было, проверок и процентов на экране нет."
+            >
+              {#snippet action()}
+                <Button variant="action" href="/research">Задать вопрос</Button>
+              {/snippet}
+            </Empty>
+          {/if}
         {:else}
           <Panel flush>
-            <div class="table-wrap dash__table">
-              <table class="table">
+            <div class="table-wrap">
+              <table class="table dash__table">
                 <thead>
                   <tr>
-                    <th scope="col">когда</th>
-                    {#each METRIC_KEYS as key (key)}
+                    <th scope="col" rowspan="2">
+                      {CHECK_TABLE_LABELS.when}
+                    </th>
+                    <th scope="colgroup" colspan={GROUNDED_KEYS.length}>
+                      {CHECK_TABLE_LABELS.grounded}
+                    </th>
+                    <th scope="colgroup" colspan={SELF_REPORTED_KEYS.length} class="dash__sep">
+                      {CHECK_TABLE_LABELS.selfReported}
+                    </th>
+                    <th scope="col" rowspan="2">{CHECK_TABLE_LABELS.verdict}</th>
+                  </tr>
+                  <tr>
+                    {#each GROUNDED_KEYS as key (key)}
                       <th scope="col" class="n">{termOf(EVAL_METRIC_LABELS, key)}</th>
                     {/each}
-                    <th scope="col">вердикт</th>
+                    {#each SELF_REPORTED_KEYS as key (key)}
+                      <th scope="col" class="n dash__sep">{termOf(EVAL_METRIC_LABELS, key)}</th>
+                    {/each}
                   </tr>
                 </thead>
                 <tbody>
                   {#each runs as run (run.id)}
                     <tr>
-                      <td>
+                      <td data-label={CHECK_TABLE_LABELS.when}>
                         <time datetime={run.created_at}>{dateTime(run.created_at)}</time>
-                        <!-- Идентификатор ответа нужен, чтобы найти его в рабочем
-                             пространстве и при разборе обращения в сервис. -->
-                        <span class="dash__qid"><code class="tech">{run.query_id}</code></span>
                       </td>
-                      {#each METRIC_KEYS as key (key)}
-                        <td class="n">{pct(run.metrics[key])}</td>
+                      {#each GROUNDED_KEYS as key (key)}
+                        <td class="n" data-label={termOf(EVAL_METRIC_LABELS, key)}>
+                          {pct(run.metrics[key])}
+                        </td>
                       {/each}
-                      <td>
+                      {#each SELF_REPORTED_KEYS as key (key)}
+                        <td class="n dash__sep" data-label={termOf(EVAL_METRIC_LABELS, key)}>
+                          {pct(run.metrics[key])}
+                        </td>
+                      {/each}
+                      <td data-label={CHECK_TABLE_LABELS.verdict}>
                         <StatusPill
                           status={run.passed ? 'consensus' : 'disputed'}
-                          label={run.passed ? 'зачтён' : 'не зачтён'}
+                          label={run.passed ? CHECK_TABLE_LABELS.passed : CHECK_TABLE_LABELS.notPassed}
                         />
                       </td>
                     </tr>
@@ -511,16 +660,38 @@
             </div>
           </Panel>
           <p class="micro muted dash__legend">
-            «Выводы без поддержки» — чем меньше, тем лучше: это доля тезисов без трассировки до
-            источника. «Уверенность выводов» оценивает сама модель, а не подтверждённость факта.
+            {runsShown}.
+            {#if runsPartial}{runsPartial}.{/if}
           </p>
-          {#if modelCalls > 0}
-            <p class="micro muted dash__legend--tight">
-              Сбоем завершилось <span class="num">{share(modelFailures, modelCalls)}</span> % обращений к
-              модели (<span class="num">{num(modelFailures)}</span> из
-              <span class="num">{num(modelCalls)}</span>).
-            </p>
+          {#if runsStalled}
+            <!-- Остаток назван, а страница пришла пустой: действие убрано, иначе
+                 клик был бы пустым. Тупик отличается и от сбоя, и от «показаны
+                 все», поэтому говорит о себе своей строкой. -->
+            <Notice tone="warn" title={JOURNAL_WINDOW_WORDS.stalledTitle}>
+              {JOURNAL_WINDOW_WORDS.stalled}
+            </Notice>
+          {:else if runsLeft !== null && runsLeft > 0}
+            <div class="row dash__actions">
+              <Button
+                variant="quiet"
+                busy={runsMoreLoading}
+                disabled={runsMoreLoading}
+                onclick={() => void loadRunsMore()}
+              >
+                {runsMoreLoading ? JOURNAL_WINDOW_WORDS.loadingMore : runsMoreLabel}
+              </Button>
+            </div>
           {/if}
+          {#if runsMoreError}
+            <Notice tone="error" title={JOURNAL_WINDOW_WORDS.moreFailedTitle}>
+              {runsMoreError}
+            </Notice>
+          {/if}
+          <div class="stack dash__notes">
+            <p class="micro muted">{CHECK_TABLE_LABELS.groundedNote}</p>
+            <p class="micro muted">{CHECK_TABLE_LABELS.selfReportedNote}</p>
+            <p class="micro muted">{CHECK_TABLE_LABELS.verdictNote}</p>
+          </div>
         {/if}
       </section>
 
@@ -540,8 +711,8 @@
           {#if serviceOpen}
             <div class="acc__body" id="dash-service">
               <p>
-                Числа агентного контура с запуска процесса: на решения аналитика они не влияют, но по
-                ним сервис объясняет отказ приёма запроса.
+                Числа агентного контура с момента запуска процесса: на решения аналитика они не влияют,
+                но по ним сервис объясняет отказ приёма запроса.
               </p>
               {#if process}
                 <dl class="kv dash__facts">
@@ -550,7 +721,32 @@
                     <dd class="num">{fact.value}</dd>
                   {/each}
                 </dl>
+                {#if modelCalls > 0}
+                  <p class="micro muted">
+                    Сбоем завершилось <span class="num">{share(modelFailures, modelCalls)}</span> %
+                    обращений к модели: <span class="num">{num(modelFailures)}</span> из
+                    <span class="num">{num(modelCalls)}</span>.
+                  </p>
+                {/if}
                 <p class="micro muted">Снимок датирован {dateTime(process.generated_at)}.</p>
+              {/if}
+              <p class="micro muted">
+                Действия этого аккаунта и, где на них есть право, действия корпуса читаются в профиле.
+              </p>
+              <div class="row dash__actions">
+                <Button variant="quiet" href="/account">Открыть профиль</Button>
+              </div>
+              {#if runRefs.length > 0}
+                <h3 class="h4 dash__sub">Идентификаторы показанных проверок</h3>
+                <p class="micro muted">
+                  По ним ответ ищут в разделе «Вопрос» и при разборе обращения в сервис.
+                </p>
+                <dl class="kv dash__ids">
+                  {#each runRefs as run (run.id)}
+                    <dt><time datetime={run.created_at}>{dateTime(run.created_at)}</time></dt>
+                    <dd class="tech">{run.query_id}</dd>
+                  {/each}
+                </dl>
               {/if}
             </div>
           {/if}
@@ -675,6 +871,8 @@
     font-size: var(--t-h3);
   }
 
+  /* Покрытия встают в две колонки на широком экране: первый viewport держит
+     статус, числа корпуса и главное действие, а не уходит в прокрутку. */
   .dash__ratios {
     --gap: var(--s5);
     margin-top: var(--s5);
@@ -701,20 +899,38 @@
     margin-top: var(--s4);
   }
 
-  .dash__legend--tight {
+  /* Расшифровки метрик: короткие строки под таблицей, а не абзац о методике. */
+  .dash__notes {
+    --gap: var(--s2);
+    margin-top: var(--s4);
     max-width: 88ch;
-    margin-top: var(--s3);
   }
 
-  /* Идентификатор ответа — подписью под моментом проверки, сам заголовком
-     строки он не является. */
-  .dash__qid {
-    display: block;
-    margin-top: var(--s1);
+  /* Отделение колонки самооценки модели: детерминированные метрики и слова
+     модели читаются как два разных блока, а не одна ось. */
+  .dash__sep {
+    border-left: 1px solid var(--line);
+    padding-left: var(--s4);
+  }
+
+  .dash__sub {
+    margin-top: var(--s5);
+    font-size: var(--t-small);
+    font-weight: 600;
+  }
+
+  /* Идентификаторы проверок живут только здесь: в строке таблицы их нет. */
+  .dash__ids {
+    margin-top: var(--s3);
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
   }
 
   .dash__facts {
     margin-top: var(--s4);
+  }
+
+  .dash__head-actions {
+    --gap: var(--s3);
   }
 
   .failed-line {
@@ -723,8 +939,8 @@
 
   /* Числовые колонки: перекрываем text-align из app.css (.table th), поэтому
      селектор поднимается до уровня глобального правила. */
-  .dash__table :global(.table th.n),
-  .dash__table :global(.table td.n) {
+  .table.dash__table th.n,
+  .table.dash__table td.n {
     text-align: right;
     white-space: normal;
     font-variant-numeric: tabular-nums;
@@ -760,7 +976,7 @@
       flex: none;
     }
 
-    /* Телефон: строка остаётся строкой, но число крупнее — подпись переносится
+    /* Телефон: строка остаётся строкой, но число крупнее: подпись переносится
        и не спорит с величиной. */
     .dash__metric {
       column-gap: var(--s4);
@@ -769,6 +985,48 @@
 
     .dash__metrics .metric__num {
       font-size: var(--t-h2);
+    }
+
+    /* Семь колонок проверки на узком экране читаются карточкой строки: каждая
+       величина встаёт своей подписанной строкой, боковая прокрутка не нужна.
+       Подпись берётся из data-label, который задаётся тем же словарём, что и
+       заголовок колонки. */
+    .table.dash__table thead {
+      display: none;
+    }
+
+    .table.dash__table,
+    .table.dash__table tbody,
+    .table.dash__table tr,
+    .table.dash__table td {
+      display: block;
+      width: 100%;
+    }
+
+    .table.dash__table td {
+      border-top: 0;
+      padding: var(--s1) 0;
+      text-align: left;
+    }
+
+    .table.dash__table td.n {
+      text-align: left;
+    }
+
+    .table.dash__table td::before {
+      content: attr(data-label);
+      display: block;
+      color: var(--ink-3);
+      font-size: var(--t-micro);
+    }
+
+    .table.dash__table tr + tr {
+      border-top: 1px solid var(--line-soft);
+    }
+
+    .table.dash__table td.dash__sep {
+      border-left: 0;
+      padding-left: 0;
     }
   }
 </style>

@@ -1,25 +1,30 @@
 <script lang="ts">
-  // Сравнение технологий по измерениям: условия и результат — в главной колонке,
-  // списки корпуса — в правом рельсе (на узком экране свёрнуты в аккордеон под
-  // результатом). Отметить технологию или измерение можно единственным способом —
-  // нажатием по списку корпуса, поэтому в условиях сравнения остаётся итог
-  // выбора, а не второй и третий параллельный ввод. Ниже 900px сравнение
-  // разворачивается в стек заметок на технологию, а не сжимается в горизонтальный
-  // скролл.
+  // Сравнение технологий по измерениям: отметка сущностей, таблица и главное
+  // действие читаются с первого экрана, списки корпуса живут в правом рельсе (на
+  // узком экране они свёрнуты под результатом). Отметить технологию или измерение
+  // можно единственным способом: нажатием по списку корпуса, поэтому в условиях
+  // сравнения остаётся итог выбора, а не второй и третий параллельный ввод. Ниже
+  // 900px сравнение разворачивается в стек заметок на технологию, а не сжимается
+  // в горизонтальный скролл: скроллится таблица внутри своей области.
   import { onMount, tick } from 'svelte';
   import { page } from '$app/state';
   import { api, ApiError } from '$lib/api';
-  import { countOf, num, pct } from '$lib/format';
+  import { countOf, pct, plural } from '$lib/format';
+  import { navLabel } from '$lib/nav';
   import { scrollRegion } from '$lib/scroll-region';
   import { session } from '$lib/sessionStore.svelte';
   import {
     COMPARE_CELL_LABELS,
+    COMPARE_LEGEND,
     COMPARE_LIMIT_SOURCE,
     COMPARE_ROW_LABELS,
-    OPERATOR_SYMBOL,
+    OPERATOR_WORD,
     PROPERTY_LABELS,
     SUBJECT_LABELS,
-    termOf,
+    limitTagText,
+    outsideLimitText,
+    serviceKeysOf,
+    termLabelsOf,
   } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
   import Chip from '$lib/ui/Chip.svelte';
@@ -38,10 +43,14 @@
     NumericObservation,
   } from '$lib/types';
 
-  // Предел корпуса: направление, величина, единица и где он взят — из оператора
+  // Предел корпуса: направление, величина, единица и где он взят: из оператора
   // наблюдения (`operator`) или из его формулировки (`wording`).
   type Limit = { kind: 'lte' | 'gte'; at: number; unit: string; from: 'operator' | 'wording' };
   type Check = 'outside' | 'within' | 'none';
+
+  // Находки корпуса читаются окном: список выбора растёт вместе с корпусом, и
+  // экран обязан называть, сколько находок показано и сколько их всего.
+  const CORPUS_PAGE_SIZE = 200;
 
   // Право проверяет сервер (`export:run`); клиентская сверка нужна, чтобы не
   // слать заведомо отклоняемый вызов, а отказ по доступу показывается тем же
@@ -51,7 +60,7 @@
   );
 
   let question = $state('');
-  // Вопрос сравнения необязателен и ни на какие числа не влияет — это подпись к
+  // Вопрос сравнения необязателен и ни на какие числа не влияет: это подпись к
   // результату, а не пропуск на сравнение. Серверному контракту нужен ориентир
   // прогона (от 3 символов), поэтому при пустом поле уходит подпись по отмеченным
   // технологиям, а на экран выводится только вопрос человека (`questionEcho`).
@@ -60,6 +69,11 @@
   let dimensions = $state<string[]>([]);
   let matrix = $state<ComparisonTable | null>(null);
   let corpus = $state<FindingListItem[] | null>(null);
+  let corpusTotal = $state<number | null>(null);
+  let corpusOffset = $state(0);
+  let corpusMoreLoading = $state(false);
+  let corpusMoreError = $state('');
+  let corpusSeq = 0;
   let corpusError = $state('');
   let loading = $state(false);
   let attempted = $state(false);
@@ -68,9 +82,9 @@
   let needsEntities = $state(false);
 
   // Мобильная композиция сравнения: стек заметок на технологию вместо таблицы.
-  // Точка перестройки — проектный брейкпоинт 900px: ниже него и рельс уходит
-  // под условия, и матрица разворачивается в заметки, поэтому ничего не
-  // сжимается в горизонтальный скролл на 781–900px.
+  // Точка перестройки 900px: ниже него и рельс уходит под условия, и матрица
+  // разворачивается в заметки, поэтому страница не идёт горизонтальным скроллом
+  // ни на 781 px, ни на 375 px.
   let narrow = $state(false);
   // Списки корпуса и пояснение чтения — вторичный слой: на широком экране они
   // в правом рельсе, на узком свёрнуты, чтобы условия и результат читались сразу.
@@ -87,31 +101,62 @@
   });
 
   const sample = $derived(corpus ?? []);
+
+  // Имена ключей корпуса для интерфейса: русское имя словаря, иначе
+  // человекочитаемая строка сервера, иначе заглушка. Сырое имя онтологии в
+  // заголовок столбца не встаёт и живёт под «Служебными данными».
+  const subjectKeys = $derived(
+    [...new Set(sample.map((f) => f.subject).filter((name): name is string => Boolean(name)))],
+  );
+  const propertyKeys = $derived([
+    ...new Set(sample.flatMap((f) => f.observations.map((o) => o.property_name))),
+  ]);
+  const subjectLabels = $derived(termLabelsOf(subjectKeys, SUBJECT_LABELS, 'subject'));
+  const propertyLabels = $derived(termLabelsOf(propertyKeys, PROPERTY_LABELS, 'property'));
+  const subjectServiceKeys = $derived(
+    serviceKeysOf(subjectKeys, SUBJECT_LABELS, 'subject'),
+  );
+  const propertyServiceKeys = $derived(
+    serviceKeysOf(propertyKeys, PROPERTY_LABELS, 'property'),
+  );
+  const serviceKeys = $derived([...subjectServiceKeys, ...propertyServiceKeys]);
+
+  const labelOf = (labels: Record<string, string>, name: string): string => labels[name] ?? name;
+
   const subjectNames = $derived(
-    [...new Set(sample.map((f) => f.subject).filter((name): name is string => Boolean(name)))].sort(
-      (a, b) => termOf(SUBJECT_LABELS, a).localeCompare(termOf(SUBJECT_LABELS, b), 'ru'),
+    [...subjectKeys].sort((a, b) =>
+      labelOf(subjectLabels, a).localeCompare(labelOf(subjectLabels, b), 'ru'),
     ),
   );
   const propertyNames = $derived(
-    [
-      ...new Set(sample.flatMap((f) => f.observations.map((o) => o.property_name))),
-    ].sort((a, b) => termOf(PROPERTY_LABELS, a).localeCompare(termOf(PROPERTY_LABELS, b), 'ru')),
+    [...propertyKeys].sort((a, b) =>
+      labelOf(propertyLabels, a).localeCompare(labelOf(propertyLabels, b), 'ru'),
+    ),
   );
 
-  // Имя ключа корпуса для интерфейса: служит то же «terms.ts», что и в находках.
   function entityLabel(name: string): string {
-    return termOf(SUBJECT_LABELS, name);
+    return labelOf(subjectLabels, name);
   }
 
   function dimensionLabel(name: string): string {
-    return termOf(PROPERTY_LABELS, name);
+    return labelOf(propertyLabels, name);
   }
 
-  // Общий формат числа для обеих таблиц: сервер отдаёт «≥92.5» с точкой и без
-  // пробела, экран показывает «≥ 92,5» — как `num()` в находках.
+  // Знак направления серверного значения становится словом: «≥92.5» превращается
+  // в «не меньше 92,5» вместе с десятичной запятой, как на остальных экранах.
+  const SIGN_WORD: Record<string, string> = {
+    '<=': OPERATOR_WORD.lte,
+    '>=': OPERATOR_WORD.gte,
+    '<': OPERATOR_WORD.lt,
+    '>': OPERATOR_WORD.gt,
+    '≤': OPERATOR_WORD.lte,
+    '≥': OPERATOR_WORD.gte,
+    '=': OPERATOR_WORD.eq,
+  };
+
   function serverValue(text: string): string {
     return text
-      .replace(/([≤≥<>]=?)(?=\d)/g, '$1 ')
+      .replace(/(<=|>=|[≤≥<>])\s*(?=\d)/g, (sign) => `${SIGN_WORD[sign.trim()] ?? sign} `)
       .replace(/(\d)\.(\d)/g, '$1,$2');
   }
 
@@ -164,7 +209,7 @@
     if (forbidden) return 'Сравнение закрыто: нужен доступ к корпусу.';
     if (error) return 'Сравнение не выполнено.';
     if (loading) return 'Считаем сравнение…';
-    if (!matrix) return 'Сравнения пока нет — отметьте технологии в списках корпуса.';
+    if (!matrix) return 'Сравнения пока нет. Отметьте технологии в списках корпуса.';
     if (matrix.headers.length === 0) return 'Указанных измерений в находках нет.';
     if (matrix.rows.length === 0) return 'Таких технологий в находках нет.';
     return `Готово: ${countOf(
@@ -218,13 +263,13 @@
     if (limit.kind === 'lte' && Math.max(...numbers) > limit.at) {
       return {
         check: 'outside',
-        why: `${property}: ${num(Math.max(...numbers))} ${limit.unit} ${OPERATOR_SYMBOL.gt} ${num(limit.at)} ${limit.unit}`,
+        why: outsideLimitText(property, Math.max(...numbers), limit.unit, 'lte', limit.at),
       };
     }
     if (limit.kind === 'gte' && Math.min(...numbers) < limit.at) {
       return {
         check: 'outside',
-        why: `${property}: ${num(Math.min(...numbers))} ${limit.unit} ${OPERATOR_SYMBOL.lt} ${num(limit.at)} ${limit.unit}`,
+        why: outsideLimitText(property, Math.min(...numbers), limit.unit, 'gte', limit.at),
       };
     }
     return { check: 'within', why: '' };
@@ -248,17 +293,7 @@
     return { pill: 'hypothesis', label: COMPARE_CELL_LABELS.unchecked };
   }
 
-  // Цвет полосы уверенности честный: зелёный и красный — только когда сверку
-  // действительно удалось выполнить; во всех остальных случаях — коралл действия.
-  function barModifier(pill: 'consensus' | 'hypothesis' | 'disputed' | 'off'): string {
-    return pill === 'consensus' || pill === 'disputed' ? ` bar__fill--${pill}` : '';
-  }
-
-  function confidenceWidth(value: number): string {
-    return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
-  }
-
-  // Отметка ставится и снимается одним движением — нажатием по списку корпуса.
+  // Отметка ставится и снимается одним движением: нажатием по списку корпуса.
   function toggleEntity(name: string): void {
     entities = entities.includes(name) ? entities.filter((v) => v !== name) : [...entities, name];
     needsEntities = false;
@@ -268,16 +303,47 @@
     dimensions = dimensions.includes(name) ? dimensions.filter((v) => v !== name) : [...dimensions, name];
   }
 
+  // Находки корпуса приходят окном, поэтому полное число берётся из ответа
+  // сервера: молчаливого среза в списках выбора нет.
   async function loadCorpus(): Promise<void> {
+    corpusSeq += 1;
     try {
-      corpus = await api.findings();
+      const window = await api.findings(undefined, undefined, CORPUS_PAGE_SIZE, 0);
+      corpus = window.items;
+      corpusTotal = window.total;
+      corpusOffset = window.items.length;
+      corpusMoreError = '';
       corpusError = '';
     } catch (reason) {
       corpus = null;
+      corpusTotal = null;
+      corpusOffset = 0;
+      // Отказ по праву и технический сбой различаются словами и действием.
       corpusError =
         reason instanceof ApiError && reason.status === 403
-          ? 'находки корпуса этому аккаунту не открыты'
-          : 'списки корпуса не загрузились';
+          ? 'Находки корпуса этому аккаунту не открыты. Право выдаёт администратор сервиса.'
+          : 'Списки корпуса не загрузились. Проверьте соединение и повторите.';
+    }
+  }
+
+  async function loadCorpusMore(): Promise<void> {
+    const call = ++corpusSeq;
+    corpusMoreLoading = true;
+    corpusMoreError = '';
+    try {
+      const window = await api.findings(undefined, undefined, CORPUS_PAGE_SIZE, corpusOffset);
+      if (call !== corpusSeq) return;
+      const seen = new Set((corpus ?? []).map((finding) => finding.id));
+      corpus = [...(corpus ?? []), ...window.items.filter((finding) => !seen.has(finding.id))];
+      corpusOffset += window.items.length;
+      if (window.total !== null) corpusTotal = window.total;
+      // Страница пустая: дальше показывать нечего, кнопка осталась бы пустым
+      // действием.
+      if (window.items.length === 0) corpusTotal = corpus.length;
+    } catch {
+      if (call === corpusSeq) corpusMoreError = 'Следующие находки не добавились. Повторите.';
+    } finally {
+      if (call === corpusSeq) corpusMoreLoading = false;
     }
   }
 
@@ -308,10 +374,10 @@
       );
     } catch (reason) {
       matrix = null;
-      // Отказ по доступу и технический сбой — две разные строки, и обе человеческие.
+      // Отказ по доступу и технический сбой две разные строки, и обе человеческие.
       if (reason instanceof ApiError && reason.status === 403) {
         forbidden =
-          'Сравнение открыто аккаунтам с доступом к корпусу — запросите его у администратора сервиса.';
+          'Сравнение открыто аккаунтам с доступом к корпусу. Право выдаёт администратор сервиса.';
       } else {
         error = 'Не удалось получить сравнение. Проверьте соединение и повторите.';
       }
@@ -331,7 +397,7 @@
   }
 
   /**
-   * Способ выбрать технологию и измерение один — списки корпуса: рельс на широком
+   * Способ выбрать технологию и измерение один: списки корпуса. Рельс на широком
    * экране, свёрнутый аккордеон под результатом на узком. Подсказка в условиях
    * раскрывает его и прокручивает к нему вместо второго поля ввода.
    */
@@ -345,8 +411,13 @@
     );
   }
 
-  // Вывод по сравнению записывают в «Проверке решений»: ссылка передаёт, о чём
-  // именно вывод, чтобы не набирать основание отзыва заново.
+  // Сколько находок показалось за списком выбора: без полного числа оговорки нет.
+  const corpusLeft = $derived(
+    corpusTotal === null ? 0 : Math.max(0, corpusTotal - corpusOffset),
+  );
+
+  // Вывод по сравнению записывают в отзыв на ответ (в навигации раздел
+  // «Отзывы»): ссылка передаёт, о чём именно вывод, чтобы не набирать его заново.
   const feedbackHref = $derived(
     `/feedback?about=${encodeURIComponent(
       questionEcho || entities.map(entityLabel).join(', ') || 'сравнение технологий',
@@ -384,7 +455,7 @@
 </script>
 
 <svelte:head>
-  <title>Сравнение технологий — Научный Клубок</title>
+  <title>Сравнение технологий: Научный Клубок</title>
 </svelte:head>
 
 {#snippet corporaBlock()}
@@ -395,21 +466,21 @@
     </p>
 
     <p class="field__label">
-      Технологии корпуса
+      Технологии
       <!-- Число при заголовке говорит, сколько меток в списке всего: в рельсе
-           сразу видно не все. Во время загрузки счётчика нет — «0» выглядел бы
-           как пустой корпус. -->
+           сразу видно не все. Во время загрузки счётчика нет: «0» выглядел бы как
+           пустой корпус. -->
       {#if corpus}
         <span class="muted">(<span class="num">{subjectNames.length}</span>)</span>
       {/if}
     </p>
     {#if corpus}
       {#if subjectNames.length === 0}
-        <!-- Пустой корпус — не «нет совпадений»: сравнивать нечего, пока в него
+        <!-- Пустой корпус это не «нет совпадений»: сравнивать нечего, пока в него
              не положен документ. Вводить вручную нечего, поэтому подсказка ведёт
              туда, где корпус пополняется. -->
         <p class="micro muted">
-          В находках корпуса нет ни одного субъекта: технология приходит вместе с
+          В находках корпуса нет ни одной технологии: технология приходит вместе с
           документом.
         </p>
         <Button href="/findings" variant="quiet" size="sm">Пополнить корпус</Button>
@@ -425,17 +496,18 @@
         </div>
       {/if}
     {:else if corpusError}
-      <p class="micro muted">Список технологий не получен: {corpusError}</p>
+      <p class="micro muted">{corpusError}</p>
+      <Button variant="quiet" size="sm" onclick={() => void loadCorpus()}>Обновить списки корпуса</Button>
     {:else}
       <div class="cmp__skeleton" role="status">
         <span class="skeleton cmp__skeleton-line"></span>
         <span class="skeleton cmp__skeleton-line cmp__skeleton-line--short"></span>
-        <p class="micro muted">Читаем находки корпуса…</p>
+        <p class="micro muted">Загружаем находки корпуса…</p>
       </div>
     {/if}
 
     <p class="field__label">
-      Измерения в находках
+      Измерения
       {#if corpus}
         <span class="muted">(<span class="num">{propertyNames.length}</span>)</span>
       {/if}
@@ -443,8 +515,7 @@
     {#if corpus}
       {#if propertyNames.length === 0}
         <p class="micro muted">
-          Числовых свойств в находках нет — колонок не будет, пока корпус не
-          пополнится числами.
+          Измерений в находках нет: колонок не будет, пока в корпус не придут числа.
         </p>
       {:else}
         <div class="cmp__chips">
@@ -456,9 +527,49 @@
         </div>
       {/if}
     {:else if corpusError}
-      <p class="micro muted">Измерения не получены: {corpusError}</p>
+      <p class="micro muted">Измерения не получены: обновите списки корпуса.</p>
     {:else}
-      <p class="micro muted" role="status">Измерения появятся, когда прочитаем находки корпуса.</p>
+      <p class="micro muted" role="status">Измерения появятся, когда загрузим находки корпуса.</p>
+    {/if}
+
+    <!-- Ось «сколько показано»: список выбора построен по окну находок, поэтому
+         знаменатель назван и неполнота закрыта одной кнопкой. -->
+    {#if corpus}
+      <p class="micro muted">
+        {#if corpusTotal !== null}
+          Показано <span class="num">{countOf(corpus.length, 'находка', 'находки', 'находок')}</span> из
+          <span class="num">{corpusTotal}</span>.
+        {:else}
+          Показано <span class="num">{countOf(corpus.length, 'находка', 'находки', 'находок')}</span>.
+        {/if}
+      </p>
+      {#if corpusLeft > 0}
+        <Button
+          variant="quiet"
+          size="sm"
+          busy={corpusMoreLoading}
+          disabled={corpusMoreLoading}
+          onclick={() => void loadCorpusMore()}
+        >
+          {corpusMoreLoading ? 'Показываем ещё…' : 'Показать ещё'}
+        </Button>
+      {/if}
+      {#if corpusMoreError}
+        <p class="micro muted">{corpusMoreError}</p>
+      {/if}
+    {/if}
+
+    <!-- Служебные имена ключей, которые экран заменил заглушкой: сырой ключ
+         корпуса больше не становится заголовком столбца. -->
+    {#if serviceKeys.length}
+      <details class="cmp__svc">
+        <summary class="micro">Служебные данные</summary>
+        <ul class="cmp__svc-list">
+          {#each serviceKeys as item (item.key)}
+            <li><span>{item.label}</span> <span class="tech">{item.key}</span></li>
+          {/each}
+        </ul>
+      </details>
     {/if}
 
     <div class="cmp__list-actions">
@@ -470,10 +581,10 @@
           variant="ghost"
           size="sm"
           disabled={loading}
-          title="Берём не больше четырёх технологий — остальное отмечаете сами"
+          title="Отмечаем не больше четырёх технологий, остальное отмечаете сами"
           onclick={takeSubjects}
         >
-          Взять технологии из корпуса
+          Отметить первые 4 технологии
         </Button>
       {/if}
     </div>
@@ -495,32 +606,47 @@
     <!-- Тело остаётся в DOM и получает `hidden`: ссылка aria-controls ведёт к
          существующему элементу в обоих состояниях раскрытия. -->
     <div class="acc__body" id="cmp-help-body" hidden={!helpOpen}>
-      <p>
-        Строки — технологии (субъекты утверждений), колонки — измеримые свойства
-        наблюдений. В ячейке стоит каждое различное число источников с единицей, цитата
-        и уверенность извлечения: расхождение не сводится к одной удачной цифре.
+      <p>В строках таблицы технологии, в колонках измерения. В ячейке то же число, что
+        в находке корпуса, с единицей и цитатой источника: расхождение источников не
+        прячется за одной удачной цифрой. Уверенность модели, с которой число извлекли,
+        спрятана в «Служебных данных» ячейки.
       </p>
       <p>
-        Технология ищется в субъекте утверждения целым словом, а не фрагментом: «Fe» не
-        стянет в одну строку Fe2O3 и FeS. Если измерений не отмечено, показываем все
-        свойства наблюдений выбранных технологий.
+        Технология ищется в названии утверждения целым словом, а не фрагментом: «Fe» не
+        соберёт в одну строку Fe2O3 и FeS. Если измерений не отмечено, сравниваем по всем
+        измерениям выбранных технологий.
       </p>
       <p>
-        Метки соответствия считаются по пределу, распознанному в самом наблюдении: если у
-        наблюдения есть оператор «≤» или «≥», берём его нормализованное число, если
-        оператора нет — направление распознаём по формулировке («не выше», «выше»). Это
-        распознавание, а не поле корпуса, поэтому у каждой метки предела в подписи сказано,
-        откуда он взят. Если у свойства несколько разных пределов, сверка идёт по самому
-        строгому: «не выше» — по меньшему числу, «не ниже» — по большему.
-      </p>
-      <p>
-        «Вне предела» — значение вышло за распознанный предел того же свойства и единицы.
-        Когда предела нет, единицы не совпали или число не разобралось, ячейка получает
-        «не сверено», а не «в пределе»; строка без единой удачной сверки помечается
-        «нечего сверять».
+        Предел это ограничение из текста источника: «не выше 92,5». Мы находим его по знаку
+        в наблюдении или по словам «не выше» и «не ниже» и сверяем с ним числа в таблице.
+        Такое распознавание не записано в корпусе отдельным полем, поэтому у каждой метки
+        предела открыто сказано, откуда он взят. Если у измерения несколько пределов,
+        сверяем по самому строгому: «не выше» по меньшему числу, «не ниже» по большему.
       </p>
     </div>
   </div>
+{/snippet}
+
+{#snippet cellContent(header: string, cell: ComparisonCell | undefined)}
+  {#if cell?.value}
+    {@const state = cellState(header, cell)}
+    <div class="cmp__cell">
+      <span class="num cmp__value">{serverValue(cell.value)}</span>
+      {#if cell.unit}<span class="micro muted cmp__unit">{cell.unit}</span>{/if}
+      <!-- В пути чтения остаётся цветовой итог сверки словом: полоса и процент
+           уверенности модели ушли в раскрытие ниже. -->
+      <StatusPill status={state.pill} label={state.label} />
+      {#if cell.evidence}<blockquote class="quote cmp__quote">{cell.evidence}</blockquote>{/if}
+      <details class="cmp__svc">
+        <summary class="micro">Служебные данные</summary>
+        <p class="micro muted cmp__conf">
+          уверенность извлечения <span class="num">{pct(cell.confidence)}</span>
+        </p>
+      </details>
+    </div>
+  {:else}
+    <span class="small muted">{COMPARE_CELL_LABELS.novalue}</span>
+  {/if}
 {/snippet}
 
 <div class="page cmp-page">
@@ -529,9 +655,9 @@
          на нём заменяет заголовок. -->
     <SectionHead
       level="1"
-      eyebrow={narrow ? '' : 'Корпус · технологии · измерения'}
+      eyebrow={narrow ? '' : 'Корпус, измерения, пределы'}
       title="Сравнение технологий"
-      lead="Технологии по измерениям — бок о бок: число, единица и цитата источника в каждой ячейке."
+      lead="Технологии стоят рядом по каждому измерению: число, единица и цитата источника в ячейке."
     />
 
     {#if allowed === null}
@@ -539,7 +665,7 @@
         <div class="cmp__skeleton">
           <span class="skeleton cmp__skeleton-line"></span>
           <span class="skeleton cmp__skeleton-block"></span>
-          <p class="micro muted">Уточняем доступ к сравнению — результаты появятся после этого.</p>
+          <p class="micro muted">Уточняем доступ к сравнению.</p>
         </div>
       </Panel>
     {:else if !allowed}
@@ -549,12 +675,14 @@
           <StatusPill status="off" label="нет доступа" />
         </div>
         <p class="lead small">
-          Сравнение технологий открыто аккаунтам с доступом к корпусу — запросите его
-          у администратора сервиса.
+          Сравнение технологий открыто аккаунтам с доступом к корпусу. Право выдаёт
+          администратор сервиса.
         </p>
+        <!-- Переходы называются разделами из `nav.ts`: «Рабочее пространство»
+             было третьим именем раздела «Вопрос». -->
         <div class="row">
-          <Button href="/research" variant="quiet">Рабочее пространство</Button>
-          <Button href="/findings" variant="ghost">Находки корпуса</Button>
+          <Button href="/research" variant="quiet">{navLabel('/research')}</Button>
+          <Button href="/findings" variant="ghost">{navLabel('/findings')}</Button>
         </div>
       </Panel>
     {:else}
@@ -571,7 +699,7 @@
             <div class="cmp__field">
               <p class="field__label">
                 Технологии
-                <span class="muted">({entities.length})</span>
+                <span class="muted">(<span class="num">{entities.length}</span>)</span>
               </p>
               <!-- Здесь только итог выбора. Метка и есть действие: нажатие убирает
                    технологию из сравнения, отдельной кнопки-крестика нет. -->
@@ -586,7 +714,7 @@
               {/if}
               {#if needsEntities}
                 <p class="field__error">
-                  Нужна хотя бы одна технология — отметьте её в списках корпуса.
+                  Нужна хотя бы одна технология. Отметьте её в списках корпуса.
                 </p>
               {/if}
               <Button variant="link" size="sm" onclick={openCorpora}>
@@ -597,7 +725,8 @@
             <div class="cmp__field">
               <p class="field__label">
                 Измерения
-                <span class="muted">({dimensions.length}) · необязательно</span>
+                <span class="muted">(<span class="num">{dimensions.length}</span>)</span>
+                <span class="micro muted">необязательно</span>
               </p>
               {#if dimensions.length}
                 <div class="cmp__picker">
@@ -608,17 +737,17 @@
                 <p class="field__hint">Нажатие на метку убирает её из сравнения.</p>
               {:else}
                 <p class="small muted cmp__none">
-                  Без отметок сравниваем по всем измерениям наблюдений.
+                  Без отметок сравниваем по всем измерениям выбранных технологий.
                 </p>
               {/if}
             </div>
 
             <div class="cmp__field">
               <Field
-                label="Вопрос сравнения — необязательно"
+                label="Вопрос сравнения (необязательно)"
                 name="cmp-question"
                 bind:value={question}
-                placeholder="напр. какая технология держит соли по холодной шахтной воде"
+                placeholder="Например: какая технология лучше очищает воду на морозе"
                 hint="Одна строка контекста к результату: на числа она не влияет."
                 onenter={() => void runCompare()}
               />
@@ -639,7 +768,7 @@
                 {forbidden}
               </Notice>
               <div class="row">
-                <Button href="/findings" variant="quiet">Находки корпуса</Button>
+                <Button href="/findings" variant="quiet">{navLabel('/findings')}</Button>
                 <Button href="/account" variant="ghost">Что открыто моему аккаунту</Button>
               </div>
             </Panel>
@@ -651,17 +780,14 @@
                   Повторить сравнение
                 </Button>
                 <Button variant="quiet" disabled={loading} onclick={() => void loadCorpus()}>
-                  Перечитать корпус
+                  Обновить списки корпуса
                 </Button>
               </div>
             </Panel>
           {:else if loading}
             <Panel tone="sunk">
               <div class="cmp__skeleton">
-                <p class="micro muted">
-                  В ячейке — все различные значения наблюдений по свойству: расхождение
-                  источников не прячется за одной удачной цифрой.
-                </p>
+                <p class="micro muted">Считаем сравнение по находкам корпуса.</p>
                 <span class="skeleton cmp__skeleton-line"></span>
                 <span class="skeleton cmp__skeleton-block"></span>
                 <span class="skeleton cmp__skeleton-line"></span>
@@ -672,12 +798,12 @@
             <Empty
               icon="compare"
               title="До первого сравнения результата нет"
-              body="Отметьте технологии в списках корпуса — покажем их числа по общим измерениям, с цитатой источника в каждой ячейке."
+              body="Отметьте технологии в списках корпуса: покажем их числа по общим измерениям, с цитатой источника в ячейке."
             >
               {#snippet action()}
                 <div class="row">
                   <Button variant="quiet" size="sm" onclick={openCorpora}>Отметить технологии</Button>
-                  <Button variant="ghost" size="sm" href="/graph">Посмотреть узлы на карте</Button>
+                  <Button variant="ghost" size="sm" href="/graph">{navLabel('/graph')}</Button>
                 </div>
               {/snippet}
             </Empty>
@@ -685,7 +811,7 @@
             <Empty
               icon="filter"
               title="Указанных измерений в находках нет"
-              body="У отмеченных технологий этих измерений нет: снимите отметки — и останутся все свойства наблюдений."
+              body="У отмеченных технологий этих измерений нет. Снимите отметки, и останутся все измерения."
             >
               {#snippet action()}
                 <div class="row">
@@ -693,7 +819,7 @@
                     Сравнить без отмеченных измерений
                   </Button>
                   <Button variant="ghost" size="sm" onclick={() => void loadCorpus()}>
-                    Перечитать измерения корпуса
+                    Обновить списки корпуса
                   </Button>
                 </div>
               {/snippet}
@@ -702,14 +828,14 @@
             <Empty
               icon="search"
               title="Таких технологий в находках нет"
-              body="Ни одно утверждение корпуса не называет их целым словом: субъект ищется целиком, а не по фрагменту названия."
+              body="Ни одно утверждение корпуса не называет их целым словом: название ищется целиком, а не по фрагменту."
             >
               {#snippet action()}
                 <!-- Третьего способа выбрать технологию здесь нет: ряд быстрых кнопок
                      дублировал бы списки корпуса. Ведём к ним. -->
                 <div class="row">
                   <Button variant="quiet" size="sm" onclick={openCorpora}>Отметить технологии</Button>
-                  <Button variant="ghost" size="sm" href="/findings">Посмотреть находки</Button>
+                  <Button variant="ghost" size="sm" href="/findings">{navLabel('/findings')}</Button>
                 </div>
               {/snippet}
             </Empty>
@@ -722,16 +848,26 @@
                     <p class="h4">{questionEcho}</p>
                   </div>
                 {/if}
+                <!-- Счётчики подписаны отдельно: знаменатель у каждой свой. -->
                 <p class="micro muted cmp__counts">
-                  {countOf(matrix.rows.length, 'строка', 'строки', 'строк')} ·
-                  {countOf(matrix.headers.length, 'измерение', 'измерения', 'измерений')}
+                  <span class="num">{matrix.rows.length}</span>
+                  {plural(matrix.rows.length, 'технология', 'технологии', 'технологий')}
+                </p>
+                <p class="micro muted cmp__counts">
+                  <span class="num">{matrix.headers.length}</span>
+                  {plural(matrix.headers.length, 'измерение', 'измерения', 'измерений')}
                 </p>
               </div>
-              <!-- Кодировка полосы подписана один раз на матрицу: полоса и так
-                   стоит рядом с числом уверенности в каждой ячейке. -->
-              <p class="micro muted cmp__bar-hint">
-                Полоса в ячейке: длина — уверенность источника, цвет — итог сверки.
-              </p>
+              <!-- Легенда цветовых итогов над таблицей: смысл метки читается там,
+                   где на неё смотрят, а не только в справке внизу. -->
+              <ul class="cmp__legend">
+                {#each COMPARE_LEGEND as item (item.label)}
+                  <li>
+                    <StatusPill status={item.pill} label={item.label} />
+                    <span class="micro muted">{item.note}</span>
+                  </li>
+                {/each}
+              </ul>
 
               {#if narrow}
                 <div class="cmp__notes">
@@ -745,33 +881,9 @@
                       {#if assess.why}<p class="micro cmp__why">{assess.why}</p>{/if}
                       <dl class="cmp__note-list">
                         {#each matrix.headers as header (header)}
-                          {@const cell = row.cells[header]}
-                          {@const state = cellState(header, cell)}
                           <div class="cmp__note-cell">
-                            <dt>
-                              {dimensionLabel(header)}
-                              <StatusPill status={state.pill} label={state.label} />
-                            </dt>
-                            <dd>
-                              {#if cell?.value}
-                                <span class="num cmp__value">{serverValue(cell.value)}</span>
-                                {#if cell.unit}<span class="micro muted cmp__unit">{cell.unit}</span>{/if}
-                                <!-- Полоса — повтор числа: значение и так сказано
-                                     строкой ниже, поэтому экрану чтения она не нужна. -->
-                                <div class="bar" aria-hidden="true">
-                                  <span
-                                    class="bar__fill{barModifier(state.pill)}"
-                                    style="width: {confidenceWidth(cell.confidence)}"
-                                  ></span>
-                                </div>
-                                <p class="micro muted">
-                                  уверенность извлечения <span class="num">{pct(cell.confidence)}</span>
-                                </p>
-                                {#if cell.evidence}<blockquote class="quote">{cell.evidence}</blockquote>{/if}
-                              {:else}
-                                <span class="small muted">{COMPARE_CELL_LABELS.novalue}</span>
-                              {/if}
-                            </dd>
+                            <dt>{dimensionLabel(header)}</dt>
+                            <dd>{@render cellContent(header, row.cells[header])}</dd>
                           </div>
                         {/each}
                       </dl>
@@ -779,13 +891,13 @@
                   {/each}
                 </div>
               {:else}
-                <!-- Широкая матрица на 1024 px и при пяти измерениях уходит за
-                     блок: `.table-wrap` режет её с видимым жёлобом, но полоса
-                     должна крутиться и с клавиатуры. `use:scrollRegion` ставит
-                     `tabindex` только когда есть что прокручивать, поэтому на
-                     целиком видимой таблице лишней точки фокуса не появляется. -->
+                <!-- Широкая матрица остаётся в своём рабочем блоке: горизонтально
+                     скроллится таблица, а не страница, и скроллится она тоже
+                     внутри блока, поэтому шапка и первая колонка не уплывают при
+                     десятках технологий. `use:scrollRegion` ставит `tabindex`
+                     только когда есть что прокручивать. -->
                 <div
-                  class="table-wrap"
+                  class="table-wrap cmp__matrix"
                   role="region"
                   aria-label="Таблица сравнения"
                   use:scrollRegion
@@ -797,7 +909,7 @@
                     </caption>
                     <thead>
                       <tr>
-                        <th scope="col">технология</th>
+                        <th scope="col" class="cmp__corner">технология</th>
                         {#each matrix.headers as header (header)}
                           <th scope="col">{dimensionLabel(header)}</th>
                         {/each}
@@ -807,38 +919,13 @@
                       {#each matrix.rows as row (row.item)}
                         {@const assess = rowAssessment(row, matrix.headers)}
                         <tr>
-                          <th scope="row">
+                          <th scope="row" class="cmp__rowhead">
                             <span class="cmp__item">{entityLabel(row.item)}</span>
                             <StatusPill status={assess.pill} label={assess.label} />
                             {#if assess.why}<span class="micro cmp__why">{assess.why}</span>{/if}
                           </th>
                           {#each matrix.headers as header (header)}
-                            {@const cell = row.cells[header]}
-                            {@const state = cellState(header, cell)}
-                            <td>
-                              {#if cell?.value}
-                                <div class="cmp__cell">
-                                  <span class="num cmp__value">{serverValue(cell.value)}</span>
-                                  {#if cell.unit}<span class="micro muted cmp__unit">{cell.unit}</span>{/if}
-                                  <StatusPill status={state.pill} label={state.label} />
-                                  <!-- Полоса повторяет число из строки под ней. -->
-                                  <div class="bar" aria-hidden="true">
-                                    <span
-                                      class="bar__fill{barModifier(state.pill)}"
-                                      style="width: {confidenceWidth(cell.confidence)}"
-                                    ></span>
-                                  </div>
-                                  <p class="micro muted cmp__conf">
-                                    уверенность извлечения <span class="num">{pct(cell.confidence)}</span>
-                                  </p>
-                                  {#if cell.evidence}
-                                    <blockquote class="quote cmp__quote">{cell.evidence}</blockquote>
-                                  {/if}
-                                </div>
-                              {:else}
-                                <span class="small muted">{COMPARE_CELL_LABELS.novalue}</span>
-                              {/if}
-                            </td>
+                            <td>{@render cellContent(header, row.cells[header])}</td>
                           {/each}
                         </tr>
                       {/each}
@@ -851,41 +938,42 @@
             {#if declaredLimits.length}
               <Panel tone="sage">
                 <p class="micro muted">
-                  Пределы, по которым сверяем значения. Как они распознаны и почему
-                  их может не быть — в «Как читать сравнение» под результатом.
+                  Пределы, по которым сверяем значения. Направление предела мы распознаём в
+                  тексте источника: отдельного поля для него в корпусе нет, поэтому источник
+                  подписан при каждой метке.
                 </p>
                 <div class="cmp__limits">
                   {#each declaredLimits as [property, limit] (property)}
-                    <!-- Откуда взят предел — подписью при самой метке: это
-                         распознавание из наблюдения, а не поле корпуса, и в строке
-                         оно только мешает читать число. -->
-                    <span class="tag" title={COMPARE_LIMIT_SOURCE[limit.from]}>
-                      {dimensionLabel(property)} {OPERATOR_SYMBOL[limit.kind]}
-                      <span class="num">{num(limit.at)}</span> {limit.unit}
-                    </span>
+                    <!-- Откуда взят предел, открытой строкой, а не только подсказкой:
+                         на тач-устройстве в `title` не посмотреть. -->
+                    <div class="cmp__limit">
+                      <span class="tag">{limitTagText(dimensionLabel(property), limit)}</span>
+                      <span class="micro muted">{COMPARE_LIMIT_SOURCE[limit.from]}</span>
+                    </div>
                   {/each}
                 </div>
               </Panel>
             {:else}
               <p class="micro muted cmp__nolimit">
-                Ни в одном наблюдении предел не распознан, поэтому меток соответствия
-                здесь нет: строки помечены «нечего сверять», ячейки — «не сверено».
+                Ни в одном наблюдении предел не распознан, поэтому меток соответствия здесь
+                нет: строки помечены «нечего сверять», ячейки «не сверено».
               </p>
             {/if}
 
-            <!-- У сравнения есть конец: вывод по числам записывают в «Проверке
-                 решений», иначе сопоставление остаётся наблюдением без следа. -->
+            <!-- У сравнения есть конец: вывод записывают в отзыв на ответ (в
+                 навигации раздел «Отзывы»), иначе сопоставление остаётся
+                 наблюдением без следа. -->
             {#if matrix.rows.length > 0}
               <Panel tone="lav">
                 <div class="cmp__close-row">
                   <div class="stack">
                     <h3 class="h4">Вывод по этим числам</h3>
                     <p class="micro muted">
-                      Запишите его в «Проверке решений» — он попадёт в журнал отзывов
-                      вместе с вердиктом и комментарием.
+                      Запишите его в отзыве на ответ: вывод попадёт в журнал отзывов вместе
+                      с решением и комментарием.
                     </p>
                   </div>
-                  <Button href={feedbackHref} variant="action">Записать вывод</Button>
+                  <Button href={feedbackHref} variant="action">Записать отзыв</Button>
                 </div>
               </Panel>
             {/if}
@@ -1131,9 +1219,53 @@
     margin: 0;
   }
 
-  /* Подпись кодировки полосы — плотная строка под шапкой, без абзацных отступов. */
-  .cmp__bar-hint {
+  /* Легенда итогов сверки: метка и её смысл в одной строке, рядом с таблицей,
+     а не в справке внизу страницы. */
+  .cmp__legend {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
     margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .cmp__legend li {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+
+  /* Служебные имена и величины под одним раскрытием: в пути чтения их нет. */
+  .cmp__svc {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+    width: 100%;
+  }
+
+  .cmp__svc summary {
+    cursor: pointer;
+    color: var(--ink-3);
+  }
+
+  .cmp__svc-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .cmp__svc-list li {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    flex-wrap: wrap;
+    font-size: var(--t-micro);
+    color: var(--ink-3);
   }
 
   .cmp__caption {
@@ -1143,6 +1275,44 @@
     font-size: var(--t-micro);
     color: var(--ink-3);
     background: var(--surface-sunk);
+  }
+
+  /*
+   * Матрица живёт в своём прокручиваемом блоке на обе оси: страница горизонтальным
+   * скроллом не идёт никогда, а при десятках технологий имена строк и заголовки
+   * колонок остаются на месте (`position: sticky`). Потолок высоты держит таблицу
+   * внутри рабочей области, вертикальная полоса у неё своя.
+   */
+  .cmp__matrix {
+    overflow-y: auto;
+    max-height: calc(100dvh - var(--topbar-h) - var(--s8));
+    scrollbar-color: var(--ink-4) var(--surface-sunk);
+  }
+
+  .cmp__matrix::-webkit-scrollbar-track {
+    background: var(--surface-sunk);
+  }
+
+  .cmp__matrix thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface-raised);
+  }
+
+  /* Угловая клетка перекрывает и шапку, и первую колонку: под ней не должно
+     быть ни полосы таблицы, ни имени строки. */
+  .cmp__corner {
+    left: 0;
+    z-index: 3;
+  }
+
+  .cmp__rowhead {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    background: var(--surface-raised);
+    max-width: 240px;
   }
 
   .cmp__table td {
@@ -1236,11 +1406,24 @@
     gap: var(--s2);
   }
 
+  /* Метка предела и её источник парой: откуда взят предел видно рядом с числом,
+     а не только в подсказке. */
   .cmp__limits {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--s2);
+    gap: var(--s3) var(--s5);
     margin-top: var(--s3);
+  }
+
+  .cmp__limit {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    flex-wrap: wrap;
+  }
+
+  .cmp__limit .micro {
+    color: var(--ink-3);
   }
 
   .cmp__nolimit {

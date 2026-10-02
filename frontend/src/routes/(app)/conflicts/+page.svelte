@@ -1,32 +1,65 @@
 <script lang="ts">
-  // Расхождение — это спор двух источников об одном и том же числе. Тема держит
-  // обе формулировки рядом, их величины лежат на одной полосе, базовый источник
-  // выбирает аналитик, а решение фиксируется в «Оценке ответов». Сбой чтения,
-  // пустой корпус и корпус без споров — три разных состояния, не одно «пусто».
+  // Расхождение — тема, где два первоисточника дают разные числа об одном
+  // показателе. Тема держит обе формулировки рядом, их величины лежат на одной
+  // полосе, аналитик выбирает главный источник (от него считается сравнение) и
+  // фиксирует решение в «Отзывах». Сбой чтения, пустой корпус и корпус без
+  // расхождений — три разных состояния, а не одно «пусто».
+  // Ниже очередь на проверку: пары чисел, которые сервис нашёл, но решение по
+  // ним ещё не записано. У очереди свой запрос, свои состояния и своё действие,
+  // потому что она существует и тогда, когда подтверждённых расхождений нет.
+  // Право подтверждать или отклонять противоречие выдаёт администратор сервиса:
+  // без него пары видны, кнопок нет.
   // Шапку, skip-link и <main id="main"> рендерит +layout.svelte.
   import { api, ApiError } from '$lib/api';
-  import { countOf, num, pct } from '$lib/format';
+  import { countOf, dateTime, num, pct } from '$lib/format';
   import { navLabel } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import {
     CONFLICTS_ACTION,
+    CONFLICTS_FAILURE,
+    CONFLICTS_PAGE,
+    CONFLICT_FROM_MAIN,
+    CONFLICT_QUEUE_ACTION,
+    CONFLICT_QUEUE_CLASS_HINT,
+    CONFLICT_QUEUE_FAILURE,
+    CONFLICT_QUEUE_HEAD,
+    CONFLICT_QUEUE_HINTS,
+    CONFLICT_QUEUE_STATUS_LABELS,
+    CONFLICT_QUEUE_STATUS_TONE,
+    CONFLICT_QUEUE_SVC,
+    CONFLICT_QUEUE_WORDS,
     CONFLICT_SCALE_WORDS,
     CONFLICT_SIDE,
+    CONFLICT_TOPIC_SVC,
+    CONFLICT_TOPIC_WORDS,
     GAP_KIND_LABELS,
     GAP_KIND_TITLES,
-    OPERATOR_SYMBOL,
+    OPERATOR_WORD,
     PREDICATE_LABELS,
     PROPERTY_LABELS,
     STATUS_SHORT,
     SUBJECT_LABELS,
+    conflictsListUnloaded,
+    conflictsRecordNote,
+    conflictsSectionLink,
+    conflictsShownOf,
     describeScope,
     gapBody,
+    gapsShown,
     knownTerm,
+    othersShown,
+    queueCounter,
+    queueOutcome,
+    queueWaiting,
+    quotesShown,
     termOf,
+    topicsShown,
     type ConflictGapKind,
   } from '$lib/terms';
   import {
     DATA_CLASS_LABELS,
+    type ConflictCandidate,
+    type ConflictSide,
     type DataClass,
     type Evidence,
     type FindingListItem,
@@ -50,12 +83,13 @@
   const NO_SOURCE = 'источник не указан';
 
   // Экран живёт на реальном корпусе: пятьсот оспоренных находок не должны
-  // превращаться в одну простыню. Темы, цитаты, «прочие утверждения» и пробелы
-  // раскрываются порциями, и объём скрытого назван числом.
+  // превращаться в одну простыню. Темы, цитаты, значения полосы, остальные
+  // утверждения темы и пробелы имеют потолок и раскрываются действием.
   const GROUP_PAGE_SIZE = 6;
   const GAP_PAGE_SIZE = 8;
   const EVIDENCE_PREVIEW = 2;
   const OTHERS_PREVIEW = 3;
+  const BAND_PREVIEW = 4;
   // Сколько тем открыто по умолчанию: остальное раскрывает сам читатель.
   const FIRST_OPEN = 1;
 
@@ -64,25 +98,34 @@
   let failure = $state<{ title: string; text: string; denied: boolean } | null>(null);
   let loadedAt = $state<Date | null>(null);
   // Сколько утверждений в корпусе всего. Без этого «расхождений нет» неотличимо
-  // от пустого корпуса; null — показаний не пришли, и экран обязан это сказать.
+  // от пустого корпуса; null означает, что показаний нет, и экран обязан
+  // сказать это отдельно от нуля.
   let corpusClaims = $state<number | null>(null);
+  // Сервер режет список тем окном: полное число оспоренных утверждений несёт
+  // заголовок ответа, а не длина массива. null означает, что показаний нет, и
+  // экран не вправе называть показанное ни всеми, ни неполным. Оговорка о
+  // неполном чтении приходит с сервиса уже человеческим текстом.
+  let conflictsTotal = $state<number | null>(null);
+  let conflictsNote = $state<string | null>(null);
 
   // ── Отбор и раскрытие: каждый контроль реально меняет список ────────────
   let search = $state('');
   let onlyNumeric = $state(false);
-  // pressed у чипа класса данных значит «класс выбран и показан» — тот же
-  // смысл, что у фасетных чипов в находках. Пустой выбор = показаны все.
+  // pressed у чипа доступа значит «доступ выбран и показан» — тот же смысл,
+  // что у фасетных чипов в находках. Пустой выбор = показаны все.
   let pickedClasses = $state<DataClass[]>([]);
   let sortKey = $state<string>('divergence');
   // Форма отбора под сворачиванием: смотреть темы нужно чаще, чем править
-  // отбор, — применённые условия остаются строкой над списком.
+  // отбор, поэтому применённые условия остаются строкой над списком.
   let filtersOpen = $state(false);
   let collapsed = $state<Set<string>>(new Set());
   let expanded = $state<Set<string>>(new Set());
   let openQuotes = $state<Set<string>>(new Set());
   let openOthers = $state<Set<string>>(new Set());
-  // Ключ темы → пара идентификаторов [база, с чем сверяем]. Пока записи нет,
-  // работает авторская пара корпуса; выбирать базу может аналитик.
+  let openMain = $state<Set<string>>(new Set());
+  let openBand = $state<Set<string>>(new Set());
+  // Ключ темы → пара идентификаторов [главный источник, сверяемый]. Пока
+  // записи нет, работает подобранная корпусом пара.
   let pairPicks = $state<Record<string, [string, string]>>({});
   let shownGroups = $state(GROUP_PAGE_SIZE);
   let shownGaps = $state(GAP_PAGE_SIZE);
@@ -120,7 +163,7 @@
     lo: number;
     hi: number;
     spread: number;
-    ratio: number | null;
+    /** Относительный размах полосы: служит порядком тем, а не выводом о базе. */
     relative: number | null;
     overlap: [number, number] | null;
     disjoint: boolean;
@@ -130,13 +173,13 @@
     /** Заголовок темы: русское имя связки либо формулировка, когда имени нет. */
     title: string;
     named: boolean;
-    /** Служебные ключи остаются подписью при человекочитаемом названии. */
+    /** Служебные ключи темы: только под раскрытием «Служебные данные». */
     keys: string[];
   }
 
   /**
-   * Пара для сравнения: base — источник, который аналитик считает основным,
-   * other — тот, что он с ним сверяет. manual — пару выбрал человек, а не экран.
+   * Пара для сравнения: base — главный источник, который выбрал аналитик,
+   * other — сверяемый. manual — пару выбрал человек, а не экран.
    */
   interface Pair {
     base: FindingListItem | null;
@@ -150,7 +193,7 @@
     topic: Topic;
     findings: FindingListItem[];
     comparisons: Comparison[];
-    /** null — относительной величины нет: нет и настоящей базы у шкалы. */
+    /** null — относительного размаха нет: все величины не положительны. */
     divergence: number | null;
     sourceCount: number;
     headline: Comparison | null;
@@ -168,15 +211,21 @@
     source: string;
   }
 
+  /** Место в источнике: страница, лист, диапазон ячеек. Символовые оффсеты
+   *  остались в служебных данных: на виду они читателю не помогают. */
   function locatorsOf(evidence: Evidence): Locator[] {
     const rows: Locator[] = [];
     if (evidence.page != null) rows.push({ kind: 'стр.', value: String(evidence.page), numeric: true });
     if (evidence.sheet) rows.push({ kind: 'лист', value: evidence.sheet, numeric: false });
     if (evidence.cell_range) rows.push({ kind: 'ячейки', value: evidence.cell_range, numeric: false });
-    if (evidence.char_start != null && evidence.char_end != null) {
-      rows.push({ kind: 'симв.', value: `${evidence.char_start}–${evidence.char_end}`, numeric: true });
-    }
     return rows;
+  }
+
+  /** Символовый оффсет фрагмента: появляется только под «Служебными данными». */
+  function charRangeOf(evidence: Evidence): string | null {
+    return evidence.char_start != null && evidence.char_end != null
+      ? `${evidence.char_start}–${evidence.char_end}`
+      : null;
   }
 
   function sourceOf(finding: FindingListItem): string {
@@ -189,14 +238,9 @@
     return known ? { name: known, named: true } : { name: key || '—', named: false };
   }
 
-  /** Служебное имя показателя — наведением: русское название важнее ключа. */
+  /** Служебное имя показателя остаётся подсказкой: русское название важнее ключа. */
   function propHint(propertyName: string, named: boolean): string | undefined {
     return named ? `служебное имя показателя: ${propertyName}` : undefined;
-  }
-
-  /** Служебные ключи темы — подписью, а не строкой в заголовке. */
-  function keysHint(keys: string[]): string | undefined {
-    return keys.length > 0 ? `служебные имена темы: ${keys.join(' · ')}` : undefined;
   }
 
   function bounds(obs: NumericObservation): { lo: number; hi: number } | null {
@@ -207,14 +251,24 @@
     return null;
   }
 
-  /** Число вместе с пределом: оператор — часть величины, а не украшение. */
+  /**
+   * Число вместе с пределом в одном формате с остальными экранами:
+   * «не меньше 95», «95–97». У диапазона печатаются оба края, поэтому связка
+   * «от…до» остаётся за пустым значением и пределы не теряют верхнюю границу.
+   * Когда из диапазона известен только один край, это предел, а не диапазон.
+   */
   function obsText(obs: NumericObservation): string {
+    if (obs.operator === 'between') {
+      if (obs.min_value != null && obs.max_value != null) {
+        return `${num(obs.min_value)}–${num(obs.max_value)}`;
+      }
+      if (obs.min_value != null) return `${OPERATOR_WORD.gte} ${num(obs.min_value)}`;
+      if (obs.max_value != null) return `${OPERATOR_WORD.lte} ${num(obs.max_value)}`;
+      return 'нет значения';
+    }
     const b = bounds(obs);
     if (!b) return 'нет значения';
-    if (obs.operator === 'between' && obs.min_value != null && obs.max_value != null) {
-      return `${num(b.lo)}–${num(b.hi)}`;
-    }
-    return `${OPERATOR_SYMBOL[obs.operator]} ${num(obs.value ?? b.lo)}`;
+    return `${OPERATOR_WORD[obs.operator]} ${num(obs.value ?? b.lo)}`;
   }
 
   function unitOf(obs: NumericObservation): string {
@@ -292,9 +346,8 @@
         lo,
         hi,
         spread,
-        ratio: lo > 0 && hi > lo ? hi / lo : null,
-        // Относительная величина есть только там, где есть настоящая база:
-        // ноль или переход через ноль базы не дают.
+        // Относительный размах полосы нужен только порядком тем: он считается от
+        // наименьшего значения и не выдаётся за сравнение от главного источника.
         relative: lo > 0 && spread > 0 ? spread / lo : null,
         overlap: minHi >= maxLo ? [maxLo, minHi] : null,
         disjoint,
@@ -306,7 +359,8 @@
   /**
    * Величина расхождения темы: абсолютный размах несравним между показателями
    * (95 % и 95 кВт·ч/т нельзя ставить в один порядок), поэтому считается только
-   * отношение к меньшему значению. Без базы — null.
+   * отношение к меньшему значению. Когда такого отношения нет, темы без числа
+   * идут после измеримых, а не получают выдуманное значение.
    */
   function divergenceOf(comparisons: Comparison[]): number | null {
     let max: number | null = null;
@@ -330,17 +384,17 @@
   }
 
   /**
-   * Заголовок темы. Когда словарь знает связку — она называется по-русски, а
-   * служебные ключи остаются подписью. Когда не знает — заголовком становится
-   * формулировка утверждения, а ключ уходит в подчинённую строку: сырой ключ
-   * заголовком не бывает.
+   * Заголовок темы. Когда словарь знает связку, она называется по-русски, а
+   * служебные ключи остаются под «Служебными данными». Когда не знает,
+   * заголовком становится формулировка утверждения: сырой ключ заголовком
+   * не бывает.
    */
   function topicFor(subject: string, predicate: string, list: FindingListItem[]): Topic {
     const keys = [subject, predicate].filter((key) => key.length > 0);
     const subjectName = knownTerm(SUBJECT_LABELS, subject);
     const predicateName = knownTerm(PREDICATE_LABELS, predicate);
     if (subjectName && predicateName) {
-      return { title: `${subjectName} · ${predicateName}`, named: true, keys };
+      return { title: `${subjectName}: ${predicateName}`, named: true, keys };
     }
     const statement = list.find((finding) => finding.statement.trim().length > 0)?.statement.trim();
     return { title: statement ?? 'тема без формулировки', named: false, keys };
@@ -349,7 +403,7 @@
   /**
    * Авторская пара темы: стороны берутся из самого широкого числового
    * расхождения, чтобы рядом встали именно спорящие величины, а не случайные две
-   * карточки. Аналитик вправе выбрать базу сам — см. pairOf.
+   * карточки. Аналитик вправе выбрать главный источник сам: см. pairOf.
    */
   function pairFor(
     list: FindingListItem[],
@@ -378,7 +432,7 @@
     return JSON.stringify([finding.subject ?? '', finding.predicate ?? '']);
   }
 
-  /** Сборка темы из бакета находок: одна и для отбора, и для полного среза. */
+  /** Сборка темы из бакета находок: одна и для отбора, и для полного списка. */
   function buildGroup(key: string, list: FindingListItem[]): Group {
     const parsed: unknown = JSON.parse(key);
     const [subject = '', predicate = ''] = Array.isArray(parsed) ? (parsed as string[]) : [];
@@ -403,9 +457,9 @@
   }
 
   /**
-   * Пара темы на экране: выбор аналитика важнее авторской пары корпуса. Если
-   * записанная находка пропала из среза, тема возвращается к авторской паре,
-   * а не остаётся с половиной.
+   * Пара темы на экране: выбор аналитика важнее подобранной корпусом пары.
+   * Если записанная находка пропала из списка, тема возвращается к паре
+   * корпуса, а не остаётся с половиной.
    */
   function pairOf(group: Group): Pair {
     const pick = pairPicks[group.id];
@@ -419,23 +473,21 @@
     return { base, other, manual: true };
   }
 
-  function pickBase(group: Group, findingId: string): void {
+  /**
+   * Выбор главного источника: прежний источник отходит на вторую сторону, чтобы
+   * выбор одного источника не терял молча то, с чем сверяли. От выбранной
+   * стороны считается сравнение: см. fromMainLabel.
+   */
+  function pickMain(group: Group, findingId: string): void {
     const current = pairOf(group);
     if (!current.base || current.base.id === findingId) return;
-    // Прежняя база отходит на вторую сторону: иначе выбор одного источника
-    // молча терял бы то, с чем сверяли.
     const other =
       current.other && current.other.id !== findingId ? current.other.id : current.base.id;
     pairPicks = { ...pairPicks, [group.id]: [findingId, other] };
   }
 
-  function swapSides(group: Group): void {
-    const current = pairOf(group);
-    if (!current.base || !current.other) return;
-    pairPicks = { ...pairPicks, [group.id]: [current.other.id, current.base.id] };
-  }
-
-  function autoPair(group: Group): void {
+  /** Сброс выбора: возвращается пара, которую подобрал корпус. */
+  function resetMain(group: Group): void {
     if (!(group.id in pairPicks)) return;
     const next = { ...pairPicks };
     delete next[group.id];
@@ -446,21 +498,75 @@
     return group.findings.filter((f) => f.id !== pair.base?.id && f.id !== pair.other?.id);
   }
 
-  /** Список выбора базы: без версии два утверждения одного документа не различить. */
-  function baseOptionLabel(finding: FindingListItem): string {
-    return `${sourceOf(finding) || NO_SOURCE} · версия ${finding.version}`;
+  /**
+   * Список выбора главного источника с потолком: тема на триста находок не
+   * даёт стену кнопок. Выбранные стороны остаются видимы, иначе выбор,
+   * спрятанный в хвосте списка, нельзя было бы ни снять, ни проверить.
+   */
+  function mainOptions(group: Group, pair: Pair): FindingListItem[] {
+    const preview = group.findings.slice(0, OTHERS_PREVIEW);
+    if (openMain.has(group.id)) return group.findings;
+    const extra = [pair.base, pair.other].filter(
+      (finding): finding is FindingListItem =>
+        finding != null && !preview.some((row) => row.id === finding.id),
+    );
+    return [...preview, ...extra];
+  }
+
+  /** Значения полосы с потолком: остальные раскрывает одна кнопка. */
+  function bandPoints(cmp: Comparison): { rows: Point[]; hidden: number } {
+    if (openBand.has(cmp.key)) return { rows: cmp.points, hidden: 0 };
+    return {
+      rows: cmp.points.slice(0, BAND_PREVIEW),
+      hidden: Math.max(cmp.points.length - BAND_PREVIEW, 0),
+    };
   }
 
   /**
-   * Решение по спору уходит в «Оценку ответов» с предвыбранным утверждением:
-   * базу аналитик уже назвал, поэтому в отзыв идёт сверяемая сторона.
+   * Сравнение от главного источника. Доля считается от выбранной стороны, а не
+   * от меньшего числа: выбор источника обязан менять видимые проценты. Когда
+   * выбранная сторона показатель не называет либо её значение не положительное,
+   * сравнения нет и это сказано прямо, а не подменено другим знаменателем.
+   * `named` значит, что у фразы есть subject: его подписывают «Источник Б».
+   */
+  function fromMainLabel(
+    cmp: Comparison,
+    pair: Pair,
+  ): { lead: string; value: string | null; named: boolean } {
+    const basePoint = pair.base ? cmp.points.find((p) => p.findingId === pair.base?.id) : undefined;
+    const otherPoint = pair.other
+      ? cmp.points.find((p) => p.findingId === pair.other?.id)
+      : undefined;
+    if (!basePoint || !otherPoint) {
+      return { lead: CONFLICT_FROM_MAIN.noPair, value: null, named: false };
+    }
+    if (basePoint.lo === 0) {
+      return { lead: CONFLICT_FROM_MAIN.zeroBase, value: null, named: false };
+    }
+    if (basePoint.lo < 0) {
+      return { lead: CONFLICT_FROM_MAIN.negBase, value: null, named: false };
+    }
+    const diff = (otherPoint.lo - basePoint.lo) / basePoint.lo;
+    if (diff > 0) return { lead: CONFLICT_FROM_MAIN.more, value: pct(diff), named: true };
+    if (diff < 0) return { lead: CONFLICT_FROM_MAIN.less, value: pct(-diff), named: true };
+    return { lead: CONFLICT_FROM_MAIN.equal, value: null, named: true };
+  }
+
+  /** Список выбора главного источника: без версии два утверждения одного документа не различить. */
+  function baseOptionLabel(finding: FindingListItem): string {
+    return `${sourceOf(finding) || NO_SOURCE}, версия ${finding.version}`;
+  }
+
+  /**
+   * Решение по расхождению уходит в «Отзывы» с предвыбранным утверждением:
+   * главный источник аналитик уже назвал, поэтому в отзыв идёт сверяемая сторона.
    */
   function decisionHref(pair: Pair): string {
     const claim = pair.other ?? pair.base;
     return claim ? `/feedback?claim=${encodeURIComponent(claim.id)}` : '/feedback';
   }
 
-  // Полный срез без отбора: по нему считают пробелы, отбор фильтрует только
+  // Полный список без отбора: по нему считают пробелы, отбор фильтрует только
   // отображаемый список тем.
   const allGroups = $derived.by<Group[]>(() => {
     const buckets = new Map<string, FindingListItem[]>();
@@ -516,8 +622,8 @@
 
   /**
    * Пробелы: отдельного эндпоинта у сервера нет, поэтому это ровно те дыры,
-   * которые видны в срезе /api/v1/conflicts, — и названы они по данным.
-   * Считаются по полному срезу (allGroups): отбор фильтрует список тем,
+   * которые видны в списке оспоренных утверждений, и названы они по данным.
+   * Считаются по полному списку (allGroups): отбор фильтрует темы,
    * а не пробелы.
    */
   const gaps = $derived.by<GapNote[]>(() => {
@@ -644,6 +750,20 @@
     openOthers = next;
   }
 
+  function toggleMain(key: string): void {
+    const next = new Set(openMain);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    openMain = next;
+  }
+
+  function toggleBand(key: string): void {
+    const next = new Set(openBand);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    openBand = next;
+  }
+
   function resetFilters(): void {
     search = '';
     onlyNumeric = false;
@@ -662,28 +782,48 @@
     shownGaps = GAP_PAGE_SIZE;
   });
 
+  // Строка-ориентир над списком: раздел на три части и живые числа каждой из
+  // них. Знаменатель очереди остаётся пустым, пока ответ не пришёл, чтобы
+  // нули не выглядели прочитанными данными.
+  const marks = $derived.by(() => {
+    const ready = status === 'ready' && items.length > 0;
+    return {
+      topics: ready ? groups.length : null,
+      queue: queueStatus === 'ready' ? queueWaitingCount : null,
+      gaps: ready ? gaps.length : null,
+    };
+  });
+
+  /**
+   * Пустой список при неподтверждённом нуле. Слово «нет» здесь было бы выводом
+   * о согласных источниках, которого экран не вправе делать: полное число либо
+   * обещает расхождения, либо не сообщено вовсе.
+   */
+  const listUnloadedNotice = $derived(conflictsListUnloaded(conflictsTotal));
+
   /**
    * Три разных факта, а не один «сбой»: доступ закрыт, данные не пришли,
-   * список пуст. Объяснение — человеческое, без кодов ответов и путей.
+   * список пуст. Объяснение говорит последствие и одно действие, без кодов
+   * ответов и путей.
    */
   function describe(reason: unknown): { title: string; text: string; denied: boolean } {
     if (reason instanceof ApiError && reason.status === 403) {
       return {
-        title: 'Разбор расхождений недоступен',
-        text: 'Оспоренные утверждения этому аккаунту не открыты — доступ к находкам корпуса выдаёт администратор. Проверьте вход и повторите запрос.',
+        title: CONFLICTS_FAILURE.deniedTitle,
+        text: CONFLICTS_FAILURE.deniedBody,
         denied: true,
       };
     }
     if (reason instanceof ApiError && (reason.status === 502 || reason.status === 503)) {
       return {
-        title: 'Расхождения не прочитаны',
-        text: 'Данные не пришли. Проверьте соединение и повторите запрос: расхождения — данные корпуса, а не ответ модели.',
+        title: CONFLICTS_FAILURE.failedTitle,
+        text: CONFLICTS_FAILURE.failedBody,
         denied: false,
       };
     }
     return {
-      title: 'Расхождения не загрузились',
-      text: 'Список оспоренных утверждений не прочитан. Проверьте соединение и повторите запрос.',
+      title: CONFLICTS_FAILURE.loadTitle,
+      text: CONFLICTS_FAILURE.loadBody,
       denied: false,
     };
   }
@@ -693,23 +833,34 @@
     const call = ++requestSeq;
     status = 'loading';
     failure = null;
+    // Показания окна относятся к тому списку, который он опишет: при повторе и
+    // при сбое чтения их нет, поэтому они сбрасываются, а не доедают старый
+    // знаменатель. Тот же порядок, что у очереди на проверку.
+    conflictsTotal = null;
+    conflictsNote = null;
     // Объём корпуса читаем параллельно и отдельно: без него нечем отличить
-    // пустой корпус от корпуса без споров, а его сбой не имеет права
+    // пустой корпус от корпуса без расхождений, а его сбой не имеет права
     // превращать пустой список в вывод о согласных источниках.
     const claimsPromise = api
       .corpusStats()
       .then((stats) => stats.claims)
       .catch(() => null);
     try {
-      const data = await api.conflicts();
+      const page = await api.conflicts();
       const claims = await claimsPromise;
       if (call !== requestSeq) return;
-      items = data;
+      items = page.items;
+      conflictsTotal = page.total;
+      // Пустая строка у замечания значит, что его не было: состояние остаётся
+      // null, чтобы экран не выводил пустую полосу вместо текста сервиса.
+      conflictsNote = page.windowNote === '' ? null : page.windowNote;
       corpusClaims = claims;
       collapsed = new Set();
       expanded = new Set();
       openQuotes = new Set();
       openOthers = new Set();
+      openMain = new Set();
+      openBand = new Set();
       pairPicks = {};
       shownGroups = GROUP_PAGE_SIZE;
       shownGaps = GAP_PAGE_SIZE;
@@ -717,27 +868,216 @@
       status = 'ready';
     } catch (reason) {
       if (call !== requestSeq) return;
+      // Показанное остаётся на экране: сбой следующего чтения не вычёркивает
+      // темы, которые человек уже видел, и не превращает список в пустой.
       failure = describe(reason);
       status = 'error';
     }
   }
 
-  // Срез класса данных считает сервер по подтверждённой сессии — перечитываем,
-  // когда права появились.
+  // ── Очередь на проверку: что ждёт решения эксперта ───────────────────────
+  // Свой запрос, своё состояние и своё действие: очередь обязана открываться и
+  // тогда, когда подтверждённых расхождений в корпусе ещё нет.
+  const QUEUE_WINDOW = 20;
+  const QUEUE_PREVIEW = 4;
+
+  let candidates = $state<ConflictCandidate[]>([]);
+  let queueStatus = $state<'loading' | 'ready' | 'error'>('loading');
+  let queueFailure = $state<{ title: string; text: string; denied: boolean } | null>(null);
+  // Полное число пар приходит заголовком ответа. null означает, что показаний
+  // нет: это «неизвестно», а не «ноль пар».
+  let queueTotal = $state<number | null>(null);
+  let queueLoadedAt = $state<Date | null>(null);
+  let queueBusy = $state(false);
+  let shownPairs = $state(QUEUE_PREVIEW);
+  // Решение по паре пишется на месте: активна только одна запись за раз.
+  let pendingId = $state('');
+  let pendingChoice = $state(false);
+  // Итог записанного решения показан в подвале той же карточки, где он и
+  // произошёл: сообщение вверху очереди терялось при длинном списке.
+  let cardMessage = $state<{ id: string; tone: 'ok' | 'warn' | 'error' | 'info'; text: string } | null>(
+    null,
+  );
+  // Сбой дозагрузки очереди относится к списку целиком, поэтому он у списка.
+  let queueMessage = $state<{ tone: 'error'; text: string } | null>(null);
+
+  // Право на решение серверное: признак приходит с /api/v1/auth/me вместе с
+  // остальными правами, того же достаточно здесь — без клиентского зеркала ролей.
+  const canDecide = $derived(session.can('proposal:review'));
+
+  const shownQueueRows = $derived(candidates.slice(0, shownPairs));
+  const queueWaitingCount = $derived(
+    candidates.filter((candidate) => candidate.status === 'candidate').length,
+  );
+  const queueLeft = $derived(
+    queueTotal === null ? 0 : Math.max(queueTotal - candidates.length, 0),
+  );
+  const queueHasMore = $derived(candidates.length > 0 && queueLeft > 0);
+  // Одна фраза о неполноте очереди: часть пар не показана, и это видно всегда.
+  const queueNotAll = $derived(queueLeft > 0 || shownQueueRows.length < candidates.length);
+  const queueLoadedAtText = $derived(
+    queueLoadedAt
+      ? queueLoadedAt.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'medium' })
+      : '',
+  );
+
+  function pairTopic(candidate: ConflictCandidate): Topic {
+    const keys = [candidate.subject, candidate.property_name].filter((key) => key.length > 0);
+    const subjectName = knownTerm(SUBJECT_LABELS, candidate.subject);
+    const propertyName = knownTerm(PROPERTY_LABELS, candidate.property_name);
+    if (subjectName && propertyName) {
+      return { title: `${subjectName}: ${propertyName}`, named: true, keys };
+    }
+    const known = subjectName ?? propertyName;
+    if (known) return { title: known, named: true, keys };
+    // Служебный ключ заголовком не бывает: без словаря пару называют по
+    // формулировке утверждения.
+    const statement = [candidate.left.statement, candidate.right.statement]
+      .find((text) => text.trim().length > 0)
+      ?.trim();
+    return { title: statement ?? CONFLICT_QUEUE_WORDS.noTopic, named: false, keys };
+  }
+
+  /** Первоисточник пары: тот же список «Находок» по документу, что и в ответе. */
+  function documentHref(documentId: string): string {
+    const params = new URLSearchParams();
+    params.set('document', documentId);
+    return `/findings?${params.toString()}`;
+  }
+
+  function docHint(documentId: string): string {
+    return CONFLICT_QUEUE_WORDS.docCode(documentId);
+  }
+
+  /**
+   * Отказ по-человечески: последствие, одно действие и тон. Повторная запись
+   * уже принятого решения не ошибка, а состояние пары: она отдаётся тоном info,
+   * и очередь перечитывается, чтобы записанное решение стало видно.
+   */
+  function decisionFailure(
+    reason: unknown,
+  ): { tone: 'warn' | 'error' | 'info'; text: string; refresh: boolean } {
+    if (reason instanceof ApiError && reason.status === 403) {
+      return { tone: 'warn', text: CONFLICT_QUEUE_FAILURE.denied, refresh: false };
+    }
+    if (reason instanceof ApiError && reason.status === 404) {
+      return { tone: 'warn', text: CONFLICT_QUEUE_FAILURE.gone, refresh: true };
+    }
+    if (reason instanceof ApiError && reason.status === 409) {
+      return { tone: 'info', text: CONFLICT_QUEUE_FAILURE.duplicate, refresh: true };
+    }
+    return { tone: 'error', text: CONFLICT_QUEUE_FAILURE.transport, refresh: false };
+  }
+
+  function describeQueue(reason: unknown): { title: string; text: string; denied: boolean } {
+    if (reason instanceof ApiError && reason.status === 403) {
+      return {
+        title: CONFLICT_QUEUE_WORDS.queueDeniedTitle,
+        text: CONFLICT_QUEUE_FAILURE.queueDenied,
+        denied: true,
+      };
+    }
+    return {
+      title: CONFLICT_QUEUE_WORDS.queueFailedTitle,
+      text: CONFLICT_QUEUE_FAILURE.queueFailed,
+      denied: false,
+    };
+  }
+
+  let queueSeq = 0;
+  /** `append` дозагружает следующую часть, не стирая загруженное при отказе. */
+  async function loadQueue(append = false): Promise<void> {
+    const call = ++queueSeq;
+    queueMessage = null;
+    if (append) queueBusy = true;
+    else {
+      queueStatus = 'loading';
+      queueFailure = null;
+    }
+    try {
+      const page = await api.conflictCandidates(QUEUE_WINDOW, append ? candidates.length : 0);
+      if (call !== queueSeq) return;
+      candidates = append ? [...candidates, ...page.items] : page.items;
+      queueTotal = page.total;
+      queueLoadedAt = new Date();
+      queueStatus = 'ready';
+      // Обновление не сворачивает список обратно к первой четвёрке: раскрытое
+      // человек уже видел, и после записи решения оно обязано остаться на месте.
+      if (!append) shownPairs = Math.max(QUEUE_PREVIEW, shownPairs);
+    } catch (reason) {
+      if (call !== queueSeq) return;
+      if (append) {
+        queueMessage = { tone: 'error', text: CONFLICT_QUEUE_FAILURE.more };
+      } else {
+        queueFailure = describeQueue(reason);
+        queueStatus = 'error';
+      }
+    } finally {
+      if (call === queueSeq) queueBusy = false;
+    }
+  }
+
+  /**
+   * Решение эксперта: ответ сервера обновляет строку очереди на месте, а итог
+   * показывается в подвале той же карточки. Подтверждение переводит обе находки
+   * в оспоренные, поэтому темы выше перечитываются сразу: решение видно, не
+   * после отдельной кнопки.
+   */
+  async function decide(candidate: ConflictCandidate, confirmed: boolean): Promise<void> {
+    if (!canDecide) {
+      cardMessage = { id: candidate.id, tone: 'warn', text: CONFLICT_QUEUE_FAILURE.denied };
+      return;
+    }
+    pendingId = candidate.id;
+    pendingChoice = confirmed;
+    cardMessage = null;
+    try {
+      const review = await api.conflictReview(candidate.id, confirmed);
+      candidates = candidates.map((item) =>
+        item.id === review.candidate_id
+          ? {
+              ...item,
+              status: review.status,
+              decided_by: review.actor_id,
+              decided_at: review.created_at,
+            }
+          : item,
+      );
+      cardMessage = { id: candidate.id, tone: 'ok', text: queueOutcome(review.status) };
+      if (review.status === 'confirmed') void load();
+    } catch (reason) {
+      const refused = decisionFailure(reason);
+      cardMessage = { id: candidate.id, tone: refused.tone, text: refused.text };
+      if (refused.refresh) void loadQueue();
+    } finally {
+      pendingId = '';
+      pendingChoice = false;
+    }
+  }
+
+  // Доступ к находкам считает сервер по подтверждённой сессии, поэтому список
+  // перечитывается, когда права появились. Очередь запрашивается тем же входом,
+  // но отдельно: её сбой не имеет права прятать темы расхождений, и наоборот.
   let started = false;
+  let queueStarted = false;
   $effect(() => {
     if (session.state === 'unknown' || !canRead) return;
-    if (started) return;
-    started = true;
-    void load();
+    if (!started) {
+      started = true;
+      void load();
+    }
+    if (!queueStarted) {
+      queueStarted = true;
+      void loadQueue();
+    }
   });
 </script>
 
 <svelte:head>
-  <title>Расхождения — Научный Клубок</title>
+  <title>Расхождения: Научный Клубок</title>
   <meta
     name="description"
-    content="Два источника называют разные числа об одном и том же: здесь видно обе формулировки, места в документах и полосу величин — и можно зафиксировать, какому источнику вы верите."
+    content="Два источника называют разные числа об одном показателе: здесь видно обе формулировки, места в документах и полосу величин. Ниже очередь на проверку: пары, которые ждут решения эксперта."
   />
 </svelte:head>
 
@@ -745,15 +1085,29 @@
   <div class="wrap">
     <SectionHead
       level="1"
-      eyebrow="Расхождения · спор источников"
-      title="Расхождения в числах"
-      lead="Здесь собраны случаи, когда два документа называют разные числа об одном и том же. Откройте тему: видно, кто что утверждает и где именно в документе. Выберите, какому источнику верите, и зафиксируйте это — остальное останется в корпусе."
-    >
+      eyebrow={CONFLICTS_PAGE.eyebrow}
+      title={CONFLICTS_PAGE.title}
+      lead={CONFLICTS_PAGE.lead}>
       <div class="row conf__aside">
         {#if status === 'ready' && loadedAt}
           <p class="micro muted">
-            прочитано <time datetime={loadedAt.toISOString()}>{loadedAtText}</time>
+            {CONFLICTS_PAGE.loadedAt} <time datetime={loadedAt.toISOString()}>{loadedAtText}</time>
           </p>
+        {/if}
+        {#if status === 'ready' && items.length > 0}
+          <!-- Полное число приходит заголовком ответа, поэтому строка о показанном
+               стоит рядом со временем загрузки: «показаны 200 из 431 расхождения». -->
+          <p class="micro muted">{conflictsShownOf(items.length, conflictsTotal)}</p>
+        {/if}
+        {#if status === 'ready' && conflictsNote}
+          <!-- Замечание о неполном чтении формулирует сервис: экран повторяет его
+               отдельной строкой как есть и не переписывает своими словами. -->
+          <p class="micro muted conf__window-note">{conflictsNote}</p>
+        {/if}
+        {#if canRead && status === 'ready' && items.length > 0}
+          <Button size="sm" variant="quiet" expanded={filtersOpen} onclick={toggleFilters}>
+            {filtersOpen ? CONFLICTS_ACTION.filterClose : CONFLICTS_ACTION.filterOpen}
+          </Button>
         {/if}
         {#if canRead}
           <Button
@@ -769,51 +1123,74 @@
     </SectionHead>
 
     {#if !canRead}
-      <Notice tone="warn" title="Разбор расхождений недоступен">
-        Оспоренные утверждения этому аккаунту не открыты — доступ к находкам корпуса выдаёт
-        администратор. Проверьте вход и повторите запрос.
+      <Notice tone="warn" title={CONFLICTS_FAILURE.deniedTitle}>
+        {CONFLICTS_FAILURE.deniedBody}
         <div class="row conf__aside">
           <Button href="/" variant="quiet" size="sm">На витрину</Button>
         </div>
       </Notice>
     {:else if status === 'loading' && items.length === 0}
-      <div class="conf__skeleton" role="status" aria-label="Читаем оспоренные утверждения">
+      <div class="conf__skeleton" role="status" aria-label={CONFLICTS_PAGE.loadingAria}>
         <span class="skeleton conf__sk-title"></span>
         <span class="skeleton conf__sk-panel"></span>
         <span class="skeleton conf__sk-panel"></span>
-        <p class="micro muted">Читаем оспоренные утверждения корпуса…</p>
+        <p class="micro muted">{CONFLICTS_PAGE.loading}</p>
       </div>
     {:else if status === 'error'}
-      <Notice tone={failure?.denied ? 'warn' : 'error'} title={failure?.title ?? 'Расхождения не загрузились'}>
-        {failure?.text ?? 'Список оспоренных утверждений не прочитан.'}
+      <Notice tone={failure?.denied ? 'warn' : 'error'} title={failure?.title ?? CONFLICTS_FAILURE.loadTitle}>
+        {failure?.text ?? CONFLICTS_FAILURE.loadBody}
         <div class="row conf__aside">
           <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>Повторить запрос</Button>
           <Button href="/findings" variant="ghost" size="sm">Раздел «{navLabel('/findings')}»</Button>
         </div>
       </Notice>
     {:else if items.length === 0}
-      {#if corpusClaims === 0}
-        <!-- Пустой корпус: числам здесь ещё не между собой спорить, и выдавать
-             это за «источники согласованы» нельзя. -->
+      {#if conflictsTotal !== null && conflictsTotal > 0}
+        <!-- Сервис называет полное число больше нуля, а список пуст: это сбой
+             чтения окна, а не «расхождений нет». -->
+        <Notice tone="error" title={listUnloadedNotice.title}>
+          {listUnloadedNotice.body}
+          <div class="row conf__aside">
+            <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
+              {CONFLICTS_ACTION.readAgain}
+            </Button>
+            <Button href="/findings" variant="ghost" size="sm">Раздел «{navLabel('/findings')}»</Button>
+          </div>
+        </Notice>
+      {:else if corpusClaims === 0}
+        <!-- Пустой корпус: сравнивать числа здесь ещё не между чем, и выдавать
+             это за «источники согласуются» нельзя. -->
         <Empty
           icon="layers"
-          title="В корпусе пока нет данных"
-          body="Расхождение — это два документа, которые называют разные числа об одном и том же. Сравнивать пока нечего: в корпусе нет ни одного утверждения. Пришлите хотя бы два документа — споры появятся здесь сами.">
+          title={CONFLICTS_PAGE.emptyCorpusTitle}
+          body={CONFLICTS_PAGE.emptyCorpusBody}>
           {#snippet action()}
             <div class="row">
               <Button href="/findings" variant="action" size="sm">
-                Открыть раздел «{navLabel('/findings')}»
+                Открыть «{navLabel('/findings')}»
               </Button>
             </div>
           {/snippet}
         </Empty>
+      {:else if conflictsTotal === null}
+        <!-- Подтверждённого нуля нет: экран не пишет ни «расхождений нет», ни
+             «корпус пуст», потому что полного числа он не знает. -->
+        <Notice tone="warn" title={listUnloadedNotice.title}>
+          {listUnloadedNotice.body}
+          <div class="row conf__aside">
+            <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
+              {CONFLICTS_ACTION.readAgain}
+            </Button>
+            <Button href="/findings" variant="ghost" size="sm">Раздел «{navLabel('/findings')}»</Button>
+          </div>
+        </Notice>
       {:else if corpusClaims === null}
-        <!-- Расхождений нет, а объём корпуса не прочитан: экран не вправе
+        <!-- Расхождений нет, а объём корпуса не загружен: экран не вправе
              объявлять ни пустой корпус, ни согласие источников. -->
         <Empty
           icon="alert"
-          title="Расхождений нет, но объём корпуса не прочитан"
-          body="Оспоренных утверждений сервис не вернул, а сколько в корпусе данных — прочитать не удалось. Поэтому здесь нет ни вывода о согласии источников, ни утверждения, что корпус пуст. Перечитайте; если повтор даст то же самое — это сбой сервиса, а не пустой корпус.">
+          title={CONFLICTS_PAGE.statsFailedTitle}
+          body={CONFLICTS_PAGE.statsFailedBody}>
           {#snippet action()}
             <div class="row">
               <Button variant="action" size="sm" icon="refresh" onclick={() => void load()}>
@@ -826,9 +1203,14 @@
       {:else}
         <Empty
           icon="checkCircle"
-          title="Расхождений в числах нет"
-          body={`В корпусе ${countOf(corpusClaims, 'утверждение', 'утверждения', 'утверждений')}, но ни одно утверждение не помечено как оспоренное: два документа пока не назвали разных чисел об одном и том же. Это не значит, что источники согласованы — расхождение появится, когда в корпусе встанет второй документ по тому же показателю.`}>
+          title={CONFLICTS_PAGE.noDivergenceTitle}
+          body={CONFLICTS_PAGE.noDivergenceBody}>
           {#snippet action()}
+            {#if corpusClaims !== null}
+              <p class="micro muted conf__corpus-size">
+                В корпусе {countOf(corpusClaims, 'утверждение', 'утверждения', 'утверждений')}
+              </p>
+            {/if}
             <div class="row">
               <Button href="/findings" variant="quiet" size="sm">Раздел «{navLabel('/findings')}»</Button>
               <Button href="/research" variant="ghost" size="sm">
@@ -839,63 +1221,65 @@
         </Empty>
       {/if}
     {:else}
-      <!-- Применённый отбор — строкой над темами: видно, что список отсеял, и
-           есть куда вернуться за изменением. Форма — под сворачиванием. -->
-      <div class="conf__applied">
-        <p class="micro conf__applied-title"><Icon name="filter" size={14} /> Отбор</p>
-        <div class="row conf__applied-chips">
-          {#if search.trim()}
-            <Chip pressed onclick={() => (search = '')}>поиск: «{search.trim()}» · снять</Chip>
-          {/if}
-          {#if onlyNumeric}
-            <Chip pressed onclick={() => (onlyNumeric = false)}>
-              только где числа расходятся · снять
-            </Chip>
-          {/if}
-          {#each pickedClasses as code (code)}
-            <Chip pressed onclick={() => toggleClass(code)}>
-              {DATA_CLASS_LABELS[code]} · снять
-            </Chip>
-          {/each}
-          {#if sortKey !== 'divergence'}
-            <Chip pressed onclick={() => (sortKey = 'divergence')}>порядок: {sortLabel} · снять</Chip>
-          {/if}
-          {#if !filtersActive}
-            <span class="micro muted">{CONFLICTS_ACTION.noFilter}</span>
-          {/if}
-        </div>
-        <div class="row conf__applied-actions">
-          <Button size="sm" variant="quiet" expanded={filtersOpen} onclick={toggleFilters}>
-            {filtersOpen ? CONFLICTS_ACTION.filterClose : CONFLICTS_ACTION.filterOpen}
-          </Button>
-          <Button size="sm" variant="ghost" disabled={!filtersActive} onclick={resetFilters}>
-            {CONFLICTS_ACTION.filterReset}
-          </Button>
-          {#if shownGroupRows.length > 0}
-            <Button size="sm" variant="link" onclick={toggleAllGroups}>
-              {allOpen ? CONFLICTS_ACTION.collapseAll : CONFLICTS_ACTION.expandAll}
+      <!-- Применённый отбор виден строкой над темами, только когда он есть:
+           без отбора полоса не съедает первый экран. Форма под сворачиванием. -->
+      {#if filtersActive}
+        <div class="conf__applied">
+          <p class="micro conf__applied-title">
+            <Icon name="filter" size={14} /> {CONFLICTS_PAGE.filterTitle}
+          </p>
+          <div class="row conf__applied-chips">
+            {#if search.trim()}
+              <Chip pressed onclick={() => (search = '')}>
+                {CONFLICTS_PAGE.chipSearch}: «{search.trim()}», {CONFLICTS_PAGE.removeFilter}
+              </Chip>
+            {/if}
+            {#if onlyNumeric}
+              <Chip pressed onclick={() => (onlyNumeric = false)}>
+                {CONFLICTS_PAGE.filterNumeric}, {CONFLICTS_PAGE.removeFilter}
+              </Chip>
+            {/if}
+            {#each pickedClasses as code (code)}
+              <Chip pressed onclick={() => toggleClass(code)}>
+                {DATA_CLASS_LABELS[code]}, {CONFLICTS_PAGE.removeFilter}
+              </Chip>
+            {/each}
+            {#if sortKey !== 'divergence'}
+              <Chip pressed onclick={() => (sortKey = 'divergence')}>
+                {CONFLICTS_PAGE.chipSort}: {sortLabel}, {CONFLICTS_PAGE.removeFilter}
+              </Chip>
+            {/if}
+          </div>
+          <div class="row conf__applied-actions">
+            <Button size="sm" variant="quiet" expanded={filtersOpen} onclick={toggleFilters}>
+              {filtersOpen ? CONFLICTS_ACTION.filterClose : CONFLICTS_ACTION.filterOpen}
             </Button>
-          {/if}
+            <Button size="sm" variant="ghost" onclick={resetFilters}>
+              {CONFLICTS_ACTION.filterReset}
+            </Button>
+          </div>
         </div>
-      </div>
+      {:else if !filtersOpen}
+        <p class="micro muted conf__nofilter">{CONFLICTS_ACTION.noFilter}</p>
+      {/if}
 
       {#if filtersOpen}
         <Panel raised>
           <form class="conf__form" onsubmit={(event) => event.preventDefault()}>
             <Field
-              label="Поиск по теме спора"
+              label={CONFLICTS_PAGE.filterSearch}
               name="conf-search"
               type="search"
               placeholder="формулировка, источник, показатель"
               bind:value={search}
-              hint="Ищем по формулировке, названию темы, числам из документа и цитатам доказательств."
+              hint={CONFLICTS_PAGE.filterSearchHint}
             />
-            <Select label="Порядок тем" name="conf-sort" bind:value={sortKey} options={SORT_OPTIONS} />
+            <Select label={CONFLICTS_PAGE.filterSort} name="conf-sort" bind:value={sortKey} options={SORT_OPTIONS} />
             <div class="conf__chips">
-              <p class="micro">Отбор по классу данных</p>
+              <p class="micro">{CONFLICTS_PAGE.filterAccess}</p>
               <div class="row">
                 <Chip pressed={onlyNumeric} onclick={() => (onlyNumeric = !onlyNumeric)}>
-                  только где числа расходятся
+                  {CONFLICTS_PAGE.filterNumeric}
                 </Chip>
                 {#each classOptions as code (code)}
                   <Chip pressed={pickedClasses.includes(code)} onclick={() => toggleClass(code)}>
@@ -906,7 +1290,7 @@
                   pressed={pickedClasses.length === 0}
                   disabled={pickedClasses.length === 0}
                   onclick={showAllClasses}>
-                  все классы
+                  {CONFLICTS_PAGE.filterAnyAccess}
                 </Chip>
               </div>
             </div>
@@ -914,11 +1298,36 @@
         </Panel>
       {/if}
 
+      <!-- Строка-ориентир: из чего состоит экран и сколько в каждой части. -->
+      <nav class="conf__marks" aria-label="Части экрана">
+        <a class="conf__mark" href="#conf-topics">
+          <span class="conf__mark-label">{CONFLICTS_PAGE.markTopics}</span>
+          <span class="num conf__mark-value">{marks.topics ?? '—'}</span>
+        </a>
+        <a class="conf__mark" href="#conf-queue">
+          <span class="conf__mark-label">{CONFLICTS_PAGE.markQueue}</span>
+          <!-- Знаменатель относится к загруженной части очереди: когда пар
+               показали не все, число нижнее, и знак «+» это говорит. -->
+          <span class="num conf__mark-value">
+            {marks.queue === null ? '—' : `${marks.queue}${queueNotAll ? '+' : ''}`}
+          </span>
+        </a>
+        <a class="conf__mark" href="#conf-gaps">
+          <span class="conf__mark-label">{CONFLICTS_PAGE.markGaps}</span>
+          <span class="num conf__mark-value">{marks.gaps ?? '—'}</span>
+        </a>
+        {#if shownGroupRows.length > 0}
+          <Button size="sm" variant="link" onclick={toggleAllGroups}>
+            {allOpen ? CONFLICTS_ACTION.collapseAll : CONFLICTS_ACTION.expandAll}
+          </Button>
+        {/if}
+      </nav>
+
       {#if groups.length === 0}
         <Empty
           icon="filter"
-          title="Под этот отбор тем нет"
-          body="Отбор убрал {countOf(items.length, 'оспоренное утверждение', 'оспоренных утверждения', 'оспоренных утверждений')} среза: ни одна тема не прошла по тексту поиска, классу данных или требованию числового расхождения.">
+          title={CONFLICTS_PAGE.filterEmptyTitle}
+          body={CONFLICTS_PAGE.filterEmptyBody}>
           {#snippet action()}
             <div class="row">
               <Button variant="action" size="sm" onclick={resetFilters}>
@@ -931,41 +1340,50 @@
           {/snippet}
         </Empty>
       {:else}
-        <div class="stack conf__groups">
+        <section class="stack conf__topics" id="conf-topics" aria-label={CONFLICTS_PAGE.markTopics}>
           {#each shownGroupRows as group, gi (group.id)}
             {@const open = groupOpen(gi, group)}
             {@const pair = pairOf(group)}
             {@const others = othersFor(group, pair)}
+            {@const mainRows = mainOptions(group, pair)}
+            {@const hiddenMain = group.findings.length - mainRows.length}
             <!-- Там, где числа несопоставимы, сторону нельзя назвать меньшей или
-                 большей: она остаётся первым и вторым утверждением спора. -->
+                 большей: она остаётся первым и вторым утверждением расхождения. -->
             {@const scaled = group.headline !== null}
             <Panel tag="article" tone="default" flush={true}>
-              <button
-                class="conf-group__head"
-                type="button"
-                aria-expanded={open}
-                aria-controls={group.domId}
-                onclick={() => toggleGroup(gi, group)}>
-                <span class="conf-group__title">
-                  <strong class="h4" title={keysHint(group.topic.keys)}>{group.topic.title}</strong>
-                </span>
-                <span class="row conf-group__counts">
-                  <span class="micro">
-                    {countOf(group.findings.length, 'утверждение', 'утверждения', 'утверждений')} ·
-                    {countOf(group.sourceCount, 'источник', 'источника', 'источников')}
+              <h3 class="h4 conf-group__heading">
+                <button
+                  class="conf-group__head"
+                  type="button"
+                  aria-expanded={open}
+                  aria-controls={group.domId}
+                  onclick={() => toggleGroup(gi, group)}>
+                  <span class="conf-group__title">
+                    <span class="conf-group__name">{group.topic.title}</span>
                   </span>
-                  <span class="micro conf-group__div">
-                    {#if group.divergence !== null}
-                      разница в числах <span class="num">{pct(group.divergence)}</span>
-                    {:else}
-                      числа не сопоставимы
-                    {/if}
+                  <span class="row conf-group__counts">
+                    <span class="micro conf-group__stat">
+                      <span class="conf-group__stat-label">{CONFLICTS_PAGE.statFindings}</span>
+                      <span class="num">{group.findings.length}</span>
+                    </span>
+                    <span class="micro conf-group__stat">
+                      <span class="conf-group__stat-label">{CONFLICTS_PAGE.statSources}</span>
+                      <span class="num">{group.sourceCount}</span>
+                    </span>
+                    <span class="conf-group__div">
+                      {#if group.divergence !== null}
+                        {CONFLICTS_PAGE.topicDivergence}
+                        <span class="num">{pct(group.divergence)}</span>
+                      {:else}
+                        {CONFLICTS_PAGE.topicNotComparable}
+                      {/if}
+                    </span>
                   </span>
-                </span>
-                <span class="conf-group__icon">
-                  <Icon name={open ? 'chevronDown' : 'chevronRight'} size={18} />
-                </span>
-              </button>
+                  <span class="conf-group__icon">
+                    <Icon name={open ? 'chevronDown' : 'chevronRight'} size={18} />
+                  </span>
+                </button>
+              </h3>
 
               <!-- Тело живёт в DOM и получает `hidden`: aria-controls ведёт к
                    существующему элементу в обоих состояниях раскрытия. -->
@@ -973,67 +1391,72 @@
                   {#if group.findings.length > 1}
                     <div class="conf-pick">
                       <p class="micro conf-pick__label">
-                        {CONFLICTS_ACTION.pickBase}: <span class="conf-pick__hint">
-                          база — тот источник, с которым сверяем остальное
-                        </span>
+                        {CONFLICTS_ACTION.mainSource}
+                        <span class="conf-pick__hint">{CONFLICTS_ACTION.mainSourceNote}</span>
                       </p>
                       <div class="row">
-                        {#each group.findings as finding (finding.id)}
+                        {#each mainRows as finding (finding.id)}
                           <Chip
                             pressed={finding.id === pair.base?.id}
-                            onclick={() => pickBase(group, finding.id)}>
+                            onclick={() => pickMain(group, finding.id)}>
                             {baseOptionLabel(finding)}
                           </Chip>
                         {/each}
-                      </div>
-                      <div class="row conf-pick__side">
-                        <Button
-                          size="sm"
-                          variant="quiet"
-                          disabled={!pair.other}
-                          onclick={() => swapSides(group)}>
-                          {CONFLICTS_ACTION.swapSides}
-                        </Button>
-                        {#if pair.manual}
-                          <Button size="sm" variant="link" onclick={() => autoPair(group)}>
-                            {CONFLICTS_ACTION.autoPair}
+                        {#if hiddenMain > 0}
+                          <Button
+                            variant="quiet"
+                            size="sm"
+                            onclick={() => toggleMain(group.id)}>
+                            {CONFLICTS_ACTION.showMoreMain}
+                          </Button>
+                        {:else if openMain.has(group.id) && group.findings.length > OTHERS_PREVIEW}
+                          <Button
+                            variant="link"
+                            size="sm"
+                            onclick={() => toggleMain(group.id)}>
+                            {CONFLICTS_ACTION.collapseMain}
                           </Button>
                         {/if}
                       </div>
+                      {#if pair.manual}
+                        <div class="row conf-pick__side">
+                          <Button size="sm" variant="link" onclick={() => resetMain(group)}>
+                            {CONFLICTS_ACTION.resetMain}
+                          </Button>
+                        </div>
+                      {/if}
                     </div>
                   {/if}
 
                   {#if pair.base}
                     <div class="pair">
                       <div class="pair__side pair__side--left">
-                        <p class="micro pair__mark">{scaled ? CONFLICT_SIDE.base : CONFLICT_SIDE.first}</p>
+                        <p class="micro pair__mark">{scaled ? CONFLICT_SIDE.main : CONFLICT_SIDE.first}</p>
                         {@render claimBlock(pair.base)}
                       </div>
 
                       <div class="pair__seam" aria-hidden="true">
-                        <span class="pair__seam-label">расхождение</span>
+                        <span class="pair__seam-label">{CONFLICTS_PAGE.seamTopics}</span>
                       </div>
 
                       {#if pair.other}
                         <div class="pair__side pair__side--right">
                           <p class="micro pair__mark">
-                            {scaled ? CONFLICT_SIDE.other : CONFLICT_SIDE.second}
+                            {scaled ? CONFLICT_SIDE.compared : CONFLICT_SIDE.second}
                           </p>
                           {@render claimBlock(pair.other)}
                         </div>
                       {:else}
                         <div class="pair__side">
-                          <Notice tone="warn" title="Второго источника нет">
-                            По этой теме в корпусе только одно оспоренное утверждение:
-                            сравнивать числа пока не с чем. Пришлите второй документ —
-                            спор встанет здесь.
+                          <Notice tone="warn" title={CONFLICTS_PAGE.noSecondTitle}>
+                            {CONFLICTS_PAGE.noSecondBody}
                           </Notice>
                         </div>
                       {/if}
                     </div>
                   {:else}
-                    <Notice tone="warn" title="В теме нет утверждений">
-                      Отбор не оставил в этой теме ни одного утверждения.
+                    <Notice tone="warn" title={CONFLICTS_PAGE.noPairTopicTitle}>
+                      {CONFLICTS_PAGE.noPairTopicBody}
                     </Notice>
                   {/if}
 
@@ -1048,93 +1471,115 @@
                       </p>
                       {#each group.comparisons as cmp (cmp.key)}
                         {@const prop = nameOf(PROPERTY_LABELS, cmp.property)}
+                        {@const band = bandPoints(cmp)}
+                        {@const from = fromMainLabel(cmp, pair)}
                         <div class="scale">
                           <p class="scale__head">
                             <span class="scale__prop" title={propHint(cmp.property, prop.named)}>
                               {prop.name}
                             </span>
-                            <span class="micro">{cmp.unit || 'единица в данных не указана'}</span>
+                            <span class="micro">{cmp.unit || CONFLICT_TOPIC_WORDS.noUnit}</span>
                             <span class="micro grow">
                               {countOf(cmp.points.length, 'значение', 'значения', 'значений')}
                               {CONFLICT_SCALE_WORDS.values}
                             </span>
                           </p>
-                          {#each cmp.points as point, pi (`${point.findingId}-${pi}`)}
-                            {@const band = bandStyle(point, cmp)}
-                            {@const isBase = pair.base !== null && point.findingId === pair.base.id}
-                            <div class="scale__line" data-base={isBase ? '1' : undefined}>
+                          {#each band.rows as point, pi (`${point.findingId}-${pi}`)}
+                            {@const track = bandStyle(point, cmp)}
+                            {@const isMain = pair.base !== null && point.findingId === pair.base.id}
+                            <div class="scale__line" data-base={isMain ? '1' : undefined}>
                               <p class="scale__src">
-                                <span class="num">{pi + 1}</span> · {point.source || NO_SOURCE}
-                                {#if isBase}
-                                  <span class="scale__base">{CONFLICT_SCALE_WORDS.baseTag}</span>
+                                <span class="num">{pi + 1}</span>
+                                <span>{point.source || NO_SOURCE}</span>
+                                {#if isMain}
+                                  <span class="scale__base">{CONFLICT_SCALE_WORDS.mainTag}</span>
                                 {/if}
                                 {#each point.locs as loc (loc.kind)}
                                   <span class="locator">{loc.kind} <span class="num">{loc.value}</span></span>
                                 {/each}
                                 {#if point.locs.length === 0}
-                                  <span class="locator">мест в источнике не указаны</span>
+                                  <span class="locator">{CONFLICT_TOPIC_WORDS.noLocators}</span>
                                 {/if}
                               </p>
                               <p class="scale__value num">
                                 {point.text}{#if cmp.unit} {cmp.unit}{/if}
                               </p>
-                              {#if band}
+                              {#if track}
                                 <span class="bar scale__track">
-                                  <span class="bar__fill" style={band}></span>
+                                  <span class="bar__fill" style={track}></span>
                                 </span>
                               {:else}
                                 <p class="micro scale__noband">{CONFLICT_SCALE_WORDS.noband}</p>
                               {/if}
                             </div>
                           {/each}
-                          <p class="scale__cap micro">
-                            {#if cmp.spread === 0}
-                              {CONFLICT_SCALE_WORDS.equal}
-                            {:else}
-                              {CONFLICT_SCALE_WORDS.range} <span class="num">{num(cmp.lo)}</span>–<span class="num">{num(cmp.hi)}</span>{#if cmp.unit} {cmp.unit}{/if} ·
-                              {CONFLICT_SCALE_WORDS.diff} <span class="num">{num(cmp.spread)}</span>{#if cmp.unit} {cmp.unit}{/if} ·
-                              {#if cmp.ratio !== null}
-                                {CONFLICT_SCALE_WORDS.times} <span class="num">{num(cmp.ratio)}</span> {CONFLICT_SCALE_WORDS.timesEnd} ·
-                              {/if}
-                              {#if cmp.relative !== null}
-                                {CONFLICT_SCALE_WORDS.share} <span class="num">{pct(cmp.relative)}</span> {CONFLICT_SCALE_WORDS.shareEnd} ·
-                              {:else}
-                                {CONFLICT_SCALE_WORDS.noBase} ·
-                              {/if}
+                          {#if band.hidden > 0}
+                            <Button variant="quiet" size="sm" onclick={() => toggleBand(cmp.key)}>
+                              {CONFLICT_SCALE_WORDS.showMoreBand}
+                            </Button>
+                          {:else if openBand.has(cmp.key) && cmp.points.length > BAND_PREVIEW}
+                            <Button variant="link" size="sm" onclick={() => toggleBand(cmp.key)}>
+                              {CONFLICT_SCALE_WORDS.collapseBand}
+                            </Button>
+                          {/if}
+                          <!-- Две короткие строки вместо цепочки через «·»: сначала
+                               факты полосы, затем сравнение от выбранного источника,
+                               затем пересечение диапазонов. -->
+                          {#if cmp.spread === 0}
+                            <p class="scale__cap micro">{CONFLICT_SCALE_WORDS.equal}</p>
+                          {:else}
+                            <p class="row scale__cap">
+                              <span>
+                                {CONFLICT_SCALE_WORDS.range}:
+                                <span class="num">{num(cmp.lo)}</span>–<span class="num">{num(cmp.hi)}</span>{#if cmp.unit} {cmp.unit}{/if}
+                              </span>
+                              <span>
+                                {CONFLICT_SCALE_WORDS.diff}
+                                <span class="num">{num(cmp.spread)}</span>{#if cmp.unit} {cmp.unit}{/if}
+                              </span>
+                            </p>
+                            <p class="scale__from micro">
+                              {#if from.named}{CONFLICT_SIDE.compared} {/if}{from.lead}
+                              {#if from.value}<span class="num">{from.value}</span>{/if}
+                            </p>
+                            <p class="scale__cross micro">
                               {#if cmp.disjoint}
                                 {CONFLICT_SCALE_WORDS.disjoint}
                               {:else if cmp.overlap}
-                                {CONFLICT_SCALE_WORDS.overlap} <span class="num">{num(cmp.overlap[0])}</span>–<span class="num">{num(cmp.overlap[1])}</span>{#if cmp.unit} {cmp.unit}{/if}
+                                {CONFLICT_SCALE_WORDS.overlap}:
+                                <span class="num">{num(cmp.overlap[0])}</span>–<span class="num">{num(cmp.overlap[1])}</span>{#if cmp.unit} {cmp.unit}{/if}
                               {:else}
                                 {CONFLICT_SCALE_WORDS.noOverlap}
                               {/if}
-                            {/if}
-                          </p>
+                            </p>
+                          {/if}
                         </div>
                       {/each}
                     </div>
                   {/if}
                   {#if others.length > 0}
                     {@const othersOpen = openOthers.has(group.id)}
-                    {@const hiddenOthers = othersOpen ? 0 : Math.max(others.length - OTHERS_PREVIEW, 0)}
+                    {@const visibleOthers = othersOpen ? others.length : Math.min(others.length, OTHERS_PREVIEW)}
                     <div class="stack others">
                       <p class="micro others__title">
-                        Ещё {countOf(others.length, 'утверждение', 'утверждения', 'утверждений')} по этой теме
-                        {#if hiddenOthers > 0}· показано {countOf(OTHERS_PREVIEW, 'утверждение', 'утверждения', 'утверждений')}{/if}
+                        {othersShown(visibleOthers, others.length)} по этой теме
                       </p>
                       {#each othersOpen ? others : others.slice(0, OTHERS_PREVIEW) as other (other.id)}
                         <div class="other">
                           <p class="small">{other.statement}</p>
-                          <p class="micro other__meta">
+                          <p class="row other__meta">
                             <span class="locator">{sourceOf(other) || NO_SOURCE}</span>
                             {#if other.evidence[0]}
                               {#each locatorsOf(other.evidence[0]) as loc (loc.kind)}
                                 <span class="locator">{loc.kind} <span class="num">{loc.value}</span></span>
                               {/each}
                             {:else}
-                              <span class="locator">мест в источнике нет</span>
+                              <span class="locator">{CONFLICT_TOPIC_WORDS.noLocators}</span>
                             {/if}
-                            · версия <span class="num">{other.version}</span>
+                            <span class="micro">
+                              {CONFLICT_TOPIC_WORDS.versionTitle}
+                              <span class="num">{other.version}</span>
+                            </span>
                             {#if other.scope}
                               {#each describeScope(other.scope) as line, li (li)}
                                 <span class="scope__item">{line}</span>
@@ -1144,99 +1589,82 @@
                           </p>
                         </div>
                       {/each}
-                      {#if hiddenOthers > 0 || othersOpen}
+                      {#if visibleOthers < others.length || othersOpen}
                         <Button variant="quiet" size="sm" onclick={() => toggleOthers(group.id)}>
                           {othersOpen
-                            ? 'Свернуть прочие утверждения'
-                            : `Показать ещё ${countOf(hiddenOthers, 'утверждение', 'утверждения', 'утверждений')}`}
+                            ? CONFLICT_TOPIC_WORDS.collapseOthers
+                            : CONFLICT_TOPIC_WORDS.showMore}
                         </Button>
                       {/if}
                     </div>
                   {/if}
 
-                  <!-- Идентификаторы не решают, кому верить, но нужны, когда
-                       сверяешь запись с сервером: они под раскрытием. -->
+                  <!-- Идентификаторы, сырой текст из источника и символовые оффсеты
+                       не решают, кому верить: они под раскрытием. -->
                   {#if group.topic.keys.length > 0 || pair.base || pair.other}
                     <details class="svc">
-                      <summary class="micro">Служебные данные</summary>
+                      <summary class="micro">{CONFLICT_TOPIC_SVC.head}</summary>
                       {#each group.topic.keys as key (key)}
-                        <p class="micro svc__row">служебное имя темы <code class="code">{key}</code></p>
+                        <p class="micro svc__row">
+                          {CONFLICT_TOPIC_SVC.topicKeys} <code class="code">{key}</code>
+                        </p>
                       {/each}
                       {#if pair.base}
-                        <p class="micro svc__row">
-                          код утверждения · база <code class="code">{pair.base.id}</code>
-                        </p>
+                        {@render svcFinding(pair.base, CONFLICT_TOPIC_SVC.mainCode)}
                       {/if}
                       {#if pair.other}
-                        <p class="micro svc__row">
-                          код сверяемого утверждения <code class="code">{pair.other.id}</code>
-                        </p>
+                        {@render svcFinding(pair.other, CONFLICT_TOPIC_SVC.comparedCode)}
                       {/if}
                     </details>
                   {/if}
 
                   <div class="row conf-group__foot">
-                    <Button
-                      href={decisionHref(pair)}
-                      variant="action"
-                      size="sm"
-                      icon="shield"
-                      title={`Решение записывают в разделе «${navLabel('/feedback')}» — ссылка несёт с собой это утверждение`}>
+                    <Button href={decisionHref(pair)} variant="action" size="sm" icon="shield">
                       {CONFLICTS_ACTION.record}
                     </Button>
                     <p class="micro muted conf-group__note">
-                      Сначала выберите, какой источник считать базой: в отзыв уходит то
-                      утверждение, которое вы с ней сверяете.
+                      {conflictsRecordNote(navLabel('/feedback'))}
                     </p>
                   </div>
 
                   <div class="row conf-group__links">
                     <Button href="/findings" variant="link" size="sm" iconEnd="arrowRight">
-                      Все находки · «{navLabel('/findings')}»
+                      {conflictsSectionLink(navLabel('/findings'))}
                     </Button>
                     <Button href="/graph" variant="link" size="sm" iconEnd="arrowRight">
-                      Связи темы · «{navLabel('/graph')}»
+                      {conflictsSectionLink(navLabel('/graph'))}
                     </Button>
                   </div>
               </div>
             </Panel>
           {/each}
-        </div>
+        </section>
 
         <div class="conf__pager">
-          <p class="micro">
-            показано {countOf(shownGroupRows.length, 'тема', 'темы', 'тем')} из
-            <span class="num">{groups.length}</span>
-            {#if filtersActive}в отбор{:else}в срезе{/if}
-          </p>
-          <div class="row">
-            {#if groups.length > shownGroupRows.length}
-              <Button variant="quiet" size="sm" onclick={() => (shownGroups += GROUP_PAGE_SIZE)}>
-                Показать ещё {countOf(Math.min(GROUP_PAGE_SIZE, groups.length - shownGroupRows.length), 'тему', 'темы', 'тем')}
-              </Button>
-            {:else if shownGroups > GROUP_PAGE_SIZE}
-              <Button variant="ghost" size="sm" onclick={() => (shownGroups = GROUP_PAGE_SIZE)}>
-                Только первые <span class="num">{GROUP_PAGE_SIZE}</span>
-              </Button>
-            {/if}
-          </div>
+          <p class="micro">{topicsShown(shownGroupRows.length, groups.length)}</p>
+          {#if groups.length > shownGroupRows.length}
+            <Button variant="quiet" size="sm" onclick={() => (shownGroups += GROUP_PAGE_SIZE)}>
+              {CONFLICT_TOPIC_WORDS.showMore}
+            </Button>
+          {/if}
         </div>
       {/if}
 
       {#if groups.length > 0 || gaps.length > 0}
-        <section class="conf__gaps">
+        <section class="conf__gaps" id="conf-gaps" aria-labelledby="conf-gaps-title">
           <SectionHead
             level="2"
-            eyebrow="Чего не хватает"
-            title="Почему спор пока нельзя проверить числом"
-            lead="Отдельного списка пробелов у сервиса нет: эти записи экран считает по тому же срезу оспоренных утверждений — где нет второго источника, где числа названы в разных единицах, где нет самого числа или места в документе."
+            id="conf-gaps-title"
+            eyebrow={CONFLICTS_PAGE.gapsEyebrow}
+            title={CONFLICTS_PAGE.gapsTitle}
+            lead={CONFLICTS_PAGE.gapsLead}
           />
 
           {#if gaps.length === 0}
             <Empty
               icon="checkCircle"
-              title="Пробелов в срезе нет"
-              body="Каждая тема среза держит два утверждения, где один и тот же показатель назван в одинаковых единицах, и у обоих есть место в первоисточнике: страницу, лист или диапазон ячеек."
+              title={CONFLICTS_PAGE.gapsEmptyTitle}
+              body={CONFLICTS_PAGE.gapsEmptyBody}
             />
           {:else}
             <div class="stack gaps">
@@ -1250,67 +1678,365 @@
                   <p class="small muted">
                     {gapBody(note.kind, note.topic.title, countOf(note.findings, 'утверждение', 'утверждения', 'утверждений'))}
                   </p>
-                  <p class="gap__meta">
-                    <strong class="small" title={keysHint(note.topic.keys)}>{note.topic.title}</strong>
-                  </p>
+                  <!-- Тема «pair» и «scale» уже названа в формулировке пробела:
+                       второй раз её печатать не нужно. -->
+                  {#if note.kind === 'value' || note.kind === 'locator'}
+                    <p class="gap__meta">
+                      <strong class="small">{note.topic.title}</strong>
+                    </p>
+                  {/if}
                   <p class="row gap__locs">
                     <span class="locator">{note.source || NO_SOURCE}</span>
                     {#each note.locs as loc (loc.kind)}
                       <span class="locator">{loc.kind} <span class="num">{loc.value}</span></span>
                     {/each}
                     {#if note.locs.length === 0}
-                      <span class="locator">доказательств нет</span>
+                      <span class="locator">{CONFLICT_TOPIC_WORDS.noGapLocators}</span>
                     {/if}
                   </p>
+                  {#if note.topic.keys.length > 0}
+                    <details class="svc">
+                      <summary class="micro">{CONFLICT_TOPIC_SVC.head}</summary>
+                      {#each note.topic.keys as key (key)}
+                        <p class="micro svc__row">
+                          {CONFLICT_TOPIC_SVC.topicKeys} <code class="code">{key}</code>
+                        </p>
+                      {/each}
+                    </details>
+                  {/if}
                 </article>
               {/each}
             </div>
 
             <div class="conf__pager">
               <p class="micro">
-                показано {countOf(shownGapsRows.length, 'запись', 'записи', 'записей')} из
-                <span class="num">{gaps.length}</span> — отбор тем на пробелы не влияет
+                {gapsShown(shownGapsRows.length, gaps.length)}
+                <span class="conf__pager-note">{CONFLICT_TOPIC_WORDS.gapsNotFiltered}</span>
               </p>
-              <div class="row">
-                {#if gaps.length > shownGapsRows.length}
-                  <Button variant="quiet" size="sm" onclick={() => (shownGaps += GAP_PAGE_SIZE)}>
-                    Показать ещё {countOf(Math.min(GAP_PAGE_SIZE, gaps.length - shownGapsRows.length), 'запись', 'записи', 'записей')}
-                  </Button>
-                {:else if shownGaps > GAP_PAGE_SIZE}
-                  <Button variant="ghost" size="sm" onclick={() => (shownGaps = GAP_PAGE_SIZE)}>
-                    Только первые <span class="num">{GAP_PAGE_SIZE}</span>
-                  </Button>
-                {/if}
-              </div>
+              {#if gaps.length > shownGapsRows.length}
+                <Button variant="quiet" size="sm" onclick={() => (shownGaps += GAP_PAGE_SIZE)}>
+                  {CONFLICT_TOPIC_WORDS.showMore}
+                </Button>
+              {/if}
             </div>
           {/if}
         </section>
       {/if}
     {/if}
+
+    {#if canRead}
+      <section class="conf__queue" id="conf-queue" aria-labelledby="conf-queue-title">
+        <SectionHead
+          level="2"
+          id="conf-queue-title"
+          eyebrow={CONFLICT_QUEUE_HEAD.eyebrow}
+          title={CONFLICT_QUEUE_HEAD.title}
+          lead={CONFLICT_QUEUE_HEAD.lead}>
+          <div class="row conf__aside">
+            {#if queueStatus === 'ready' && queueLoadedAt}
+              <p class="micro muted">
+                {CONFLICT_QUEUE_WORDS.loadedAt}
+                <time datetime={queueLoadedAt.toISOString()}>{queueLoadedAtText}</time>
+              </p>
+            {/if}
+            <Button
+              variant="quiet"
+              size="sm"
+              icon="refresh"
+              busy={queueStatus === 'loading' && candidates.length === 0}
+              disabled={queueBusy}
+              onclick={() => void loadQueue()}>
+              {CONFLICT_QUEUE_ACTION.readAgain}
+            </Button>
+          </div>
+        </SectionHead>
+
+        {#if queueStatus === 'ready' && candidates.length > 0}
+          <!-- Каждый счётчик подписан своим элементом: видно, сколько пар показано
+               из очереди и сколько из них ещё не решены. -->
+          <div class="row conf-queue__counter">
+            <span class="micro">{queueCounter(shownQueueRows.length, queueTotal)}</span>
+            <span class="micro">{queueWaiting(queueWaitingCount)}</span>
+            {#if queueNotAll}
+              <span class="micro">{CONFLICT_QUEUE_WORDS.notAll}</span>
+            {/if}
+          </div>
+        {/if}
+
+        {#if !canDecide && candidates.length > 0}
+          <Notice tone="info" title={CONFLICT_QUEUE_WORDS.gateTitle}>
+            {CONFLICT_QUEUE_WORDS.gate}
+          </Notice>
+        {/if}
+
+        {#if queueMessage}
+          <Notice tone={queueMessage.tone}>{queueMessage.text}</Notice>
+        {/if}
+
+        {#if queueStatus === 'loading' && candidates.length === 0}
+          <div class="conf-queue__skeleton" role="status" aria-label={CONFLICT_QUEUE_WORDS.skeletonAria}>
+            <span class="skeleton conf-queue__sk-panel"></span>
+            <span class="skeleton conf-queue__sk-panel"></span>
+            <p class="micro muted">{CONFLICT_QUEUE_WORDS.skeleton}</p>
+          </div>
+        {:else if queueStatus === 'error' && candidates.length === 0}
+          <!-- Сбой очереди не пустота: «пар нет» и «пары не пришли» это разные
+               экраны и разные действия. -->
+          <Notice
+            tone={queueFailure?.denied ? 'warn' : 'error'}
+            title={queueFailure?.title ?? CONFLICT_QUEUE_WORDS.queueFailedTitle}>
+            {queueFailure?.text ?? CONFLICT_QUEUE_FAILURE.queueFailed}
+            <div class="row conf__aside">
+              <Button variant="quiet" size="sm" icon="refresh" onclick={() => void loadQueue()}>
+                {CONFLICT_QUEUE_ACTION.readAgain}
+              </Button>
+              <Button href="/dashboard" variant="ghost" size="sm">
+                Раздел «{navLabel('/dashboard')}»
+              </Button>
+            </div>
+          </Notice>
+        {:else if candidates.length === 0 && queueTotal === 0}
+          <Empty
+            icon="checkCircle"
+            title={CONFLICT_QUEUE_WORDS.emptyTitle}
+            body={CONFLICT_QUEUE_WORDS.emptyBody}
+          />
+        {:else if candidates.length === 0}
+          <!-- Пустой ответ без подтверждённого нуля: это неполная загрузка, а не
+               вывод о том, что противоречий в корпусе нет. -->
+          <Notice tone="warn" title={CONFLICT_QUEUE_WORDS.partialTitle}>
+            {CONFLICT_QUEUE_WORDS.notAll}
+            <div class="row conf__aside">
+              <Button variant="quiet" size="sm" icon="refresh" onclick={() => void loadQueue()}>
+                {CONFLICT_QUEUE_ACTION.readAgain}
+              </Button>
+            </div>
+          </Notice>
+        {:else}
+          <div class="stack conf-queue__list">
+            {#each shownQueueRows as candidate (candidate.id)}
+              {@const topic = pairTopic(candidate)}
+              {@const busy = pendingId === candidate.id}
+              {@const decided = candidate.status !== 'candidate'}
+              <Panel tag="article" tone="default" flush={true}>
+                <div class="conf-pair">
+                  <div class="conf-pair__head">
+                    <h3 class="h4 conf-pair__title">{topic.title}</h3>
+                    <span class="row conf-pair__marks">
+                      <StatusPill
+                        status={CONFLICT_QUEUE_STATUS_TONE[candidate.status]}
+                        label={CONFLICT_QUEUE_STATUS_LABELS[candidate.status]}
+                      />
+                      <span class="micro muted">{nameOf(PROPERTY_LABELS, candidate.property_name).name}</span>
+                    </span>
+                  </div>
+
+                  <p class="micro conf-pair__why">{CONFLICT_QUEUE_WORDS.whyTitle}</p>
+                  <p class="small conf-pair__reason">
+                    {candidate.reason || CONFLICT_QUEUE_WORDS.noReason}
+                  </p>
+
+                  {#if Object.keys(candidate.scope).length > 0}
+                    <p class="scope">
+                      <span class="micro scope__title">{CONFLICT_QUEUE_WORDS.scopeTitle}</span>
+                      {#each describeScope(candidate.scope) as line (line)}
+                        <span class="scope__item">{line}</span>
+                      {/each}
+                    </p>
+                  {:else}
+                    <p class="micro scope scope__title">{CONFLICT_QUEUE_WORDS.noScope}</p>
+                  {/if}
+
+                  <div class="pair">
+                    <div class="pair__side pair__side--left" data-class={candidate.left.data_class}>
+                      <p class="micro pair__mark">{CONFLICT_SIDE.first}</p>
+                      {@render sideBlock(candidate.left)}
+                    </div>
+
+                    <div class="pair__seam" aria-hidden="true">
+                      <span class="pair__seam-label">{CONFLICT_QUEUE_WORDS.seam}</span>
+                    </div>
+
+                    <div class="pair__side pair__side--right" data-class={candidate.right.data_class}>
+                      <p class="micro pair__mark">{CONFLICT_SIDE.second}</p>
+                      {@render sideBlock(candidate.right)}
+                    </div>
+                  </div>
+
+                  <p class="micro conf-pair__decided">
+                    {#if candidate.decided_by === session.account?.id}
+                      <span>{CONFLICT_QUEUE_WORDS.decidedSelf}</span>
+                    {:else if candidate.decided_by}
+                      <span>{CONFLICT_QUEUE_WORDS.decidedBy}</span>
+                    {:else}
+                      <span>{CONFLICT_QUEUE_WORDS.waiting}</span>
+                    {/if}
+                    {#if candidate.decided_at}
+                      <span>
+                        {CONFLICT_QUEUE_WORDS.decidedTitle}
+                        <time datetime={candidate.decided_at}>{dateTime(candidate.decided_at)}</time>
+                      </span>
+                    {/if}
+                  </p>
+
+                  <details class="svc">
+                    <summary class="micro">{CONFLICT_QUEUE_SVC.head}</summary>
+                    <p class="micro svc__row">
+                      {CONFLICT_QUEUE_SVC.pair} <code class="code">{candidate.id}</code>
+                    </p>
+                    <p class="micro svc__row">
+                      {CONFLICT_QUEUE_SVC.subject} <code class="code">{candidate.subject}</code>
+                    </p>
+                    <p class="micro svc__row">
+                      {CONFLICT_QUEUE_SVC.property}
+                      <code class="code">{candidate.property_name}</code>
+                    </p>
+                    <p class="micro svc__row">
+                      {CONFLICT_QUEUE_SVC.leftClaim} <code class="code">{candidate.left.claim_id}</code>
+                    </p>
+                    <p class="micro svc__row">
+                      {CONFLICT_QUEUE_SVC.leftFinding}
+                      <code class="code">{candidate.left.finding_id}</code>
+                    </p>
+                    <p class="micro svc__row">
+                      {CONFLICT_QUEUE_SVC.rightClaim} <code class="code">{candidate.right.claim_id}</code>
+                    </p>
+                    <p class="micro svc__row">
+                      {CONFLICT_QUEUE_SVC.rightFinding}
+                      <code class="code">{candidate.right.finding_id}</code>
+                    </p>
+                    {#if candidate.decided_by}
+                      <p class="micro svc__row">
+                        {CONFLICT_QUEUE_SVC.decidedBy}
+                        <code class="code">{candidate.decided_by}</code>
+                      </p>
+                    {/if}
+                  </details>
+
+                  {#if cardMessage && cardMessage.id === candidate.id}
+                    <Notice tone={cardMessage.tone}>{cardMessage.text}</Notice>
+                  {/if}
+
+                  {#if canDecide}
+                    <div class="row conf-pair__actions">
+                      <Button
+                        variant="action"
+                        size="sm"
+                        icon="shield"
+                        busy={busy && pendingChoice}
+                        disabled={busy && !pendingChoice}
+                        title={decided ? CONFLICT_QUEUE_HINTS.revision : undefined}
+                        onclick={() => void decide(candidate, true)}>
+                        {busy && pendingChoice
+                          ? CONFLICT_QUEUE_ACTION.pending
+                          : CONFLICT_QUEUE_ACTION.confirm}
+                      </Button>
+                      <Button
+                        variant="quiet"
+                        size="sm"
+                        icon="close"
+                        busy={busy && !pendingChoice}
+                        disabled={busy && pendingChoice}
+                        title={decided ? CONFLICT_QUEUE_HINTS.revision : undefined}
+                        onclick={() => void decide(candidate, false)}>
+                        {busy && !pendingChoice
+                          ? CONFLICT_QUEUE_ACTION.pending
+                          : CONFLICT_QUEUE_ACTION.dismiss}
+                      </Button>
+                      <p class="micro muted conf-pair__hint">{CONFLICT_QUEUE_HINTS.confirm}</p>
+                    </div>
+                  {/if}
+                </div>
+              </Panel>
+            {/each}
+          </div>
+
+          <div class="conf__pager">
+            <p class="micro">{queueCounter(shownQueueRows.length, queueTotal)}</p>
+            {#if shownQueueRows.length < candidates.length}
+              <Button variant="quiet" size="sm" onclick={() => (shownPairs += QUEUE_PREVIEW)}>
+                {CONFLICT_TOPIC_WORDS.showMore}
+              </Button>
+            {:else if queueHasMore}
+              <!-- Одна кнопка «Показать ещё»: сначала раскрывает загруженное,
+                   потом молча дозагружает следующее. -->
+              <Button
+                variant="quiet"
+                size="sm"
+                busy={queueBusy}
+                disabled={queueBusy}
+                onclick={() => void loadQueue(true)}>
+                {queueBusy ? CONFLICT_QUEUE_WORDS.loadingMore : CONFLICT_TOPIC_WORDS.showMore}
+              </Button>
+            {/if}
+          </div>
+        {/if}
+      </section>
+    {/if}
   </div>
 </div>
+
+{#snippet sideBlock(side: ConflictSide)}
+  <div class="conf-side">
+    <p class="conf-side__head">
+      <span class="tag" title={CONFLICT_QUEUE_CLASS_HINT[side.data_class]}>
+        <Icon
+          name={side.data_class === 'restricted' ? 'lock' : side.data_class === 'internal' ? 'eye' : 'doc'}
+          size={14}
+        />
+        {DATA_CLASS_LABELS[side.data_class]}
+      </span>
+      {#if side.data_class !== 'public'}
+        <span class="micro conf-side__class">{CONFLICT_QUEUE_CLASS_HINT[side.data_class]}</span>
+      {/if}
+    </p>
+
+    <h3 class="claim__statement">{side.statement || CONFLICT_QUEUE_WORDS.noStatement}</h3>
+
+    <p class="conf-side__value">
+      <span class="micro conf-side__label">{CONFLICT_QUEUE_WORDS.valueLabel}</span>
+      <span class="conf-side__num num">{side.value || CONFLICT_QUEUE_WORDS.noValue}</span>
+    </p>
+
+    {#if side.document_ids.length > 0}
+      <p class="row conf-side__docs">
+        {#each side.document_ids as documentId, di (`${side.finding_id}-${documentId}-${di}`)}
+          <Button
+            href={documentHref(documentId)}
+            variant="link"
+            size="sm"
+            iconEnd="arrowRight"
+            title={docHint(documentId)}>
+            {CONFLICT_QUEUE_ACTION.openSource}
+          </Button>
+        {/each}
+      </p>
+    {:else}
+      <p class="micro conf-side__nodoc">{CONFLICT_QUEUE_WORDS.noDocs}</p>
+    {/if}
+  </div>
+{/snippet}
 
 {#snippet claimBlock(finding: FindingListItem)}
   <div class="claim">
     <p class="claim__head">
       <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
-      <span class="micro">версия <span class="num">{finding.version}</span></span>
+      <span class="micro">
+        {CONFLICT_TOPIC_WORDS.versionTitle} <span class="num">{finding.version}</span>
+      </span>
       <span class="micro">{DATA_CLASS_LABELS[finding.data_class]}</span>
     </p>
     <h3 class="claim__statement">{finding.statement}</h3>
-    <p class="micro claim__conf">
-      уверенность извлечения <span class="num">{pct(finding.confidence)}</span>
-    </p>
 
     {#if finding.scope && Object.keys(finding.scope).length > 0}
       <p class="scope">
-        <span class="micro scope__title">условия применения</span>
+        <span class="micro scope__title">{CONFLICT_TOPIC_WORDS.scopeTitle}</span>
         {#each describeScope(finding.scope) as line (line)}
           <span class="scope__item">{line}</span>
         {/each}
       </p>
     {:else}
-      <p class="micro scope scope__title">условия применения в данных не заданы</p>
+      <p class="micro scope scope__title">{CONFLICT_TOPIC_WORDS.noScope}</p>
     {/if}
 
     {#if finding.observations.length > 0}
@@ -1322,20 +2048,19 @@
               {prop.name}
             </span>
             <span class="obs__value num">{obsText(obs)}</span>
-            <span class="micro">{unitOf(obs) || 'единица не указана'}</span>
-            <code class="micro obs__raw">{obs.raw_text}</code>
+            <span class="micro">{unitOf(obs) || CONFLICT_TOPIC_WORDS.noUnit}</span>
           </li>
         {/each}
       </ul>
     {:else}
-      <p class="micro obs obs__none">
-        Чисел в находке нет: сравнивать величинами нечем.
-      </p>
+      <p class="micro obs obs__none">{CONFLICT_TOPIC_WORDS.noNumbers}</p>
     {/if}
 
     {#if finding.evidence.length > 0}
       {@const quotesOpen = openQuotes.has(finding.id)}
-      {@const hiddenQuotes = quotesOpen ? 0 : Math.max(finding.evidence.length - EVIDENCE_PREVIEW, 0)}
+      {@const visibleQuotes = quotesOpen
+        ? finding.evidence.length
+        : Math.min(finding.evidence.length, EVIDENCE_PREVIEW)}
       {#each quotesOpen ? finding.evidence : finding.evidence.slice(0, EVIDENCE_PREVIEW) as ev, ei (`${finding.id}-ev-${ei}`)}
         <figure class="quote ev">
           <blockquote class="small">{ev.quote}</blockquote>
@@ -1345,24 +2070,45 @@
               <span class="locator">{loc.kind} <span class="num">{loc.value}</span></span>
             {/each}
             {#if locatorsOf(ev).length === 0}
-              <span class="locator">место в источнике не указано</span>
+              <span class="locator">{CONFLICT_TOPIC_WORDS.noLocatorPlace}</span>
             {/if}
           </figcaption>
         </figure>
       {/each}
-      {#if hiddenQuotes > 0 || quotesOpen}
-        <Button variant="quiet" size="sm" onclick={() => toggleQuotes(finding.id)}>
-          {quotesOpen
-            ? 'Свернуть доказательства'
-            : `Показать ещё ${countOf(hiddenQuotes, 'цитату', 'цитаты', 'цитат')} из ${finding.evidence.length}`}
-        </Button>
+      {#if visibleQuotes < finding.evidence.length || quotesOpen}
+        <span class="row claim__quotes">
+          <span class="micro muted">{quotesShown(visibleQuotes, finding.evidence.length)}</span>
+          <Button variant="quiet" size="sm" onclick={() => toggleQuotes(finding.id)}>
+            {quotesOpen
+              ? CONFLICT_TOPIC_WORDS.collapseEvidence
+              : CONFLICT_TOPIC_WORDS.showMore}
+          </Button>
+        </span>
       {/if}
     {:else}
-      <p class="micro ev__none">
-        Мест в источнике нет: утверждение нельзя проверить по документу.
-      </p>
+      <p class="micro ev__none">{CONFLICT_TOPIC_WORDS.noEvidence}</p>
     {/if}
   </div>
+{/snippet}
+
+{#snippet svcFinding(finding: FindingListItem, label: string)}
+  <p class="micro svc__row">{label} <code class="code">{finding.id}</code></p>
+  <p class="micro svc__row">
+    {CONFLICT_TOPIC_SVC.confidence} <span class="num">{pct(finding.confidence)}</span>
+  </p>
+  {#each finding.observations as obs, oi (`${finding.id}-svc-obs-${oi}`)}
+    <p class="micro svc__row">
+      {CONFLICT_TOPIC_SVC.rawText} <code class="code">{obs.raw_text}</code>
+    </p>
+  {/each}
+  {#each finding.evidence as ev, ei (`${finding.id}-svc-ev-${ei}`)}
+    {@const range = charRangeOf(ev)}
+    {#if range}
+      <p class="micro svc__row">
+        {CONFLICT_TOPIC_SVC.charRange} <code class="code">{range}</code>
+      </p>
+    {/if}
+  {/each}
 {/snippet}
 
 <style>
@@ -1374,6 +2120,13 @@
 
   .conf__aside {
     justify-content: flex-end;
+  }
+
+  /* Замечание сервиса о неполном чтении занимает в шапке свою строку:
+     предложение длиннее кнопок и не имеет права их сжимать. */
+  .conf__window-note {
+    flex: 1 0 100%;
+    text-align: right;
   }
 
   .conf__skeleton {
@@ -1443,8 +2196,53 @@
     gap: var(--s2);
   }
 
-  .conf__groups {
+  .conf__nofilter {
+    color: var(--ink-3);
+  }
+
+  /* Строка-ориентир: три части экрана с живыми числами каждой из них. */
+  .conf__marks {
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+
+  .conf__mark {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    padding: var(--s2) var(--s4);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-pill);
+    background: var(--surface-raised);
+    color: var(--ink);
+    text-decoration: none;
+    transition: background var(--dur-fast) var(--ease-soft);
+  }
+
+  .conf__mark:hover {
+    background: var(--sage);
+  }
+
+  .conf__mark-label {
+    font-size: var(--t-micro);
+    color: var(--ink-3);
+  }
+
+  .conf__mark-value {
+    font-size: var(--t-small);
+    font-weight: 600;
+  }
+
+  .conf__topics {
     --gap: var(--s5);
+    scroll-margin-top: var(--s6);
+  }
+
+  .conf__gaps,
+  .conf__queue {
+    scroll-margin-top: var(--s6);
   }
 
   .conf__pager {
@@ -1459,7 +2257,22 @@
     background: var(--surface-raised);
   }
 
-  /* ── Тема спора ────────────────────────────────────────────────────────── */
+  /* Пояснение к счётчику стоит отдельным подписанным элементом, а не хвостом
+     одной строки. */
+  .conf__pager-note {
+    margin-left: var(--s3);
+    color: var(--ink-3);
+    font-size: var(--t-micro);
+  }
+
+  /* ── Тема расхождения ──────────────────────────────────────────────────── */
+  /* Название темы держит заголовок уровня h3: у экрана появляется читаемая
+     структура, а не одна простыня strong-ов внутри кнопки. */
+  .conf-group__heading {
+    margin: 0;
+    min-width: 0;
+  }
+
   .conf-group__head {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1487,13 +2300,43 @@
     min-width: 0;
   }
 
-  .conf-group__counts {
-    justify-content: flex-end;
-    gap: var(--s3);
+  .conf-group__name {
+    font-size: var(--t-h4);
+    font-weight: 600;
+    line-height: var(--lh-head);
+    letter-spacing: var(--tr-body);
+    text-wrap: pretty;
   }
 
-  .conf-group__div {
+  .conf-group__counts {
+    justify-content: flex-end;
+    gap: var(--s4);
+  }
+
+  .conf-group__stat {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
     color: var(--ink-3);
+  }
+
+  .conf-group__stat-label {
+    font-size: var(--t-micro);
+  }
+
+  /* Ключевое число темы видно без приближения: оно крупнее служебных подписей. */
+  .conf-group__div {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    color: var(--ink-2);
+    font-size: var(--t-micro);
+  }
+
+  .conf-group__div .num {
+    font-size: var(--t-body);
+    font-weight: 600;
+    color: var(--ink);
   }
 
   .conf-group__icon {
@@ -1623,10 +2466,9 @@
     text-wrap: pretty;
   }
 
-  .claim__conf {
-    display: flex;
-    gap: var(--s2);
-    flex-wrap: wrap;
+  .claim__quotes {
+    justify-content: flex-start;
+    align-items: center;
   }
 
   .scope {
@@ -1682,13 +2524,6 @@
     font-weight: 600;
     color: var(--ink);
     text-align: right;
-  }
-
-  .obs__raw {
-    grid-column: 1 / -1;
-    font-family: var(--font-data);
-    color: var(--ink-3);
-    word-break: break-word;
   }
 
   .obs__none {
@@ -1810,9 +2645,19 @@
   }
 
   .scale__noband,
-  .scale__cap {
+  .scale__cap,
+  .scale__from,
+  .scale__cross {
     grid-column: 1 / -1;
     color: var(--ink-3);
+  }
+
+  /* Сравнение от главного источника и пересечение диапазонов читаются
+     отдельными строками: цепочка подписей через разделитель не работает. */
+  .scale__from,
+  .scale__cross {
+    max-width: var(--maxw-measure);
+    color: var(--ink-2);
   }
 
   /* ── Прочие утверждения темы ───────────────────────────────────────────── */
@@ -1930,6 +2775,157 @@
     gap: var(--s4);
   }
 
+  /* ── Очередь противоречий ──────────────────────────────────────────────── */
+  .conf__queue {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    margin-top: var(--s7);
+    padding-top: var(--s7);
+    border-top: 1px solid var(--line);
+  }
+
+  .conf-queue__counter {
+    color: var(--ink-3);
+  }
+
+  .conf-queue__list {
+    --gap: var(--s5);
+  }
+
+  .conf-queue__skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    padding: var(--s6);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-xl);
+    background: var(--surface-raised);
+  }
+
+  /* Геометрия скелетона — в классе, а не в inline-стилях разметки. */
+  .conf-queue__sk-panel {
+    display: block;
+    height: var(--s9);
+    border-radius: var(--r-lg);
+  }
+
+  .conf-pair {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    padding: clamp(var(--s4), 2.4vw, var(--s6));
+  }
+
+  .conf-pair__head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: var(--s3) var(--s4);
+    padding-bottom: var(--s3);
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .conf-pair__title {
+    min-width: 0;
+    text-wrap: pretty;
+  }
+
+  .conf-pair__marks {
+    justify-content: flex-end;
+    gap: var(--s3);
+  }
+
+  /* Почему это противоречие: подпись над пояснением, чтобы строка не читалась
+     как ещё одна формулировка источника. */
+  .conf-pair__why {
+    color: var(--ink-3);
+  }
+
+  .conf-pair__reason {
+    max-width: var(--maxw-measure);
+    color: var(--ink-2);
+    text-wrap: pretty;
+  }
+
+  .conf-pair__decided {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    flex-wrap: wrap;
+    color: var(--ink-3);
+  }
+
+  .conf-pair__actions {
+    justify-content: flex-start;
+    align-items: center;
+    gap: var(--s4);
+    padding-top: var(--s4);
+    border-top: 1px solid var(--line-soft);
+  }
+
+  .conf-pair__hint {
+    flex: 1 1 26ch;
+    min-width: 0;
+    max-width: var(--maxw-measure);
+  }
+
+  /* Сторона пары: формулировка тезиса, число с единицей и путь в первоисточник. */
+  .conf-side {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    min-width: 0;
+  }
+
+  .conf-side__head {
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+
+  .conf-side__class {
+    color: var(--ink-3);
+  }
+
+  .conf-side__value {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+
+  .conf-side__label {
+    color: var(--ink-3);
+  }
+
+  .conf-side__num {
+    font-family: var(--font-data);
+    font-size: var(--t-small);
+    font-weight: 600;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+
+  .conf-side__docs {
+    justify-content: flex-start;
+    gap: var(--s4);
+  }
+
+  .conf-side__nodoc {
+    color: var(--ink-3);
+  }
+
+  /* Закрытая сторона не должна выглядеть открытым тезисом: её поле отличается
+     границей и фоном из токенов, а не цветом «ошибки». */
+  .pair__side[data-class='restricted'],
+  .pair__side[data-class='internal'] {
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--r-md);
+    background: var(--surface-sunk);
+  }
+
   @media (max-width: 900px) {
     .conf__form {
       grid-template-columns: minmax(0, 1fr);
@@ -1972,6 +2968,14 @@
       grid-column: 1 / -1;
       justify-content: flex-start;
     }
+
+    .conf-pair__head {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .conf-pair__marks {
+      justify-content: flex-start;
+    }
   }
 
   @media (max-width: 640px) {
@@ -1985,6 +2989,11 @@
     .conf__applied-actions {
       justify-content: flex-start;
       width: 100%;
+    }
+
+    .conf-pair__actions {
+      align-items: flex-start;
+      flex-direction: column;
     }
 
     .conf-group__counts {

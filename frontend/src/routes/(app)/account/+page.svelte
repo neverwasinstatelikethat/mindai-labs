@@ -4,7 +4,8 @@
   import { page } from '$app/state';
   import { tick } from 'svelte';
   import { ApiError, api } from '$lib/api';
-  import { countOf, dateTime } from '$lib/format';
+  import { dateTime } from '$lib/format';
+  import { navLabel } from '$lib/nav';
   import { observeReveals } from '$lib/reveal';
   import { session } from '$lib/sessionStore.svelte';
   import {
@@ -12,7 +13,18 @@
     ACTIVITY_ACTION_LABELS,
     ACTIVITY_OUTCOME_LABELS,
     ACTIVITY_OUTCOME_UNKNOWN,
+    BASIC_RIGHT_NOTE,
+    CORPUS_JOURNAL,
+    EXPERT_RIGHT_NOTE,
+    JOURNAL_NOUNS,
+    JOURNAL_WINDOW_WORDS,
+    MY_JOURNAL,
+    RIGHT_TASK_NOTES,
+    journalIncomplete,
+    journalLoadMoreOf,
+    journalUnloaded,
     knownTerm,
+    shownSentenceOf,
   } from '$lib/terms';
   import {
     CAPABILITY_LABELS,
@@ -30,28 +42,39 @@
   import SectionHead from '$lib/ui/SectionHead.svelte';
   import StatusPill from '$lib/ui/StatusPill.svelte';
 
-  // Потолок имени известен клиенту, минимальная длина пароля — нет: её задаёт
-  // сервер, и на экране она звучит как «пароль короче допустимого».
+  // Потолок имени и минимальная длина пароля заданы на сервере (политика
+  // профиля и настройки длины пароля) и отдельным полем клиенту не приходят.
+  // Значения экрану известны заранее, поэтому проверка идёт до отправки: предел
+  // не должен узнаваться из отказа.
   const NAME_MAX = 120;
+  const PASSWORD_MIN = 10;
 
-  // Имя права — единственное и из types.ts (CAPABILITY_LABELS): экран не заводит
-  // второй набор названий. Здесь только пояснение к уже названному праву.
-  type Section = { capability: Capability; note: string };
+  // Право показывается делом, которое оно открывает: имя строки читается из
+  // `CAPABILITY_LABELS` (те же слова, что в навигации), пояснение «что оно
+  // даёт» из `RIGHT_TASK_NOTES`, а имя раздела, куда право ведёт, из `navLabel`.
+  // Экран ничего не переименовывает сам: строка профиля и пункт меню называют
+  // одно и то же. `dest` нужен там, где раздел живёт на этом же экране и в
+  // меню навигации его нет.
+  type RightRow = { capability: Capability; href: string; dest?: string };
 
-  const WORK_SECTIONS: Section[] = [
-    { capability: 'knowledge:read', note: 'находки корпуса и карта связей' },
-    { capability: 'query:ask', note: 'вопрос агенту в рабочем пространстве' },
-    { capability: 'feedback:give', note: 'отзыв по ответу и экспертная правка' },
-    { capability: 'export:run', note: 'сравнение технологий и выгрузка ответа' },
-    { capability: 'evaluation:view', note: 'метрики качества ответов' },
+  const BASIC_RIGHTS: RightRow[] = [
+    { capability: 'knowledge:read', href: '/findings' },
+    { capability: 'query:ask', href: '/research' },
+    { capability: 'feedback:give', href: '/feedback' },
+    { capability: 'export:run', href: '/compare' },
+    { capability: 'evaluation:view', href: '/dashboard' },
   ];
 
-  // Экспертные права — уже технический слой: в читаемой части экрана о них
-  // говорит одна строка, перечень уходит под «Служебные данные».
-  const EXPERT_SECTIONS: Section[] = [
-    { capability: 'proposal:review', note: 'разбор предложений эволюции' },
-    { capability: 'restricted:read', note: 'утверждения закрытого класса' },
-    { capability: 'audit:read', note: 'журнал действий аккаунтов' },
+  // Экспертные дела: в читаемой части экрана о них говорит одна формулировка с
+  // тем, кто выдаёт право. Служебный ключ права живёт только под «Служебными
+  // данными».
+  const EXPERT_RIGHTS: RightRow[] = [
+    { capability: 'proposal:review', href: '/feedback' },
+    { capability: 'restricted:read', href: '/findings' },
+    // Журнал корпуса отдельного раздела в меню не имеет: он читается ниже на
+    // этом же экране, поэтому ссылка ведёт на блок страницы, а имя блока берётся
+    // из словаря ленты.
+    { capability: 'audit:read', href: '#corpus-journal', dest: CORPUS_JOURNAL.heading },
   ];
 
   let nameDraft = $state('');
@@ -72,12 +95,26 @@
   let outBusy = $state(false);
   let outError = $state('');
 
+  // Потолок страницы журнала: серверное окно (`limit`/`offset`) режет ленту,
+  // полное число подходит в X-Total-Count. Экран называет обе величины, а не
+  // выдаёт срез за весь журнал.
+  const ACTIVITY_PAGE_SIZE = 50;
+  const AUDIT_PAGE_SIZE = 50;
+
   // Журнал собственных актов читается отдельным запросом: /api/v1/me/activity
   // возвращает только то, что сделал этот аккаунт, — фильтр по автору держит
   // сервер, из адреса запроса он не приходит.
   let activity = $state<ActivityEntry[] | null>(null);
+  let activityTotal = $state<number | null>(null);
+  let activityOffset = $state(0);
   let activityLoading = $state(false);
+  let activityMoreLoading = $state(false);
   let activityError = $state('');
+  let activityMoreError = $state('');
+  // Пустая страница при положительном остатке: offset не сдвинулся, дочитывать
+  // нечего — кнопка тогда звала бы в никуда.
+  let activityStalled = $state(false);
+  let activitySeq = 0;
 
   // Технические данные страницы по умолчанию свёрнуты: они нужны при разборе
   // обращения в сервис, а не для решения аналитика.
@@ -89,17 +126,30 @@
     return 'ready';
   });
 
+  // Имя раздела, куда ведёт право: слово навигации, а для блока этого экрана
+  // слово словаря ленты. Права, у которого раздела нет, остаются без ссылки:
+  // якорь в читаемой строке читался бы как служебный код.
+  function destOf(item: RightRow): string {
+    if (item.dest) return item.dest;
+    const label = navLabel(item.href);
+    return label === item.href ? '' : label;
+  }
+
   const workSections = $derived(
-    WORK_SECTIONS.map((item) => ({
+    BASIC_RIGHTS.map((item) => ({
       ...item,
       label: CAPABILITY_LABELS[item.capability],
+      note: RIGHT_TASK_NOTES[item.capability] ?? '',
+      to: destOf(item),
       open: session.can(item.capability),
     })),
   );
   const expertSections = $derived(
-    EXPERT_SECTIONS.map((item) => ({
+    EXPERT_RIGHTS.map((item) => ({
       ...item,
       label: CAPABILITY_LABELS[item.capability],
+      note: RIGHT_TASK_NOTES[item.capability] ?? '',
+      to: destOf(item),
       open: session.can(item.capability),
     })),
   );
@@ -107,10 +157,30 @@
   const openExpertCount = $derived(expertSections.filter((item) => item.open).length);
 
   const journalRows = $derived(activity ?? []);
+  // Сколько осталось за показанной страницей: без полного числа сервера это
+  // неизвестность, а не ноль; «Показать ещё» тогда не предлагается.
+  const activityLeft = $derived(
+    activity === null || activityTotal === null
+      ? null
+      : Math.max(0, activityTotal - journalRows.length),
+  );
+  const activityUnloaded = $derived(
+    journalUnloaded(activityTotal, JOURNAL_NOUNS.entry, MY_JOURNAL.scope)
+  );
+  const activityPartial = $derived(
+    activityTotal === null && activity !== null && activity.length >= ACTIVITY_PAGE_SIZE
+      ? journalIncomplete(JOURNAL_NOUNS.entry)
+      : '',
+  );
   // Идентификаторы объектов нужны только при разборе конкретного акта, поэтому
   // живут под «Служебными данными», а не в строке журнала.
   const journalRefs = $derived(
     journalRows.filter((entry) => Boolean(entry.object_id)).slice(0, 40),
+  );
+  // Служебный ключ действия остаётся за раскрытием: в строке журнала он бы
+  // читался как название, а два неизвестных акта различались бы только им.
+  const unknownActions = $derived(
+    journalRows.filter((entry) => knownTerm(ACTIVITY_ACTION_LABELS, entry.action) === null).slice(0, 40),
   );
 
   // Отказ называется своей строкой: что не сохранилось и что сделать. Служебный
@@ -127,13 +197,11 @@
     return Number.isNaN(date.getTime()) ? iso : date.toLocaleDateString('ru-RU', { dateStyle: 'long' });
   }
 
-  // Действие читают по русскому имени: служебный ключ журнала остаётся под
-  // «Служебными данными». Неизвестное словарю действие не остаётся безликим —
-  // при общей подписи показывается и ключ, иначе два разных неизвестных акта
-  // выглядели бы одним.
-  function actionTerm(action: string): { name: string; named: boolean } {
-    const known = knownTerm(ACTIVITY_ACTION_LABELS, action);
-    return known ? { name: known, named: true } : { name: ACTIVITY_ACTION_FALLBACK, named: false };
+  // Действие читают по русскому имени. Служебный ключ в строку журнала не
+  // ставим: акты, которых нет в словаре, перечислены с ключом под «Служебными
+  // данными», и там их можно различить.
+  function actionName(action: string): string {
+    return knownTerm(ACTIVITY_ACTION_LABELS, action) ?? ACTIVITY_ACTION_FALLBACK;
   }
 
   function outcomeLabel(outcome: string): string {
@@ -147,52 +215,191 @@
     return 'hypothesis';
   }
 
+  // Порции окна могут перекрываться, если корпус между запросами изменился;
+  // повтора в список не добавляется. У акта журнала своего id в контракте нет
+  // (у корпуса есть), поэтому ключ — содержимое строки.
+  function activityKeyOf(entry: ActivityEntry): string {
+    return `${entry.created_at}|${entry.actor_id}|${entry.action}|${entry.object_id}|${entry.outcome}`;
+  }
+
+  function mergeActivity(current: ActivityEntry[], incoming: ActivityEntry[]): ActivityEntry[] {
+    const seen = new Set(current.map(activityKeyOf));
+    return [...current, ...incoming.filter((entry) => !seen.has(activityKeyOf(entry)))];
+  }
+
   async function loadActivity(): Promise<void> {
+    const call = ++activitySeq;
     activityLoading = true;
     activityError = '';
     try {
-      activity = await api.myActivity();
+      const page = await api.myActivity(ACTIVITY_PAGE_SIZE, 0);
+      if (call !== activitySeq) return;
+      activity = page.items;
+      activityTotal = page.total;
+      activityOffset = page.items.length;
+      activityMoreError = '';
+      // Свежее чтение владеет состоянием окна: тупик дочитывания снимается,
+      // даже если прежнее окно остановилось на пустой странице.
+      activityStalled = false;
     } catch (caught) {
+      if (call !== activitySeq) return;
       // Сбой журнала — не «вы ничего не делали»: отказ называет себя отдельно
-      // от пустого списка и предлагает повтор.
+      // от пустого списка и от неполного чтения.
       activity = null;
-      activityError = messageOf(caught, 'Журнал ваших действий не прочитан. Повторите запрос.');
+      activityTotal = null;
+      activityOffset = 0;
+      activityStalled = false;
+      activityError = messageOf(caught, 'Журнал ваших действий не пришёл. Повторите запрос.');
     } finally {
-      activityLoading = false;
+      if (call === activitySeq) activityLoading = false;
     }
   }
 
-  // Журнал корпуса — то, ради чего существует право `audit:read`: после того
-  // как трейсинг ушёл из «Состояния», проверить обещание «журнал действий
-  // аккаунтов» было нечем. Секция читается только держателям права, остальным
-  // она не обещает доступ.
+  // Дочитывание по серверному offset: прочитанное остаётся на экране, отказ
+  // владеет только своей строкой. Смещение идёт по строкам ответа, а не по
+  // локальной длине списка: перекрывающиеся порции не должны застрять.
+  async function loadActivityMore(): Promise<void> {
+    if (activity === null) return;
+    const call = ++activitySeq;
+    const offset = activityOffset;
+    activityMoreLoading = true;
+    activityMoreError = '';
+    try {
+      const page = await api.myActivity(ACTIVITY_PAGE_SIZE, offset);
+      if (call !== activitySeq) return;
+      activityOffset = offset + page.items.length;
+      activity = mergeActivity(activity, page.items);
+      // Пустая страница — не сбой и не конец журнала: записей сервис не прислал,
+      // а остаток не ушёл. Ставим тупик; дубликаты его не снимают — там offset
+      // сдвинулся, и следующий клик действительно продвигает чтение.
+      activityStalled = page.items.length === 0;
+      if (page.total !== null) activityTotal = page.total;
+    } catch {
+      if (call === activitySeq) activityMoreError = JOURNAL_WINDOW_WORDS.moreFailed;
+    } finally {
+      if (call === activitySeq) activityMoreLoading = false;
+    }
+  }
+
+  // Журнал корпуса — то, ради чего существует экспертное право на чтение
+  // действий: без него обещание «читать действия всех аккаунтов» нечем было бы
+  // проверить. Секция читается только держателям права, остальным она доступ не
+  // обещает.
   let corpusJournal = $state<AuditEntry[] | null>(null);
+  let corpusTotal = $state<number | null>(null);
+  let corpusOffset = $state(0);
   let corpusLoading = $state(false);
+  let corpusMoreLoading = $state(false);
   let corpusError = $state('');
+  let corpusMoreError = $state('');
+  // Тот же тупик, что у ленты своих актов: пустая страница при неотличимом
+  // остатке не даёт смещению сдвинуться.
+  let corpusStalled = $state(false);
+  let corpusSeq = 0;
 
   const canAudit = $derived(session.can('audit:read'));
 
+  // Разделы этого экрана одним списком: человек видит на первом экране, что здесь
+  // есть, и идёт к нужному без прокрутки вслепую. Журнал корпуса появляется в
+  // списке только там, где на него есть экспертное право, а заголовок секции и
+  // ссылка читают одну и ту же строку: разойтись им негде.
+  const pageSections = $derived.by(() => {
+    const rows = [
+      { id: 'account-who', title: 'Кто вы' },
+      { id: 'account-rights', title: 'Что вам открыто' },
+      { id: 'account-journal', title: MY_JOURNAL.heading },
+    ];
+    if (canAudit) rows.push({ id: 'corpus-journal', title: CORPUS_JOURNAL.heading });
+    rows.push(
+      { id: 'account-password', title: 'Смена пароля' },
+      { id: 'account-signout', title: 'Выход' },
+    );
+    return rows;
+  });
+
+  function sectionTitle(id: string): string {
+    return pageSections.find((row) => row.id === id)?.title ?? '';
+  }
+
+  // Право на экране называется одним словом с списком ниже: экспертное право
+  // открыто либо его нет. Про «уровни доступа» экран не говорит.
+  const rightLabel = $derived(
+    session.account?.review_enabled ? 'экспертное право открыто' : 'экспертного права нет',
+  );
+
+  const corpusLeft = $derived(
+    corpusJournal === null || corpusTotal === null
+      ? null
+      : Math.max(0, corpusTotal - corpusJournal.length),
+  );
+  const corpusUnloaded = $derived(
+    journalUnloaded(corpusTotal, JOURNAL_NOUNS.entry, CORPUS_JOURNAL.scope)
+  );
+  const corpusPartial = $derived(
+    corpusTotal === null && corpusJournal !== null && corpusJournal.length >= AUDIT_PAGE_SIZE
+      ? journalIncomplete(JOURNAL_NOUNS.entry)
+      : '',
+  );
+
   async function loadCorpusJournal(): Promise<void> {
+    const call = ++corpusSeq;
     corpusLoading = true;
     corpusError = '';
     try {
-      corpusJournal = await api.audit();
+      const page = await api.audit(AUDIT_PAGE_SIZE, 0);
+      if (call !== corpusSeq) return;
+      corpusJournal = page.items;
+      corpusTotal = page.total;
+      corpusOffset = page.items.length;
+      corpusMoreError = '';
+      corpusStalled = false;
     } catch (caught) {
+      if (call !== corpusSeq) return;
       corpusJournal = null;
-      corpusError = messageOf(caught, 'Журнал корпуса не прочитан. Повторите запрос.');
+      corpusTotal = null;
+      corpusOffset = 0;
+      corpusStalled = false;
+      corpusError = messageOf(caught, 'Журнал корпуса не пришёл. Повторите запрос.');
     } finally {
-      corpusLoading = false;
+      if (call === corpusSeq) corpusLoading = false;
     }
   }
 
-  // Чужой актор в журнале — только код: имена прочих аккаунтов сервис не
-  // публикует, а свои акты помечаются словом.
-  function actorLabel(actorId: string): { mine: boolean; code: string } {
-    return {
-      mine: actorId !== '' && actorId === session.account?.id,
-      code: actorId.slice(0, 8),
-    };
+  async function loadCorpusJournalMore(): Promise<void> {
+    if (corpusJournal === null) return;
+    const call = ++corpusSeq;
+    const offset = corpusOffset;
+    corpusMoreLoading = true;
+    corpusMoreError = '';
+    try {
+      const page = await api.audit(AUDIT_PAGE_SIZE, offset);
+      if (call !== corpusSeq) return;
+      corpusOffset = offset + page.items.length;
+      corpusStalled = page.items.length === 0;
+      // У акта корпуса есть id: перекрывшиеся порции склеиваются по нему.
+      const seen = new Set(corpusJournal.map((entry) => entry.id));
+      corpusJournal = [
+        ...corpusJournal,
+        ...page.items.filter((entry) => !seen.has(entry.id)),
+      ];
+      if (page.total !== null) corpusTotal = page.total;
+    } catch {
+      if (call === corpusSeq) corpusMoreError = JOURNAL_WINDOW_WORDS.moreFailed;
+    } finally {
+      if (call === corpusSeq) corpusMoreLoading = false;
+    }
   }
+
+  // Чужой актор в читаемой строке называется словом: имена прочих аккаунтов
+  // сервис не публикует, а свои акты помечаются прямо. Код актора нужен при
+  // разборе конкретного акта, поэтому он живёт под «Служебными данными».
+  function isMine(actorId: string): boolean {
+    return actorId !== '' && actorId === session.account?.id;
+  }
+
+  const corpusActorRefs = $derived(
+    (corpusJournal ?? []).filter((entry) => entry.actor_id !== '').slice(0, 40),
+  );
 
   // Имя живёт в черновике: серверный ответ подхватывается один раз и после
   // подтверждения записи, но не перетирает напечатанное после ошибки.
@@ -234,7 +441,7 @@
       return;
     }
     if (value.length > NAME_MAX) {
-      nameError = `Имя длиннее ${NAME_MAX} символов — сократите его.`;
+      nameError = `Имя длиннее ${NAME_MAX} символов. Сократите его.`;
       return;
     }
     nameBusy = true;
@@ -254,6 +461,8 @@
     }
   }
 
+  // Предел длины проверяется до отправки: человек узнаёт его из поля, а не из
+  // отказа сервиса. Серверная проверка остаётся своей: экран не подменяет её.
   async function savePassword(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     pwdErrors = {};
@@ -261,6 +470,8 @@
     const problems: typeof pwdErrors = {};
     if (!currentPwd) problems.current = 'Введите текущий пароль.';
     if (!newPwd) problems.next = 'Введите новый пароль.';
+    else if (newPwd.length < PASSWORD_MIN)
+      problems.next = `Не короче ${PASSWORD_MIN} символов.`;
     if (!confirmPwd) problems.confirm = 'Повторите новый пароль.';
     else if (newPwd !== confirmPwd) problems.confirm = 'Подтверждение не совпадает с новым паролем.';
     if (Object.keys(problems).length > 0) {
@@ -281,7 +492,9 @@
       if (caught instanceof ApiError && caught.status === 403) {
         pwdErrors = { current: 'Текущий пароль не подошёл. Введите его ещё раз.' };
       } else if (caught instanceof ApiError && caught.status === 422) {
-        pwdErrors = { next: 'Новый пароль короче допустимого — возьмите длиннее.' };
+        pwdErrors = { next: `Не короче ${PASSWORD_MIN} символов.` };
+      } else if (caught instanceof ApiError && caught.status === 429) {
+        pwdErrors = { form: 'Слишком много неудачных попыток. Повторите позже.' };
       } else {
         pwdErrors = {
           form: messageOf(caught, 'Пароль не изменён. Проверьте соединение и повторите.'),
@@ -310,7 +523,7 @@
   <title>Профиль и пароль — Научный Клубок</title>
   <meta
     name="description"
-    content="Кто вы в системе, какие разделы корпуса открыты, журнал ваших действий и смена пароля."
+    content="Кто вы в сервисе, какие дела открыты аккаунту, журнал ваших действий и смена пароля."
   />
 </svelte:head>
 
@@ -318,17 +531,35 @@
   <div class="wrap wrap--narrow stack" style="--gap: var(--s6)">
     <SectionHead
       level="1"
-      eyebrow="Профиль и пароль"
+      eyebrow="профиль и пароль"
       title="Посмотреть свой доступ и сменить пароль"
-      lead="Кто вы в системе, какие разделы вам открыты, что вы здесь делали и как поменять пароль."
+      lead="Кто вы в сервисе, какие дела открыты аккаунту, что вы здесь делали и как поменять пароль."
     >
       {#if view === 'ready' && session.account}
-        <div class="account__head">
-          <span class="avatar" aria-hidden="true">{session.initials}</span>
-          <span class="grow">
-            <span class="small">{session.account.display_name}</span>
-            <span class="micro muted">{session.account.email}</span>
-          </span>
+        <!-- Первый экран отвечает на три вопроса без прокрутки: кто вы, что здесь
+             есть и какое действие главное. Право названо тем же словом, что и
+             список дел ниже: одно право, а не уровни доступа. -->
+        <div class="account__brief">
+          <div class="account__head">
+            <span class="avatar" aria-hidden="true">{session.initials}</span>
+            <span class="grow">
+              <span class="small">{session.account.display_name}</span>
+              <span class="micro muted">{session.account.email}</span>
+            </span>
+            <StatusPill
+              status={session.account.review_enabled ? 'consensus' : 'off'}
+              label={rightLabel}
+            />
+          </div>
+          <nav class="account__toc" aria-label="Разделы этого экрана">
+            {#each pageSections as section (section.id)}
+              <a class="account__toc-link" href={`#${section.id}`}>{section.title}</a>
+            {/each}
+          </nav>
+          <div class="row">
+            <Button href="#account-password" variant="action">Сменить пароль</Button>
+            <span class="micro muted">Имя и журнал действий читаются выше на этом же экране.</span>
+          </div>
         </div>
       {/if}
     </SectionHead>
@@ -352,13 +583,13 @@
         <div class="account__stack">
           {#if outError}
             <Notice tone="error" title="Выход не завершён">
-              {outError} Если остались на этой странице — войдите заново и повторите выход.
+              {outError} Если вы остались на этой странице, войдите заново и повторите выход.
             </Notice>
           {/if}
           <Empty
             icon="lock"
             title="Нужен вход в аккаунт"
-            body="Профиль, журнал действий, смена пароля и разделы корпуса открываются после входа. Без входа здесь нечего показывать."
+            body="Профиль, права, журнал действий и смена пароля появляются здесь после входа."
           >
             {#snippet action()}
               <div class="row">
@@ -373,8 +604,12 @@
       {@const account = session.account}
 
       <!-- ── Кто вы ─────────────────────────────────────────────────── -->
-      <section class="account__block">
-        <SectionHead level="2" title="Кто вы" lead="По этому аккаунту сервис узнаёт, чьи правки и запросы записаны." />
+      <section class="account__block" id="account-who">
+        <SectionHead
+          level="2"
+          title={sectionTitle('account-who')}
+          lead="По этому аккаунту сервис узнаёт, чьи правки и запросы записаны."
+        />
 
         <Panel tone="lav">
           <div class="reveal account__id">
@@ -386,7 +621,7 @@
               </div>
               <StatusPill
                 status={account.review_enabled ? 'consensus' : 'off'}
-                label={account.review_enabled ? 'экспертный разбор открыт' : 'экспертный разбор закрыт'}
+                label={account.review_enabled ? 'экспертные права открыты' : 'экспертные права закрыты'}
               />
             </div>
             <dl class="kv">
@@ -394,7 +629,8 @@
               <dd><time datetime={account.created_at}>{ruDay(account.created_at)}</time></dd>
             </dl>
             <p class="micro">
-              Имя можно поменять самому, email — нет: по нему сервис находит ваши действия в журнале.
+              Имя можно поменять самому. Email остаётся как при регистрации: по нему сервис находит
+              ваши действия в журнале.
             </p>
           </div>
         </Panel>
@@ -413,7 +649,7 @@
               name="display_name"
               autocomplete="name"
               maxlength={NAME_MAX}
-              placeholder="Как подписывать ваши находки"
+              placeholder="Как вас подписывать в журнале"
               hint={`До ${NAME_MAX} символов; пробелы по краям убираются.`}
               error={nameError}
               disabled={nameBusy}
@@ -447,18 +683,21 @@
       </section>
 
       <!-- ── Что вам открыто ────────────────────────────────────────── -->
-      <section class="account__block">
+      <section class="account__block" id="account-rights">
         <SectionHead
           level="2"
-          title="Что вам открыто"
-          lead="Права выдаёт администратор сервиса; на этом экране их включить нельзя."
+          title={sectionTitle('account-rights')}
+          lead="Список дел этого аккаунта. Права выдаёт администратор сервиса, на этом экране их включить нельзя."
         />
 
         <Panel class="reveal">
+          <p class="micro muted">
+            Обычные дела: открыто {openCount} из {workSections.length}.
+          </p>
           {#if openCount === 0}
-            <p class="small">
-              Ни один раздел корпуса не открыт: находки, карта связей и запросы останутся недоступны,
-              пока администратор не выдаст права.
+            <p class="small account__lead">
+              Ни одно дело не открыто: находки, карта связей и вопросы к корпусу станут доступны, когда
+              администратор выдаст права.
             </p>
           {:else}
             <ul class="opens">
@@ -469,47 +708,59 @@
                   </span>
                   <span class="grow">
                     {item.label}
-                    <span class="micro opens__note">{item.note}</span>
+                    <span class="micro opens__note">
+                      {item.open ? item.note : BASIC_RIGHT_NOTE}
+                    </span>
                   </span>
-                  <span class="micro muted">{item.open ? 'открыто' : 'закрыто'}</span>
+                  <span class="micro muted">
+                    {item.open ? 'открыто' : 'закрыто'}
+                    {#if item.open && item.to}
+                      <a href={item.href}> в раздел «{item.to}»</a>
+                    {/if}
+                  </span>
                 </li>
               {/each}
             </ul>
-            <p class="micro muted account__note">
-              Закрытый раздел объясняется правом из этого списка: полное их перечисление и доступные
-              классы данных лежат ниже, в «Служебных данных».
-            </p>
           {/if}
 
           <hr class="rule" />
 
-          <p class="small">
-            {#if session.expert}
-              Экспертные действия открыты:
-              {expertSections
-                .filter((item) => item.open)
-                .map((item) => item.label.toLowerCase())
-                .join(', ') || 'разбор предложений'}.
-            {:else}
-              Экспертного разбора у этого аккаунта нет. Базового уровня хватает для ежедневной работы:
-              находки, карта связей, запросы к корпусу, обратная связь и оценка качества.
-            {/if}
+          <p class="micro muted">
+            Экспертные дела: открыто {openExpertCount} из {expertSections.length}.
           </p>
-          {#if openExpertCount === 0}
-            <p class="micro muted account__note">
-              Расширенный доступ выдаёт и снимает администратор сервиса — при регистрации он не
-              выбирается.
-            </p>
-          {/if}
+          <ul class="opens">
+            {#each expertSections as item (item.capability)}
+              <li class="opens__item" data-open={item.open ? 'yes' : 'no'}>
+                <span class="opens__mark" aria-hidden="true">
+                  <Icon name={item.open ? 'check' : 'close'} size={15} />
+                </span>
+                <span class="grow">
+                  {item.label}
+                  <span class="micro opens__note">{item.open ? item.note : EXPERT_RIGHT_NOTE}</span>
+                </span>
+                <span class="micro muted">
+                  {item.open ? 'открыто' : 'закрыто'}
+                  {#if item.open && item.to}
+                    <a href={item.href}> в раздел «{item.to}»</a>
+                  {/if}
+                </span>
+              </li>
+            {/each}
+          </ul>
+
+          <p class="micro muted account__note">
+            Экспертные права выдаёт и снимает администратор сервиса, при регистрации их не выбрать.
+            Служебные ключи прав и классы данных лежат ниже, в раскрытии «Служебные данные».
+          </p>
         </Panel>
       </section>
 
       <!-- ── Журнал моих действий ───────────────────────────────────── -->
-      <section class="account__block">
+      <section class="account__block" id="account-journal">
         <SectionHead
           level="2"
-          title="Журнал моих действий"
-          lead="Запросы к корпусу, оценки ответов, правки и вход с выходом — только то, что делали вы."
+          title={sectionTitle('account-journal')}
+          lead="Ваши вопросы к корпусу, отзывы на ответ, правки, вход и выход."
         >
           <Button
             variant="quiet"
@@ -524,16 +775,16 @@
 
         {#if activityLoading && activity === null}
           <Panel tone="sunk">
-            <div class="row account__loading">
+            <div class="row account__loading" role="status">
               <span class="spinner" aria-hidden="true"></span>
-              <p class="small">Читаем журнал ваших действий…</p>
+              <p class="small">{MY_JOURNAL.loading}</p>
             </div>
           </Panel>
         {:else if activityError}
           <Panel tone="coral">
             <div class="account__fault">
-              <p class="eyebrow"><Icon name="alert" size={16} /> журнал не прочитан</p>
-              <p class="small">{activityError} Это не пустой журнал — он не прочитан.</p>
+              <p class="eyebrow"><Icon name="alert" size={16} /> журнал не пришёл</p>
+              <p class="small">{activityError}</p>
               <div class="row">
                 <Button
                   variant="action"
@@ -548,49 +799,97 @@
             </div>
           </Panel>
         {:else if activity !== null && journalRows.length === 0}
-          <Empty
-            icon="clock"
-            title="Ваших актов в журнале пока нет"
-            body="Задайте вопрос в рабочем пространстве или загрузите документ — запись появится здесь после обновления журнала."
-          >
-            {#snippet action()}
-              <Button variant="action" href="/research">Начать с запроса</Button>
-            {/snippet}
-          </Empty>
+          <!-- Пустота подтверждается только нулём от сервера: при ненулевом или
+               неизвестном полном числе журнал называется незагруженным. -->
+          {#if activityUnloaded}
+            <Panel tone="coral">
+              <div class="account__fault">
+                <p class="eyebrow"><Icon name="alert" size={16} /> журнал не загружен</p>
+                <p class="small"><strong>{activityUnloaded.title}.</strong> {activityUnloaded.body}</p>
+                <div class="row">
+                  <Button
+                    variant="action"
+                    icon="refresh"
+                    busy={activityLoading}
+                    disabled={activityLoading}
+                    onclick={() => void loadActivity()}
+                  >
+                    Повторить запрос
+                  </Button>
+                </div>
+              </div>
+            </Panel>
+          {:else}
+            <Empty
+              icon="clock"
+              title="Ваших актов в журнале пока нет"
+              body="Задайте вопрос в разделе «Вопрос» или загрузите документ. Запись появится здесь после обновления журнала."
+            >
+              {#snippet action()}
+                <Button variant="action" href="/research">Задать вопрос</Button>
+              {/snippet}
+            </Empty>
+          {/if}
         {:else if activity !== null}
           <Panel>
             <ul class="journal">
               {#each journalRows as entry, i (i)}
-                {@const action = actionTerm(entry.action)}
                 <li class="journal__row">
                   <div class="journal__when">
                     <time datetime={entry.created_at}>{dateTime(entry.created_at)}</time>
                   </div>
                   <div class="journal__what">
-                    <p class="small">
-                      {action.name}
-                      {#if !action.named}<code class="tech">{entry.action}</code>{/if}
-                    </p>
+                    <p class="small">{actionName(entry.action)}</p>
                   </div>
                   <StatusPill status={outcomeStatus(entry.outcome)} label={outcomeLabel(entry.outcome)} />
                 </li>
               {/each}
             </ul>
             <p class="micro muted account__note">
-              Показаны последние {countOf(journalRows.length, 'запись', 'записи', 'записей')}; более
-              старые в этот список не подтягиваются.
+              {shownSentenceOf(journalRows.length, activityTotal, JOURNAL_NOUNS.entry)}.
+              {#if activityPartial}{activityPartial}.{/if}
             </p>
+            {#if activityStalled}
+              <!-- Остаток назван, а страница пришла пустой: действие убрано,
+                   иначе клик был бы пустым. Тупик отличается и от сбоя, и от
+                   «показаны все», поэтому говорит о себе своей строкой. -->
+              <Notice tone="warn" title={JOURNAL_WINDOW_WORDS.stalledTitle}>
+                {JOURNAL_WINDOW_WORDS.stalled}
+              </Notice>
+            {:else if activityLeft !== null && activityLeft > 0}
+              <div class="row">
+                <Button
+                  variant="quiet"
+                  busy={activityMoreLoading}
+                  disabled={activityMoreLoading || activityLeft === 0}
+                  onclick={() => void loadActivityMore()}
+                >
+                  {activityMoreLoading
+                    ? JOURNAL_WINDOW_WORDS.loadingMore
+                    : journalLoadMoreOf(
+                        activityLeft ?? ACTIVITY_PAGE_SIZE,
+                        ACTIVITY_PAGE_SIZE,
+                        JOURNAL_NOUNS.entry
+                      )}
+                </Button>
+              </div>
+            {/if}
+            {#if activityMoreError}
+              <Notice tone="error" title={JOURNAL_WINDOW_WORDS.moreFailedTitle}>
+                {activityMoreError}
+              </Notice>
+            {/if}
           </Panel>
         {/if}
       </section>
 
       <!-- ── Журнал корпуса ─────────────────────────────────────────── -->
       {#if canAudit}
-        <section class="account__block">
+        <section class="account__block" id="corpus-journal">
           <SectionHead
             level="2"
-            title="Журнал корпуса"
-            lead="Действия всех аккаунтов в этом корпусе: правки фактов, разборы предложений, отказы доступа."
+            title={sectionTitle('corpus-journal')}
+            lead="Действия всех аккаунтов в этом корпусе: правки утверждений, решения по предложениям, отказы доступа."
           >
             <Button
               variant="quiet"
@@ -605,16 +904,16 @@
 
           {#if corpusLoading && corpusJournal === null}
             <Panel tone="sunk">
-              <div class="row account__loading">
+              <div class="row account__loading" role="status">
                 <span class="spinner" aria-hidden="true"></span>
-                <p class="small">Читаем журнал корпуса…</p>
+                <p class="small">{CORPUS_JOURNAL.loading}</p>
               </div>
             </Panel>
           {:else if corpusError}
             <Panel tone="coral">
               <div class="account__fault">
-                <p class="eyebrow"><Icon name="alert" size={16} /> журнал не прочитан</p>
-                <p class="small">{corpusError} Это не пустой журнал — он не прочитан.</p>
+                <p class="eyebrow"><Icon name="alert" size={16} /> журнал не пришёл</p>
+                <p class="small">{corpusError}</p>
                 <div class="row">
                   <Button
                     variant="action"
@@ -630,28 +929,43 @@
             </Panel>
           {:else if corpusJournal !== null}
             {#if corpusJournal.length === 0}
-              <Empty
-                icon="clock"
-                title="В журнале корпуса пока нет актов"
-                body="Запросы к корпусу, правки и отказы доступа записываются сюда по мере работы."
-              />
+              {#if corpusUnloaded}
+                <Panel tone="coral">
+                  <div class="account__fault">
+                    <p class="eyebrow"><Icon name="alert" size={16} /> журнал не загружен</p>
+                    <p class="small"><strong>{corpusUnloaded.title}.</strong> {corpusUnloaded.body}</p>
+                    <div class="row">
+                      <Button
+                        variant="action"
+                        icon="refresh"
+                        busy={corpusLoading}
+                        disabled={corpusLoading}
+                        onclick={() => void loadCorpusJournal()}
+                      >
+                        Повторить запрос
+                      </Button>
+                    </div>
+                  </div>
+                </Panel>
+              {:else}
+                <Empty
+                  icon="clock"
+                  title="В журнале корпуса пока нет актов"
+                  body="Вопросы к корпусу, правки и отказы доступа записываются сюда по мере работы."
+                />
+              {/if}
             {:else}
               <Panel>
                 <ul class="journal">
                   {#each corpusJournal as entry, i (i)}
-                    {@const action = actionTerm(entry.action)}
-                    {@const actor = actorLabel(entry.actor_id)}
                     <li class="journal__row">
                       <div class="journal__when">
                         <time datetime={entry.created_at}>{dateTime(entry.created_at)}</time>
                       </div>
                       <div class="journal__what">
-                        <p class="small">
-                          {action.name}
-                          {#if !action.named}<code class="tech">{entry.action}</code>{/if}
-                        </p>
+                        <p class="small">{actionName(entry.action)}</p>
                         <p class="micro muted">
-                          {#if actor.mine}это были вы{:else}актор <code class="tech">{actor.code}</code>{/if}
+                          {#if isMine(entry.actor_id)}это были вы{:else}другой аккаунт{/if}
                         </p>
                       </div>
                       <StatusPill status={outcomeStatus(entry.outcome)} label={outcomeLabel(entry.outcome)} />
@@ -659,31 +973,56 @@
                   {/each}
                 </ul>
                 <p class="micro muted account__note">
-                  Показаны последние {countOf(corpusJournal.length, 'запись', 'записи', 'записей')};
-                  более старые в этот запрос не подтягиваются, а имена прочих аккаунтов журнал не
-                  публикует.
+                  {shownSentenceOf(
+                    corpusJournal.length,
+                    corpusTotal,
+                    JOURNAL_NOUNS.entry
+                  )}.
+                  {#if corpusPartial}{corpusPartial}.{/if}
+                  Имена прочих аккаунтов сервис не публикует.
                 </p>
+                {#if corpusStalled}
+                  <Notice tone="warn" title={JOURNAL_WINDOW_WORDS.stalledTitle}>
+                    {JOURNAL_WINDOW_WORDS.stalled}
+                  </Notice>
+                {:else if corpusLeft !== null && corpusLeft > 0}
+                  <div class="row">
+                    <Button
+                      variant="quiet"
+                      busy={corpusMoreLoading}
+                      disabled={corpusMoreLoading}
+                      onclick={() => void loadCorpusJournalMore()}
+                    >
+                      {corpusMoreLoading
+                        ? JOURNAL_WINDOW_WORDS.loadingMore
+                        : journalLoadMoreOf(
+                            corpusLeft ?? AUDIT_PAGE_SIZE,
+                            AUDIT_PAGE_SIZE,
+                            JOURNAL_NOUNS.entry
+                          )}
+                    </Button>
+                  </div>
+                {/if}
+                {#if corpusMoreError}
+                  <Notice tone="error" title={JOURNAL_WINDOW_WORDS.moreFailedTitle}>
+                    {corpusMoreError}
+                  </Notice>
+                {/if}
               </Panel>
             {/if}
           {/if}
         </section>
       {/if}
 
-      <!-- ── Безопасность ───────────────────────────────────────────── -->
-      <section class="account__block">
+      <!-- ── Смена пароля ───────────────────────────────────────────── -->
+      <section class="account__block" id="account-password">
         <SectionHead
           level="2"
-          title="Безопасность"
-          lead="Смена пароля закрывает все прочие входы этого аккаунта; выход закрывает только этот."
+          title={sectionTitle('account-password')}
+          lead="После смены пароля прочие входы этого аккаунта закрываются, этот вход остаётся."
         />
 
         <Panel tag="section">
-          <div class="panel__head">
-            <div class="grow">
-              <h3 class="h4">Пароль</h3>
-            </div>
-          </div>
-
           <form class="stack" style="--gap: var(--s4)" onsubmit={savePassword}>
             <Field
               label="Текущий пароль"
@@ -699,7 +1038,7 @@
               name="new_password"
               type="password"
               autocomplete="new-password"
-              hint="Минимальную длину задаёт сервис: короткий пароль не примется."
+              hint={`Не короче ${PASSWORD_MIN} символов. Удобнее длинная фраза, чем короткий набор.`}
               error={pwdErrors.next ?? ''}
               disabled={pwdBusy}
               bind:value={newPwd}
@@ -744,17 +1083,17 @@
             </div>
           </form>
         </Panel>
+      </section>
+
+      <!-- ── Выход ──────────────────────────────────────────────────── -->
+      <section class="account__block" id="account-signout">
+        <SectionHead
+          level="2"
+          title={sectionTitle('account-signout')}
+          lead="Выход закрывает только этот вход: корпус и журнал ваших действий остаются."
+        />
 
         <Panel tone="coral" class="reveal">
-          <div class="panel__head">
-            <div class="grow">
-              <h3 class="h4">Выход</h3>
-              <p class="micro muted">
-                Выход закрывает только этот вход: список находок и история ответов остаются.
-              </p>
-            </div>
-          </div>
-
           {#if outError}
             <Notice tone="error" title="Выход не завершён">{outError}</Notice>
           {/if}
@@ -763,9 +1102,7 @@
             <Button variant="ink" icon="logout" busy={outBusy} disabled={outBusy} onclick={() => void signOut()}>
               Выйти
             </Button>
-            <p class="micro muted">
-              Войти снова можно сразу: находки и история ответов никуда не деваются.
-            </p>
+            <p class="micro muted">Войти снова можно сразу.</p>
           </div>
         </Panel>
       </section>
@@ -786,8 +1123,8 @@
           {#if serviceOpen}
             <div class="acc__body" id="account-service">
               <p>
-                Полный перечень прав и классов данных: по нему видно, почему конкретный раздел закрыт.
-                Идентификаторы нужны при разборе обращения в сервис.
+                Служебный слой профиля: ключи прав, классы данных и идентификаторы. Они нужны при разборе
+                обращения в сервис, а на решение аналитика не влияют.
               </p>
 
               <h3 class="h4 account__sub">Права аккаунта</h3>
@@ -795,6 +1132,7 @@
                 {#each [...workSections, ...expertSections] as item (item.capability)}
                   <li class="rights__row">
                     <span class="grow">{item.label}</span>
+                    <code class="tech rights__key">{item.capability}</code>
                     <span class="micro muted">{item.open ? 'выдано' : 'не выдано'}</span>
                   </li>
                 {/each}
@@ -803,7 +1141,7 @@
               <h3 class="h4 account__sub">Доступные классы данных</h3>
               {#if account.data_classes.length === 0}
                 <p class="micro muted">
-                  Классы данных не открыты — находки корпуса не видны, даже если право на чтение выдано.
+                  Классы данных не открыты: находки корпуса не видны, даже если право на чтение выдано.
                 </p>
               {:else}
                 <div class="grants">
@@ -825,16 +1163,45 @@
                 <h3 class="h4 account__sub">Объекты последних актов</h3>
                 <ul class="refs">
                   {#each journalRefs as entry, i (i)}
-                    {@const action = actionTerm(entry.action)}
                     <li class="refs__row">
                       <span class="micro muted">{dateTime(entry.created_at)}</span>
-                      <span class="micro">{action.name}</span>
+                      <span class="micro">{actionName(entry.action)}</span>
                       <code class="tech">{entry.object_id}</code>
                     </li>
                   {/each}
                 </ul>
               {:else if activity !== null && journalRows.length > 0}
                 <p class="micro muted">Объект не указан ни в одном акте этого списка журнала.</p>
+              {/if}
+
+              {#if unknownActions.length > 0}
+                <h3 class="h4 account__sub">Действия без названия</h3>
+                <p class="micro muted">
+                  В словаре экрана их нет, поэтому в журнале они подписаны общими словами. Здесь ключ
+                  виден целиком.
+                </p>
+                <ul class="refs">
+                  {#each unknownActions as entry, i (i)}
+                    <li class="refs__row">
+                      <span class="micro muted">{dateTime(entry.created_at)}</span>
+                      <code class="tech">{entry.action}</code>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+
+              {#if corpusActorRefs.length > 0}
+                <h3 class="h4 account__sub">Акторы журнала корпуса</h3>
+                <p class="micro muted">Свои акты помечены словами, чужие читаются идентификатором.</p>
+                <ul class="refs">
+                  {#each corpusActorRefs as entry, i (i)}
+                    <li class="refs__row">
+                      <span class="micro muted">{dateTime(entry.created_at)}</span>
+                      <span class="micro">{actionName(entry.action)}</span>
+                      <code class="tech">{isMine(entry.actor_id) ? 'этот аккаунт' : entry.actor_id}</code>
+                    </li>
+                  {/each}
+                </ul>
               {/if}
             </div>
           {/if}
@@ -923,6 +1290,12 @@
     margin-top: var(--s4);
   }
 
+  /* Пояснение в списке прав: читается той же мерой, что и строки списка. */
+  .account__lead {
+    max-width: 68ch;
+    margin-top: var(--s2);
+  }
+
   .row.account__loading {
     --gap: var(--s4);
     align-items: flex-start;
@@ -987,6 +1360,14 @@
     border-bottom: 1px solid var(--line-soft);
   }
 
+  /* Ключ права читается целиком и переносится, а не распирает строку: он здесь
+     единственный служебный слой этого списка. */
+  .rights__row .rights__key {
+    flex: none;
+    max-width: 40%;
+    overflow-wrap: anywhere;
+  }
+
   /* Идентификаторы объектов журнала: служебный слой, перенос не распирает
      колонку. */
   .refs {
@@ -1036,7 +1417,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--s2);
-    margin: 0;
+    margin: var(--s3) 0 0;
     padding: 0;
   }
 

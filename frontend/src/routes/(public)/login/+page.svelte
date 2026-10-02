@@ -13,6 +13,10 @@
     return raw && raw.startsWith('/') && !/^\/\/|^\/\\/.test(raw) ? raw : '/research';
   });
 
+  // Сюда привёл рабочий раздел: человек должен видеть, что после входа он
+  // вернётся туда же, а не в раздел по умолчанию.
+  const cameToContinue = $derived(page.url.searchParams.has('next'));
+
   let email = $state('');
   let password = $state('');
   let fieldErrors = $state<{ email?: string; password?: string }>({});
@@ -31,24 +35,39 @@
     }
 
     busy = true;
+    const typedEmail = email.trim();
     try {
-      await session.login(email.trim(), password);
+      await session.login(typedEmail, password);
       await goto(next);
       await invalidateAll();
     } catch (caught) {
+      // Отказ убирает введённое из полей: email возвращаем в форму, чтобы
+      // человек правил только пароль, а пароль оставаем чистым. Текст отказа
+      // обещает ровно это и не называет оба поля сохранёнными.
+      email = typedEmail;
+      password = '';
+      // Сервер отвечает одинаковым отказом и на неизвестный email, и на неверный
+      // пароль: перечислять аккаунты интерфейс не вправе, поэтому форма называет
+      // обе причины сразу. Действие одно; ссылка создать аккаунт стоит под кнопкой
+      // входа и в тексте отказа не повторяется.
       formError =
         caught instanceof ApiError && caught.status === 401
-          ? 'Неверный email или пароль.'
+          ? 'Email или пароль не подходят. Поправьте пароль и повторите вход.'
           : caught instanceof ApiError && caught.status === 429
-            // Формулировку держит интерфейс: сервер считает паузу, но её текст
-            // не должен становиться единственной подсказкой на экране входа.
-            ? 'Слишком много неудачных попыток входа подряд. Подождите минуту и повторите — введённое осталось в форме.'
-            : 'Войти не удалось. Проверьте соединение и повторите вход — введённое осталось в форме.';
+            // Сервер считает паузу сам, её точная длина наружу не выходит: нужно
+            // знать только, что повторить стоит позже, а не сейчас.
+            ? 'Слишком много неудачных попыток входа подряд, повторите позже.'
+            : 'Сервис не ответил, войти не удалось. Проверьте соединение и повторите вход.';
     } finally {
       busy = false;
     }
   }
 </script>
+
+<svelte:head>
+  <title>Вход в Научный Клубок</title>
+  <meta name="description" content="Вход в рабочее пространство Научного Клубка: вопрос к корпусу, находки, карта связей." />
+</svelte:head>
 
 <div class="page auth page--cover">
   <div class="scene" aria-hidden="true">
@@ -59,9 +78,16 @@
   <div class="wrap wrap--narrow auth__inner">
     <h1 class="display reveal">Вход в Клубок</h1>
     <p class="lead reveal" style="--reveal-delay: 90ms">
-      Один вход на всё рабочее место: вопрос агенту, находки с трассировкой до источника,
-      карта связей и сравнение технологий.
+      Один аккаунт на всё рабочее пространство: вопрос к корпусу, находки с цитатами и адресами
+      в источниках, карта связей и сравнение технологий.
     </p>
+
+    {#if cameToContinue}
+      <Notice tone="info" title="Нужен вход">
+        Рабочий раздел открывается после входа. Войдите, и вы вернётесь на ту же страницу: адрес
+        сохранён.
+      </Notice>
+    {/if}
 
     <form
       class="panel reveal auth__form"
@@ -87,6 +113,7 @@
           type="password"
           autocomplete="current-password"
           placeholder="Пароль из вашего аккаунта"
+          hint="Тот же пароль, что задали при регистрации"
           bind:value={password}
           error={fieldErrors.password ?? ''}
         />
@@ -97,14 +124,26 @@
       {/if}
 
       <div class="row row--between">
-        <Button type="submit" variant="action" {busy} disabled={busy}>Войти</Button>
+        <Button type="submit" variant="action" {busy} disabled={busy}>
+          {busy ? 'Отправляем…' : 'Войти'}
+        </Button>
         <Button href="/register" variant="link" size="sm">Нет аккаунта? Создать</Button>
       </div>
 
-      <p class="micro muted">
-        Разбор предложений эволюции, аудит и закрытые данные открываются при расширенном доступе;
-        остальное рабочее пространство доступно сразу.
-      </p>
+      <div class="stack auth__notes">
+        <p class="micro muted">
+          Email и пароль нужны только для входа в рабочее пространство и для подписи ваших
+          записей.
+        </p>
+        <p class="micro muted">
+          Забыли пароль? Новый задаёт администратор сервиса: самостоятельной сбросной ссылки
+          здесь нет.
+        </p>
+        <p class="micro muted">
+          Экспертное право на разбор предложений по ответам, журнал действий и закрытые данные
+          выдаёт администратор сервиса. Остальное открывается сразу после входа.
+        </p>
+      </div>
     </form>
   </div>
 </div>
@@ -136,5 +175,11 @@
 
   .auth__inner .display {
     max-width: 15ch;
+  }
+
+  /* Примечания читаются dense-блоком под действиями, а не россыпью строк. */
+  .auth__notes {
+    --gap: var(--s2);
+    max-width: var(--maxw-measure);
   }
 </style>

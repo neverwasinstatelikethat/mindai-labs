@@ -131,7 +131,7 @@
     {#if hint}
       <span class="prompt__hint">{hint}</span>
     {:else}
-      <span class="prompt__hint">Enter — отправить · Shift + Enter — строка</span>
+      <span class="prompt__hint">Enter отправляет вопрос, Shift + Enter переносит строку</span>
     {/if}
 
     <button

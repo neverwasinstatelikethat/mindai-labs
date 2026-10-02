@@ -8,15 +8,17 @@
   import { tick } from 'svelte';
   import { page } from '$app/state';
   import { countOf, duration, num, plural } from '$lib/format';
+  import { navLabel } from '$lib/nav';
   import { bandOf, groupIntervals } from '$lib/rail';
   import { scrollRegion } from '$lib/scroll-region';
   import { session } from '$lib/sessionStore.svelte';
   import {
-    AGENT_LABELS,
     ANSWER_HEAD,
     ASK_ACTIONS,
     ASK_EMPTY,
+    ASK_FEEDBACK,
     ASK_NO_MATCH,
+    ASK_REVIEW,
     ASK_SOURCE,
     ASK_TRAIL,
     DEGRADED,
@@ -31,7 +33,6 @@
     RUN_STAGES,
     RUN_STRINGS,
     RUN_TOOLS,
-    type RunStage,
     SCALE_LABELS,
     SHEET_LABELS,
     STEP_STATE_LABELS,
@@ -40,12 +41,15 @@
     SUBJECT_LABELS,
     TERM_FALLBACKS,
     TRUST_PANEL,
-    contourRole,
+    type RunStage,
     degradationOf,
     describeScope,
     describeValue,
     hopsText,
     knownTerm,
+    linksToText,
+    moreThesesText,
+    stageOfNode,
     termOf,
     tracePhraseOf,
   } from '$lib/terms';
@@ -192,51 +196,47 @@
   }: Props = $props();
 
   // ── Имена реальных значений контракта ─────────────────────────────────────
-  // Словари меток — в `terms.ts` (зона RS): стадии, инструменты, исходы шага,
-  // служебные слова и перевод строк рабочего процесса. В компоненте остаётся
-  // только привязка узла к стадии: это порядок следования, а не отображаемое
-  // имя.
+  // Словарь меток один и живёт в `terms.ts` (зона RS): стадии сборки ответа,
+  // инструменты, исходы шага и перевод строк рабочего процесса. Узел потока
+  // попадает в стадию через `stageOfNode`: узла нет в перечне, шаг идёт в
+  // «Другие шаги» и не получает выдуманного имени.
 
   type StageKey = RunStage;
 
-  // Стадии соответствуют узлам ResearchWorkflow.stream: узел, которого в таблице
-  // нет, честно попадает в «иные шаги», а не теряется.
-  const AGENT_STAGE: Record<string, StageKey> = {
-    planning_agent: 'setup',
-    action_planner: 'traverse',
-    tool_executor: 'traverse',
-    controller: 'traverse',
-    reasoner: 'answer',
-    critic: 'answer',
-    improver: 'answer',
-    synthesizer: 'answer',
-    finalize: 'answer',
-  };
-
-  // Цвет плашки шага: «готово» — состояние по умолчанию, а не успех, поэтому
-  // оно нейтральное; заметно только отклонение.
+  // Цвет плашки шага: «готово» это состояние по умолчанию, а не успех, поэтому
+  // плашка нейтральная; заметно только отклонение.
   function stepPill(status: AgentEvent['status']): 'off' | 'hypothesis' | 'disputed' {
     if (status === 'failed') return 'disputed';
     if (status === 'revised') return 'hypothesis';
     return 'off';
   }
 
-  // ── Локальное состояние листа ────────────────────────────────────────────
+  // ── Локальное состояние экрана ───────────────────────────────────────────
 
   let flow = $state<HTMLDivElement | null>(null);
   let rail = $state<HTMLElement | null>(null);
   let narrow = $state(false);
+  // Набранный вопрос живёт в поле до ответа: отказ не должен стоить набранного
+  // текста, поэтому поле очищает только пришедший ответ (см. $effect ниже).
   let draft = $state('');
   let seeded = false;
-  let guideOpen = $state(false);
+  let lastAsked = '';
+  // Подсказка «Как читать ответ» на пустом экране раскрыта, в готовом ответе
+  // свёрнута: новичок обязан увидеть правила до первого ответа, а готовый ответ
+  // не начинается с lesson.
+  let guideOpen = $state(true);
   // Раскрытие «Почему ответу можно верить»: режим сборки, время, узлы, глубина
-  // поиска и длительность шагов. Под ним же — служебные имена ключей.
+  // поиска и длительность шагов.
   let trustOpen = $state(false);
   let correctionFor = $state<string | null>(null);
   let correctionComment = $state('');
   let correctionText = $state('');
   let feedbackVerdict = $state<'accept' | 'reject' | null>(null);
   let feedbackComment = $state('');
+  // Список тезисов с потолком: 500 тезисов не должны превращать экран в 500
+  // карточек и 500 тиков шкалы.
+  const THESES_PAGE = 20;
+  let thesesLimit = $state(THESES_PAGE);
 
   // История версий — по каждому утверждению отдельно: загрузка одного тезиса не
   // перекрашивает остальные, и отказ относится к одному месту, а не ко всем.
@@ -297,27 +297,34 @@
 
   // Вопрос со входа в раздел подставляется в поле один раз и сразу запускается:
   // человек уже отправил его с входной страницы, повторять нажатие не нужно.
-  // Пока сессия не подтверждена, ждём — права на проход приходят с сервера.
+  // Пока сессия не подтверждена, ждём: права приходят с сервера вместе с аккаунтом.
   $effect.pre(() => {
-    const value = seed;
-    if (seeded || !value) return;
-    draft = value;
-    if (!canAsk) return;
+    const value = seed.trim();
+    if (seeded || !value || !canAsk) return;
     seeded = true;
-    // Поле очищается, как при обычном ask(): вопрос уходит в проход,
-    // а не остаётся набранным текстом.
-    draft = '';
-    queueMicrotask(() => onask(value.trim()));
+    draft = value;
+    lastAsked = value;
+    queueMicrotask(() => onask(value));
   });
 
-  // След сворачивается сам, когда проход закончился, но решение человека
-  // всегда перекрывает авто-состояние.
+  // Поле очищается только когда ответ на этот вопрос пришёл: при отказе, при
+  // остановке и во время сборки набранный текст остаётся видимым.
+  $effect(() => {
+    const answered = (answer?.question ?? '').trim();
+    if (!running && answered && answered === lastAsked && draft === lastAsked) {
+      draft = '';
+      lastAsked = '';
+    }
+  });
+
+  // След сворачивается сам, когда сборка закончилась, но решение человека
+  // всегда перекрывает автоматическое состояние.
   const trailOpen = $derived(trailUser ?? running);
   const scaleOpen = $derived(scaleUser ?? !narrow);
 
-  // Узкий экран — одна вертикальная композиция: шкала и след убираются в
+  // Узкий экран: одна вертикальная композиция, шкала и след убираются в
   // раскрытия. $effect.pre, чтобы не мелькать развёрнутым списком на мобильном.
-  // 900px — контрактная точка компоновки из DESIGN.md (диапазон 640–900 —
+  // 900px это контрактная точка компоновки из DESIGN.md (диапазон 640–900
   // планшет): JS-переключатель обязан совпадать с media-правилами стилей ниже,
   // иначе шкала свёрнута, а её сетка ещё двухколоночная.
   $effect.pre(() => {
@@ -342,19 +349,24 @@
     feedbackVerdict = null;
     feedbackComment = '';
     histories = {};
+    thesesLimit = THESES_PAGE;
+    // На пустом экране правила чтения раскрыты, в готовом ответе свёрнуты.
+    guideOpen = answer === null && !running;
   });
 
-  const railGroups = $derived(groupIntervals(answer?.findings ?? []));
+  const visibleFindings = $derived((answer?.findings ?? []).slice(0, thesesLimit));
+  const findingsHidden = $derived((answer?.findings ?? []).length - visibleFindings.length);
+  const railGroups = $derived(groupIntervals(visibleFindings));
   const trailSteps = $derived<TrailStep[]>(
     steps.length ? steps : (answer?.trace ?? []).map((step) => ({ ...step })),
   );
 
-  function stageOf(agent: string): StageKey {
-    return AGENT_STAGE[agent] ?? 'other';
+  function stageOf(agent: string | null): StageKey {
+    return agent ? (stageOfNode(agent)?.key ?? 'other') : 'other';
   }
 
   function stepsFor(key: StageKey): TrailStep[] {
-    return trailSteps.filter((step) => (step.agent ? stageOf(step.agent) : 'other') === key);
+    return trailSteps.filter((step) => stageOf(step.agent) === key);
   }
 
   const stageStrip = $derived(
@@ -368,12 +380,12 @@
   );
 
   // Телеметрия сборки уходит под раскрытие «Почему ответу можно верить»: узлы,
-  // глубина, длительность шагов — показатели контура, а не вывод аналитика.
-  // Вывод (статус тезиса, класс доступа и версия, цитата с локатором,
+  // глубина и длительность шагов это показатели контура, а не вывод аналитика.
+  // Вывод (статус тезиса, класс доступа и версия, цитата с местом в источнике,
   // расхождения и пробелы) остаётся на виду.
   const trustRows = $derived.by(() => {
     if (!answer) return [];
-    const rows: { label: string; value: string }[] = [
+    const rows: { label: string; value: string; note?: string }[] = [
       { label: TRUST_PANEL.modeLabel, value: MODEL_MODE_LABELS[answer.model_mode] },
       {
         label: TRUST_PANEL.timeLabel,
@@ -385,42 +397,48 @@
       { label: TRUST_PANEL.filtersLabel, value: String(answer.query_plan.numeric_filters.length) },
       {
         label: TRUST_PANEL.confidenceLabel,
-        value: `${num(Math.round(answer.confidence * 100))} % — ${TRUST_PANEL.confidenceNote}`,
+        value: `${num(Math.round(answer.confidence * 100))} %`,
+        note: TRUST_PANEL.confidenceNote,
       },
     ];
     return rows;
   });
 
-  // Служебные имена и длительность шагов: то же самое содержимое, но подписью,
-  // а не заголовком. Ключ, у которого нет русского имени, живёт здесь.
+  // Служебные данные ответа: одно раскрытие на весь ответ (А10). Идентификатор
+  // ответа, имена узлов, длительность шагов и сырые причины неполного ответа:
+  // всё, что нужно для сверки с сервером и чего не должно быть в тексте вывода.
   const serviceRows = $derived.by(() => {
     const rows: { label: string; value: string }[] = [];
+    if (answer) {
+      rows.push({ label: ANSWER_HEAD.queryIdLabel, value: answer.query_id });
+    }
     trailSteps.forEach((step, index) => {
       rows.push({
-        label: `${String(index + 1).padStart(2, '0')} · ${step.agent ?? RUN_STRINGS.stepFallback}`,
-        value: step.duration_ms == null ? RUN_STRINGS.noTime : duration(step.duration_ms),
+        label: `шаг ${String(index + 1).padStart(2, '0')}`,
+        value: `${step.agent ?? RUN_STRINGS.stepFallback}, ${
+          step.duration_ms == null ? RUN_STRINGS.noTime : duration(step.duration_ms)
+        }`,
       });
     });
     for (const observation of obsView) {
       rows.push({
-        label: `${observation.name} · ${RUN_STRINGS.nodeCount}`,
+        label: `узел ${observation.name}`,
         value: observation.toolCode
-          ? `${observation.nodes} (ключ: ${observation.toolCode})`
-          : String(observation.nodes),
+          ? `${observation.nodes} узлов корпуса, ключ: ${observation.toolCode}`
+          : `${observation.nodes} узлов корпуса`,
       });
     }
+    answer?.degradation_reasons.forEach((reason, index) => {
+      rows.push({ label: `причина неполного ответа ${index + 1}`, value: reason });
+    });
     return rows;
   });
 
   // ── Форматирование ──────────────────────────────────────────────────────
-  // Длительности — общий `duration` из `$lib/format`, как на остальных экранах:
-  // до минуты — десятые доли секунды, дальше — минуты, иначе отсчёт листа
-  // расходился бы с «Проверкой решений» и журналом.
-
-  function shortCode(value: string | null | undefined, size = 8): string {
-    if (!value) return '—';
-    return value.slice(0, size);
-  }
+  // Длительности читает общий `duration` из `$lib/format`, как на остальных
+  // экранах: до минуты десятые доли секунды, дальше минуты. Идентификаторы
+  // целиком уходят в «Служебные данные», поэтому сокращать их до восьми
+  // символов в интерфейсе больше нечего.
 
   function keyOf(finding: Finding, index: number): string {
     return `${finding.id}#${index}`;
@@ -430,28 +448,12 @@
     return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   }
 
-  function agentName(key: string | null | undefined): string | null {
-    if (!key) return null;
-    return AGENT_LABELS[key] ?? AGENT_LABELS[key.toLowerCase()] ?? null;
-  }
-
   // Полоса интервала: цвет несёт статус, поэтому варианты consensus/disputed
   // берут классы из `app.css`; «гипотеза» доопределена ниже единственной строкой.
   function bandClass(status: Finding['status']): string {
     if (status === 'disputed') return 'bar__fill--disputed';
     if (status === 'consensus') return 'bar__fill--consensus';
     return '';
-  }
-
-  function stepName(step: TrailStep): { label: string; code: string | null } {
-    const known = agentName(step.agent);
-    if (known) return { label: known, code: null };
-    return { label: RUN_STRINGS.stepFallback, code: step.agent ?? null };
-  }
-
-  function stepNote(step: TrailStep): string {
-    if (step.duration_ms == null) return RUN_STRINGS.noTime;
-    return step.duration_ms > 0 ? duration(step.duration_ms) : '—';
   }
 
   function signOf(operator: string): string {
@@ -520,26 +522,61 @@
         : evidence.sheet
           ? `лист ${evidence.sheet}`
           : (evidence.cell_range ?? '');
-    return `${evidence.source_title || 'запись корпуса'}${place ? ` · ${place}` : ''}`;
+    return place
+      ? `${evidence.source_title || 'запись корпуса'}, ${place}`
+      : evidence.source_title || 'запись корпуса';
   }
 
+  // Место в источнике человекочитаемыми словами. Символьные offsets это
+  // служебные данные: они ушли под «Служебные данные» этого разбора.
   function locParts(evidence: Evidence): string[] {
     const parts: string[] = [];
     if (evidence.page != null) parts.push(`стр. ${evidence.page}`);
     if (evidence.sheet) parts.push(`лист ${evidence.sheet}`);
     if (evidence.cell_range) parts.push(`ячейки ${evidence.cell_range}`);
-    if (evidence.char_start != null) {
-      parts.push(
-        `${SHEET_LABELS.chars} ${evidence.char_start}–${evidence.char_end ?? evidence.char_start}`,
-      );
-    }
     return parts.length ? parts : [SHEET_LABELS.noLocator];
   }
 
-  // Ссылка на первоисточник из ответа: находки принимают срез по утверждению
-  // (`claim`) и по документу (`document`) — имена параметров зафиксированы в
-  // DESIGN.md. Раздел не знает этих параметров — тогда это обычный вход в
-  // «Находки», где свой список и свой фильтр: ссылка ведёт, но не пустит в пустоту.
+  /** Служебные строки одного доказательства: символы и идентификатор записи. */
+  function evidenceServiceRows(finding: Finding): { label: string; value: string }[] {
+    return finding.evidence.map((evidence, index) => {
+      const from = evidence.char_start;
+      const to = evidence.char_end ?? evidence.char_start;
+      return {
+        label: `${SHEET_LABELS.source} ${index + 1}, ${SHEET_LABELS.chars}`,
+        value: from == null ? 'нет' : `${from}–${to}`,
+      };
+    });
+  }
+
+  /** Служебные данные разбора: адрес тезиса, символы цитат, идентификаторы
+   *  записей и автор правки. Для сверки с сервером, для чтения тезиса не нужно. */
+  function sheetServiceRows(finding: Finding): { label: string; value: string }[] {
+    const rows: { label: string; value: string }[] = [
+      { label: SHEET_LABELS.thesisId, value: finding.id },
+      ...evidenceServiceRows(finding),
+    ];
+    const doc = finding.evidence[0]?.document_id;
+    if (doc) rows.push({ label: SHEET_LABELS.documentId, value: doc });
+    if (finding.superseded_by) {
+      rows.push({ label: SHEET_LABELS.supersededById, value: finding.superseded_by });
+    }
+    for (const version of historyState(finding.id).data?.versions ?? []) {
+      if (version.reviewer_id) {
+        rows.push({
+          label: `${SHEET_LABELS.reviewerId}, ${SHEET_LABELS.versionLabel} ${version.version}`,
+          value: version.reviewer_id,
+        });
+      }
+    }
+    return rows;
+  }
+
+  // Ссылки под доказательством: их ровно две, и обе ведут туда, где адрес
+  // параметра читают. «Находки» берут срез по утверждению (`claim`) и по
+  // документу (`document`) и сами объясняют, если записи в их окне нет; карта
+  // связей открывает узел по `claim`. Обещать переход, который никуда не ведёт,
+  // нельзя: третьей ссылки здесь нет.
   function findingsHref(finding: Finding): string {
     const params = new URLSearchParams();
     params.set('claim', finding.id);
@@ -548,15 +585,30 @@
     return `/findings?${params.toString()}`;
   }
 
+  function graphHref(finding: Finding): string {
+    const params = new URLSearchParams();
+    params.set('claim', finding.id);
+    return `/graph?${params.toString()}`;
+  }
+
   function scopeText(scope: Record<string, string> | undefined): string {
     const conditions = describeScope(scope);
-    return conditions.length ? conditions.join(' · ') : 'условия не заданы';
+    return conditions.length ? conditions.join(', ') : 'условия не заданы';
   }
 
   function reviewDate(value: string | null): string {
-    if (!value) return '—';
+    if (!value) return 'нет даты';
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('ru-RU');
+  }
+
+  /** Период вопроса словами: прочерк зарезервирован за пустым значением, а
+   *  «2019–» читалось бы как оборванное число. */
+  function periodText(from: number | null | undefined, to: number | null | undefined): string {
+    if (from != null && to != null) return `${from}–${to}`;
+    if (from != null) return `с ${from} года`;
+    if (to != null) return `по ${to} год`;
+    return 'не задан';
   }
 
   // ── Число: значение, нормализация и относительно фильтра запроса ─────────
@@ -579,8 +631,8 @@
   function normalizedText(observation: NumericObservation): string {
     const range = envelope(observation);
     if (observation.operator === 'between' && range) return `${num(range[0])}–${num(range[1])}`;
-    const point = observation.normalized_value ?? observation.value;
-    return point == null ? '—' : num(point);
+    // Пустое значение печатает `num`: прочерк закреплён за ним по всему интерфейсу.
+    return num(observation.normalized_value ?? observation.value);
   }
 
   function niceCeil(value: number): number {
@@ -733,7 +785,7 @@
 
   function valueSummary(finding: Finding): string {
     if (!finding.observations.length) return 'числовых наблюдений нет';
-    return finding.observations.map(describeValue).join(' · ');
+    return finding.observations.map(describeValue).join(', ');
   }
 
   // Фильтр вовсе без значений не показывает строку в условиях: «равно —» или
@@ -774,7 +826,7 @@
     return {
       label: termOf(INTENT_LABELS, intent.primary),
       secondary: intent.secondary.length
-        ? intent.secondary.map((code) => termOf(INTENT_LABELS, code)).join(' · ')
+        ? intent.secondary.map((code) => termOf(INTENT_LABELS, code)).join(', ')
         : 'не заявлено',
       entities: intent.entities,
       constraints: intent.constraints,
@@ -787,7 +839,7 @@
     return {
       mentions: plan.entity_mentions,
       countries: plan.countries,
-      period: `${plan.year_from ?? '—'}–${plan.year_to ?? '—'}`,
+      period: periodText(plan.year_from, plan.year_to),
       hops: plan.max_hops ?? null,
       filters: plan.numeric_filters.length,
     };
@@ -815,15 +867,15 @@
 
   // Стадия видна, когда на неё пришли события или когда у неё есть данные.
   // До ответа стадии остаются в каркасе с честной подписью «придёт с ответом»:
-  // по ним аналитик читает проход.
+  // по ним аналитик читает ход сборки.
   const stageBlocks = $derived.by(() => {
     const waiting = !answer;
     return RUN_STAGES.map((stage) => {
       const items = stepsFor(stage.key);
       const data =
-        stage.key === 'setup'
+        stage.key === 'question'
           ? intentView !== null || planView !== null
-          : stage.key === 'traverse'
+          : stage.key === 'search'
             ? obsView.length > 0
             : false;
       const show = items.length > 0 || data || (waiting && stage.key !== 'other');
@@ -866,18 +918,24 @@
 
   // ── Действия ────────────────────────────────────────────────────────────
 
+  // Набранный вопрос из поля не убирается: он нужен, если сборка не удалась, и
+  // поле очищает только пришедший ответ (см. $effect выше).
   function ask(value: string): void {
     const trimmed = value.trim();
     if (trimmed.length < 3 || running || !canAsk) return;
-    draft = '';
+    lastAsked = trimmed;
     correctionFor = null;
     feedbackVerdict = null;
     onnotice(null);
     onask(trimmed);
   }
 
+  function showMoreTheses(): void {
+    thesesLimit += THESES_PAGE;
+  }
+
   // Открытие разбора: тезис остаётся выбранным (подсветка шкалы и карточки),
-  // а полный разбор с цитатами, локаторами и историей уходит в шторку.
+  // а полный разбор с цитатами, местом в источнике и историей уходит в шторку.
   function openClaim(id: string): void {
     onfocus(null);
     onselect(id);
@@ -922,7 +980,7 @@
         detail:
           reason instanceof Error && reason.message
             ? reason.message
-            : 'Проверьте соединение и отправьте правку снова — текст сохранён.',
+            : 'Проверьте соединение и отправьте правку снова: текст сохранён.',
       });
     }
     if (accepted) {
@@ -946,7 +1004,7 @@
         detail:
           reason instanceof Error && reason.message
             ? reason.message
-            : 'Проверьте соединение и отправьте отзыв снова — текст сохранён.',
+            : 'Проверьте соединение и отправьте отзыв снова: текст сохранён.',
       });
     }
     if (accepted) {
@@ -1027,23 +1085,24 @@
 <div class="ask">
   <div class="ask__flow" bind:this={flow}>
     <!-- ── 1. СОСТОЯНИЯ ДО ОТВЕТА ────────────────────────────────────────── -->
+    {#if busy === 'import'}
+      <p class="micro ask__importing" role="status" aria-live="polite">
+        {ASK_ACTIONS.importingNote}
+      </p>
+    {/if}
+
     {#if !showPaper && !running && !error}
       {#if corpusEmpty === true}
         <Panel tone="sunk">
           <div class="case">
-            <Notice tone="warn" title="Корпус пуст: спрашивать не о чем">
-              <p>
-                В корпусе пока ни одного документа — сравнивать и трассировать нечего.
-              </p>
-              <p class="micro">
-                Загрузите PDF, DOCX, XLSX, JSON или TXT: как только разбор закончится, вопрос по
-                новому материалу можно задать прямо здесь.
-              </p>
+            <Notice tone="warn" title={ASK_EMPTY.corpusEmptyTitle}>
+              <p>{ASK_EMPTY.corpusEmptyBody}</p>
+              <p class="micro">{ASK_EMPTY.corpusEmptyNext}</p>
             </Notice>
             <div class="row">
               <label class="btn btn--action btn--sm upload">
                 <Icon name="upload" size={16} />
-                {busy === 'import' ? 'Обрабатываем…' : 'Импортировать документ'}
+                {busy === 'import' ? ASK_ACTIONS.importing : ASK_ACTIONS.attach}
                 <input
                   type="file"
                   accept=".pdf,.docx,.xlsx,.json,.txt"
@@ -1052,13 +1111,13 @@
                 />
               </label>
               <Button href="/dashboard" variant="quiet" size="sm" icon="gauge">
-                Панель состояния корпуса
+                {navLabel('/dashboard')}
               </Button>
             </div>
           </div>
         </Panel>
       {:else}
-        <!-- Одно главное действие — вопрос в поле композера ниже. Готовые
+        <!-- Одно главное действие: вопрос в поле композера ниже. Готовые
              вопросы и файл корпуса второстепенны: они помогают вопросу, а не
              спорят с ним за внимание, поэтому у пустого состояния нет своей
              крупной кнопки. -->
@@ -1110,13 +1169,11 @@
           <Notice tone="error" title={error.label}>
             <p>{error.detail}</p>
           </Notice>
-          <p class="micro"><b>{ASK_ACTIONS.whatNext}</b> {error.recovery}</p>
+          <p class="micro">{error.recovery}</p>
           {#if staleAnswer && answer}
             <!-- Сбой не притворяется пустотой, а пустота не притворяется сбоем:
                  прежний ответ остаётся на экране и назван как прежний. -->
-            <p class="micro">
-              {ANSWER_HEAD.stale.replace('{question}', `«${answer.question}»`)}
-            </p>
+            <p class="micro">{ANSWER_HEAD.stale.replace('{question}', `«${answer.question}»`)}</p>
           {/if}
           {#if error.question}
             <div class="row">
@@ -1153,7 +1210,7 @@
             <div class="trail__title">
               <h2 class="h4" id="trail-title">
                 {#if running}
-                  <Mascot mood={answerArriving ? 'say' : 'think'} size={32} label="Собираем ответ" />
+                  <Mascot mood={answerArriving ? 'say' : 'think'} size={32} label={ASK_TRAIL.running} />
                   {answerArriving ? ASK_TRAIL.arriving : ASK_TRAIL.running}
                 {:else}
                   {ASK_TRAIL.title}
@@ -1162,7 +1219,7 @@
               <p class="micro">
                 {#if stageStrip.length}
                   {#each stageStrip as stage (stage.label)}
-                    <span class="tag">{stage.label} · <b class="num">{stage.count}</b></span>
+                    <span class="tag"><span>{stage.label}</span><b class="num">{stage.count}</b></span>
                   {/each}
                 {:else}
                   <span class="tag">{ASK_TRAIL.noSteps}</span>
@@ -1223,17 +1280,15 @@
                 {#if block.items.length}
                   <ol class="stage__steps">
                     {#each block.items as step, index (index)}
-                      {@const name = stepName(step)}
                       {@const phrase = step.message ? tracePhraseOf(step.message) : ''}
                       <li class="step" data-state={step.status ?? 'unknown'}>
                         <span class="step__idx num">{String(index + 1).padStart(2, '0')}</span>
                         <span class="step__body">
-                          <span class="step__agent">{name.label}</span>
-                          {#if phrase}<span class="step__msg">{phrase}</span>{/if}
+                          <span class="step__msg">{phrase || RUN_STRINGS.stepFallback}</span>
                         </span>
-                        <!-- Служебное имя шага и его длительность — под
-                             «Служебными данными» в конце следа: здесь читается
-                             ход ответа, а не журнал. -->
+                        <!-- Служебное имя узла и длительность шага лежат под
+                             «Служебными данными» ответа: здесь читается ход
+                             сборки, а не журнал. -->
                         <StatusPill
                           status={stepPill(step.status ?? 'completed')}
                           label={step.status
@@ -1247,7 +1302,7 @@
                   <p class="micro">{ASK_TRAIL.stageNoSteps}</p>
                 {/if}
 
-                {#if block.key === 'setup'}
+                {#if block.key === 'question'}
                   {#if intentView || planView}
                     {#if intentView}
                       <dl class="kv stage__kv">
@@ -1291,7 +1346,7 @@
                       {#if filterRows.length}
                         <div class="table-wrap" role="region" aria-label={ASK_TRAIL.filtersTitle} use:scrollRegion>
                           <table class="table">
-                            <caption class="micro">{ASK_TRAIL.filtersCaption}</caption>
+                            <caption class="micro">{ASK_TRAIL.filtersTitle}</caption>
                             <thead>
                               <tr>
                                 <th>{ASK_TRAIL.colProperty}</th>
@@ -1303,12 +1358,14 @@
                             <tbody>
                               {#each filterRows as row (row.filter.property_name + row.filter.operator)}
                                 {@const property = propertyTerm(row.filter.property_name)}
+                                {@const isRange =
+                                  row.filter.operator === 'between' || row.filter.operator === 'range'}
                                 <tr class:no-coverage={row.covered === 0}>
-                                  <!-- Русское имя свойства; ключ — в «Служебных данных». -->
+                                  <!-- Русское имя свойства; ключ живёт в «Служебных данных». -->
                                   <td>{property.label}</td>
                                   <td>
                                     {labelOf(row.filter.operator)}
-                                    <span class="num">{signOf(row.filter.operator)}</span>
+                                    {#if !isRange}<span class="num">{signOf(row.filter.operator)}</span>{/if}
                                   </td>
                                   <td class="num">{filterText(row.filter)}</td>
                                   <td class="num">
@@ -1316,7 +1373,7 @@
                                       {row.covered}
                                       {plural(row.covered, 'наблюдение', 'наблюдения', 'наблюдений')}
                                     {:else}
-                                      —
+                                      нет
                                     {/if}
                                   </td>
                                 </tr>
@@ -1332,7 +1389,7 @@
                   {/if}
                 {/if}
 
-                {#if block.key === 'traverse'}
+                {#if block.key === 'search'}
                   {#if obsView.length}
                     <div class="stage__obs">
                       {#each obsView as observation (observation.key)}
@@ -1349,8 +1406,8 @@
                             />
                           </div>
                           <p class="small">{observation.summary}</p>
-                          <!-- Счётчики утверждений и узлов — телеметрия обхода:
-                              она ушла под «Служебные данные» в конце следа. -->
+                          <!-- Счётчики утверждений и узлов это телеметрия сборки:
+                              она ушла под «Служебные данные» ответа. -->
                         </div>
                       {/each}
                     </div>
@@ -1374,7 +1431,7 @@
             <!-- Новый вопрос ещё без ответа: прежний не стирается молча, он
                  назван прежним и остаётся до явного действия человека. -->
             <div class="paper__stale">
-              <Notice tone="info" title={ANSWER_HEAD.eyebrow}>
+              <Notice tone="info" title={ANSWER_HEAD.staleTitle}>
                 <p>{ANSWER_HEAD.stale.replace('{question}', `«${answer.question}»`)}</p>
               </Notice>
               <Button variant="quiet" size="sm" onclick={() => (staleDismissed = true)}>
@@ -1385,11 +1442,10 @@
           <p class="eyebrow">
             <Icon name="doc" size={16} />
             {ANSWER_HEAD.eyebrow}
-            <code class="code paper__id">{shortCode(payload.query_id)}</code>
           </p>
           <h2 class="h3">{payload.question || question}</h2>
-          <!-- Режим сборки меняет доверие к ответу: «без модели» и «служебный
-               режим» читаются иначе, чем ответ модели. -->
+          <!-- Режим сборки меняет доверие к ответу: ответ без модели читается
+               иначе, чем ответ модели. -->
           {#if payload.model_mode !== 'gigachat'}
             <p class="micro paper__mode">
               <Icon name="alert" size={14} />
@@ -1401,10 +1457,14 @@
           </div>
           <div class="paper__bar">
             <dl class="kv paper__kv">
-              <dt>{ANSWER_HEAD.claimsLabel}</dt>
-              <dd class="num">{payload.findings.length} · {evidenceTotal}</dd>
+              <dt>{ANSWER_HEAD.thesesLabel}</dt>
+              <dd class="num">{payload.findings.length}</dd>
+              <dt>{ANSWER_HEAD.linksLabel}</dt>
+              <dd class="num">{evidenceTotal}</dd>
               <dt>{ANSWER_HEAD.divergencesLabel}</dt>
-              <dd class="num">{payload.conflicts.length} · {payload.knowledge_gaps.length}</dd>
+              <dd class="num">{payload.conflicts.length}</dd>
+              <dt>{ANSWER_HEAD.gapsLabel}</dt>
+              <dd class="num">{payload.knowledge_gaps.length}</dd>
             </dl>
             {#if canExport}
               <div class="paper__export">
@@ -1431,10 +1491,10 @@
             {/if}
           </div>
           <!-- Правила чтения одинаковы на пустом экране и в ответе; порядок
-               чтения важнее пояснений, поэтому свёрнуто. -->
+               чтения важнее пояснений, поэтому в ответе они свёрнуты. -->
           {@render readingGuide('guide-answer')}
-          <!-- Телеметрия сборки — под тем же раскрытием, что объясняет доверие:
-               в тексте ответа ей не место. -->
+          <!-- Телеметрия сборки живёт под тем же раскрытием, что объясняет
+               доверие: в тексте ответа ей не место. -->
           <div class="acc paper__trust">
             <button
               class="acc__head"
@@ -1451,48 +1511,26 @@
               <dl class="kv paper__kv trust__kv">
                 {#each trustRows as row (row.label)}
                   <dt>{row.label}</dt>
-                  <dd>{row.value}</dd>
+                  <dd>
+                    {row.value}
+                    {#if row.note}<span class="micro trust__note">{row.note}</span>{/if}
+                  </dd>
                 {/each}
               </dl>
-              {#if serviceRows.length}
-                <details class="svc">
-                  <summary class="micro">{TRUST_PANEL.serviceTitle}</summary>
-                  <p class="micro">{TRUST_PANEL.serviceHint}</p>
-                  <ul class="svc__list">
-                    {#each serviceRows as row (row.label)}
-                      <li>
-                        <span>{row.label}</span>
-                        <code class="code tech">{row.value}</code>
-                      </li>
-                    {/each}
-                  </ul>
-                </details>
-              {/if}
             </div>
           </div>
         </header>
 
         {#if payload.degradation_reasons.length}
           <!-- Неполный ответ назван причиной, а не молчаливой обрезкой: сырая
-               строка сервиса остаётся под «Служебными данными». -->
+               строка сервиса ушла в «Служебные данные» в конце ответа. -->
           <div class="paper__degraded">
-                      <Notice tone="warn" title={DEGRADED.title}>
+            <Notice tone="warn" title={DEGRADED.title}>
               {#each payload.degradation_reasons as reason (reason)}
                 <p>{degradationOf(reason)}</p>
               {/each}
             </Notice>
             <p class="micro">{DEGRADED.hint}</p>
-            <details class="svc">
-              <summary class="micro">{TRUST_PANEL.serviceTitle}</summary>
-              <p class="micro">{TRUST_PANEL.serviceHint}</p>
-              <ul class="svc__list">
-                {#each payload.degradation_reasons as reason (reason)}
-                  <li>
-                    <code class="code tech">{reason}</code>
-                  </li>
-                {/each}
-              </ul>
-            </details>
           </div>
         {/if}
 
@@ -1523,7 +1561,7 @@
               <div class="scale__head">
                 <h3 class="small">{SCALE_LABELS.title}</h3>
                 <span class="micro">
-                  {countOf(payload.findings.length, 'утверждение', 'утверждения', 'утверждений')}
+                  {countOf(payload.findings.length, 'тезис', 'тезиса', 'тезисов')}
                 </span>
                 <Button
                   variant="ghost"
@@ -1533,7 +1571,7 @@
                   controls="scale-body"
                   onclick={() => (scaleUser = !scaleOpen)}
                 >
-                  {scaleOpen ? 'Свернуть' : 'Показать'}
+                  {scaleOpen ? SCALE_LABELS.collapse : SCALE_LABELS.expand}
                 </Button>
               </div>
               <div id="scale-body" hidden={!scaleOpen}>
@@ -1553,13 +1591,11 @@
                         <button
                           class="tick"
                           type="button"
+                          tabindex="0"
                           data-tick={row.item.id}
                           aria-current={row.item.id === openClaimId ? 'true' : undefined}
                           onkeydown={onRowKeys}
-                          onclick={() => {
-                            onselect(row.item.id);
-                            onfocus(null);
-                          }}
+                          onclick={() => openClaim(row.item.id)}
                         >
                           <span class="tick__idx num">{String(row.index + 1).padStart(2, '0')}</span>
                           <span class="tick__body">
@@ -1574,31 +1610,34 @@
                                 ></span>
                               {/if}
                             </span>
-                            <span class="micro">
+                            <span class="micro tick__meta">
                               {#if row.bounds}
                                 <b class="num">{num(row.bounds[0])}–{num(row.bounds[1])} {group.unit}</b>
                               {:else}
                                 <b>{SCALE_LABELS.withoutNumber}</b>
                               {/if}
-                              · {SCALE_LABELS.links} <b class="num">{row.item.evidence.length}</b>
+                              <!-- Ссылки на фрагменты: одна формулировка со
+                                   словаря, число склоняется в ней же. -->
+                              <span>{linksToText(row.item.evidence.length)}</span>
                             </span>
                           </span>
                         </button>
                       {/each}
                     </div>
                   {/each}
+                  {#if findingsHidden > 0}
+                    <p class="micro">{SCALE_LABELS.shown.replace('{shown}', String(visibleFindings.length)).replace('{total}', String(payload.findings.length))}</p>
+                  {/if}
                   <p class="micro">{SCALE_LABELS.unitNote}</p>
                 {:else}
-                  <p class="micro">{RUN_STRINGS.noIntervals}</p>
+                  <p class="micro">{SCALE_LABELS.noBands}</p>
                 {/if}
               </div>
             </nav>
 
             <div class="theses">
-              {#each payload.findings as finding (finding.id)}
+              {#each visibleFindings as finding (finding.id)}
                 {@const selected = finding.id === openClaimId}
-                <!-- subject/predicate объявляются на уровне перебора: {@const}
-                     внутри <div> компилятор Svelte не принимает. -->
                 {@const subject = subjectTerm(finding)}
                 {@const predicate = predicateTerm(finding)}
                 <article class="thesis" class:thesis--selected={selected} data-claim={finding.id}>
@@ -1616,18 +1655,21 @@
                         />
                         {DATA_CLASS_LABELS[finding.data_class]}
                       </span>
-                      <span class="tag">версия <b class="num">{finding.version}</b></span>
+                      <span class="tag">
+                        {SHEET_LABELS.versionLabel}
+                        <b class="num">{finding.version}</b>
+                      </span>
                       {#if finding.superseded_by}
-                        <span class="tag">
-                          {STATUS_SUPERSEDED} <code class="code tech">{shortCode(finding.superseded_by)}</code>
-                        </span>
+                        <span class="tag">{STATUS_SUPERSEDED}</span>
                       {/if}
                     </div>
                     <h3 class="thesis__statement">{finding.statement}</h3>
-                    <!-- Только русское имя: ключ онтологии — подписью в разборе
-                        тезиса, под «Служебными данными». -->
+                    <!-- Только русские имена: ключи онтологии живут в разборе
+                         тезиса под «Служебными данными». -->
                     <p class="micro thesis__spo">
-                      <b>{subject.label}</b> · {predicate.label} · {scopeText(finding.scope)}
+                      <span class="thesis__spo-subject">{subject.label}</span>
+                      <span>{predicate.label}</span>
+                      <span>{scopeText(finding.scope)}</span>
                     </p>
                     <Button
                       variant="quiet"
@@ -1635,22 +1677,24 @@
                       class="thesis__toggle"
                       onclick={() => openClaim(finding.id)}
                     >
-                      Открыть разбор
+                      {SHEET_LABELS.open}
                     </Button>
                   </div>
 
                   <p class="micro thesis__closed">
-                    {valueSummary(finding)} ·
-                    {countOf(
-                      finding.evidence.length,
-                      'доказательство',
-                      'доказательства',
-                      'доказательств',
-                    )}
-                    — цитаты, локаторы первоисточника и версии читает разбор
+                    <span>{valueSummary(finding)}</span>
+                    <span>
+                      {linksToText(finding.evidence.length)}: цитаты, место в источнике и версии
+                      читает разбор
+                    </span>
                   </p>
                 </article>
               {/each}
+              {#if findingsHidden > 0}
+                <Button variant="quiet" size="sm" icon="chevronDown" onclick={showMoreTheses}>
+                  {moreThesesText(findingsHidden)}
+                </Button>
+              {/if}
             </div>
           </div>
         {/if}
@@ -1658,21 +1702,18 @@
         {#if payload.conflicts.length || payload.knowledge_gaps.length || payload.recommendations.length}
           <section class="block">
             <div class="block__head">
-              <h3 class="h4">Где источники расходятся и где молчат</h3>
-              <p class="micro">
-                Конфликт — пара утверждений об одном субъекте и предикате при непересекающихся
-                нормализованных диапазонах; пробел — непокрытая комбинация измерений.
-              </p>
+              <h3 class="h4">{ASK_REVIEW.title}</h3>
+              <p class="micro">{ASK_REVIEW.note}</p>
             </div>
             {#each payload.conflicts as item, index (index)}
               <div class="line">
-                <span class="tag">расхождение {String(index + 1).padStart(2, '0')}</span>
+                <span class="tag">{ASK_REVIEW.conflictTag} {String(index + 1).padStart(2, '0')}</span>
                 <p class="small">{item}</p>
               </div>
             {/each}
             {#each payload.knowledge_gaps as item, index (index)}
               <div class="line">
-                <span class="tag">пробел {String(index + 1).padStart(2, '0')}</span>
+                <span class="tag">{ASK_REVIEW.gapTag} {String(index + 1).padStart(2, '0')}</span>
                 <p class="small">{item}</p>
               </div>
             {/each}
@@ -1684,7 +1725,7 @@
             {/each}
             <div class="row">
               <Button href="/conflicts" variant="quiet" size="sm" icon="conflict">
-                Все расхождения корпуса
+                Раздел «{navLabel('/conflicts')}»
               </Button>
             </div>
           </section>
@@ -1695,8 +1736,8 @@
             <div class="block__head">
               <h3 class="h4">Отзыв по ответу</h3>
               <p class="micro">
-                Отзыв ложится на ответ этого прогона и создаёт предложение на проверку. Замена
-                конкретного утверждения — в разборе тезиса выше.
+                Отзыв сохранится вместе с этим ответом и уйдёт эксперту на проверку. Исправить
+                отдельный тезис можно в его разборе выше.
               </p>
             </div>
             <div class="verdicts">
@@ -1713,10 +1754,13 @@
               name="answer-feedback"
               type="textarea"
               rows={2}
-              placeholder="Что проверить в первую очередь"
-              hint="Минимум три символа — пустой комментарий не принять."
+              placeholder="Что в ответе не так"
+              hint="Минимум три символа: пустой комментарий сервис не примет."
               bind:value={feedbackComment}
             />
+            {#if !feedbackVerdict}
+              <p class="micro block__note">Сначала выберите: ответ полезен или нет.</p>
+            {/if}
             <Button
               variant="action"
               size="sm"
@@ -1729,39 +1773,66 @@
           </section>
         {:else}
           <p class="micro">
-            Отзыв по ответу доступен при расширенном доступе: без него ответ остаётся на листе, но
-            предложение эволюции из него не создаётся.
+            Отзыв по ответу доступен эксперту, право выдаёт администратор сервиса. Без отзыва ответ
+            остаётся на экране, но предложение на проверку из него не создаётся.
           </p>
+        {/if}
+
+        {#if serviceRows.length}
+          <!-- Служебные данные ответа: одно раскрытие на весь ответ. -->
+          <details class="svc paper__service">
+            <summary class="micro">{TRUST_PANEL.serviceTitle}</summary>
+            <p class="micro">{TRUST_PANEL.serviceHint}</p>
+            <ul class="svc__list">
+              {#each serviceRows as row (row.label)}
+                <li>
+                  <span>{row.label}</span>
+                  <code class="code tech">{row.value}</code>
+                </li>
+              {/each}
+            </ul>
+          </details>
         {/if}
       </article>
     {/if}
   </div>
 
-  <!-- ── 4. КОМПОЗЕР: прилип ко дну рабочего листа, маскот = состояние прогона -->
+  <!-- ── 4. КОМПОЗЕР: прилип ко дну экрана, маскот показывает состояние сборки -->
   <div class="ask__composer">
-    <!-- Показания корпуса, остановка прохода и «Приложить документ» живут своей
+    <!-- Показания корпуса, остановку сборки и загрузку документа вынесли своей
          строкой над полем: ряд инструментов композера на узком экране уходит в
          скрытый горизонтальный скролл, а эти действия обязательные. -->
     <div class="ask__meta">
-      <span class="tag ask__corpus">
-        {#if corpusState === 'loading'}
-          читаем показания корпуса…
-        {:else if corpusState === 'error'}
-          показания корпуса не получены
-        {:else if corpus}
-          корпус: документов <b class="num">{corpus.documents}</b> · утверждений
-          <b class="num">{corpus.claims}</b> · фрагментов <b class="num">{corpus.chunks}</b> ·
-          сущностей <b class="num">{corpus.entities}</b>
-        {:else}
-          показания корпуса не получены
-        {/if}
-      </span>
+      {#if corpusState === 'loading'}
+        <span class="tag ask__corpus-note">{ASK_EMPTY.corpusLoading}</span>
+      {:else if !corpus}
+        <span class="tag ask__corpus-note">{ASK_EMPTY.corpusError}</span>
+      {:else}
+        <dl class="ask__corpus">
+          <div class="ask__corpus-item">
+            <dt>документов</dt>
+            <dd class="num">{corpus.documents}</dd>
+          </div>
+          <div class="ask__corpus-item">
+            <dt>находок</dt>
+            <dd class="num">{corpus.claims}</dd>
+          </div>
+          <div class="ask__corpus-item">
+            <dt>фрагментов</dt>
+            <dd class="num">{corpus.chunks}</dd>
+          </div>
+          <div class="ask__corpus-item">
+            <dt>сущностей</dt>
+            <dd class="num">{corpus.entities}</dd>
+          </div>
+        </dl>
+      {/if}
       {#if running}
-        <Button variant="quiet" size="sm" icon="close" onclick={onstop}>Остановить проход</Button>
+        <Button variant="quiet" size="sm" icon="close" onclick={onstop}>{ASK_ACTIONS.stopRun}</Button>
       {/if}
       <label class="btn btn--sm btn--quiet upload ask__attach">
         <Icon name="upload" size={16} />
-        {busy === 'import' ? 'Обрабатываем…' : 'Приложить документ'}
+        {busy === 'import' ? ASK_ACTIONS.importing : ASK_ACTIONS.attach}
         <input
           type="file"
           accept=".pdf,.docx,.xlsx,.json,.txt"
@@ -1775,23 +1846,19 @@
       bind:value={draft}
       variant="docked"
       name="ask"
-      label="Вопрос к графу доказательств"
+      label="Вопрос к корпусу"
       placeholder="Какие методы обессоливания подходят при сульфатах и хлоридах 200–300 мг/л?"
       busy={running}
       disabled={!canAsk}
-      hint={draft && !draftValid ? 'минимум три символа' : 'Enter — спросить · Shift + Enter — строка'}
+      hint={draft && !draftValid
+        ? 'минимум три символа'
+        : 'Enter отправляет вопрос, Shift + Enter добавляет строку'}
       onsubmit={ask}
     />
 
     {#if draft && !draftValid}
       <p class="field__error ask__note">
-        Вопрос короче трёх символов — добавьте формулировку, иначе ответа не будет.
-      </p>
-    {/if}
-    {#if !canAsk}
-      <p class="field__error ask__note">
-        Спрашивать корпус может подтверждённый аккаунт с доступом к запросам: сейчас его нет.
-        Находки и карта связей работают.
+        Вопрос короче трёх символов: добавьте формулировку, иначе ответа не будет.
       </p>
     {/if}
   </div>
@@ -1799,13 +1866,13 @@
 
 {#if sheetFinding}
   <Sheet
-    title="Разбор утверждения"
-    description="Числовые наблюдения, цитаты с локаторами первоисточника и история версий этого тезиса."
+    title={SHEET_LABELS.title}
+    description={SHEET_LABELS.description}
     width="840px"
     onclose={closeClaim}
   >
     {#snippet footer()}
-      <Button variant="quiet" onclick={closeClaim}>Закрыть разбор</Button>
+      <Button variant="quiet" onclick={closeClaim}>{SHEET_LABELS.close}</Button>
     {/snippet}
     {@render thesisTrace(sheetFinding)}
   </Sheet>
@@ -1819,24 +1886,23 @@
       <span class="tag">версия <b class="num">{finding.version}</b></span>
     </div>
     <h3 class="h4">{finding.statement}</h3>
-    <p class="micro muted">
-      {sourceOf(finding)} · {scopeText(finding.scope)} ·
-      {countOf(finding.evidence.length, 'ссылка', 'ссылки', 'ссылок')} на фрагменты
+    <p class="micro muted sheet__facts">
+      <span>{sourceOf(finding)}</span>
+      <span>{scopeText(finding.scope)}</span>
+      <span>{linksToText(finding.evidence.length)}</span>
     </p>
   </div>
   {@const rivals = rivalsOf(finding)}
   {#if finding.observations.length}
     <div class="measures">
-      <p class="micro measures__label">
-        числовые наблюдения · нормализация и положение относительно условия вопроса
-      </p>
+      <p class="micro measures__label">{SHEET_LABELS.measures}</p>
       {#each measuresOf(finding) as measure (measure.key)}
         <div class="measure">
           <div class="measure__top">
             <span class="micro">
               {measure.property}
               {#if measure.propertyCode}<code class="code tech">{measure.propertyCode}</code>{/if}
-              · {measure.operatorLabel}
+              {measure.operatorLabel}
             </span>
             <span class="measure__value num">{measure.valueText} {measure.unit}</span>
           </div>
@@ -1851,8 +1917,14 @@
             {/each}
           </div>
           <p class="micro measure__scale">
-            шкала <span class="num">{measure.scaleFrom}–{measure.scaleTo} {measure.normalizedUnit}</span>
-            · норм. <span class="num">{measure.normalizedText} {measure.normalizedUnit}</span>
+            <span>
+              {SHEET_LABELS.scale}
+              <span class="num">{measure.scaleFrom}–{measure.scaleTo} {measure.normalizedUnit}</span>
+            </span>
+            <span>
+              {SHEET_LABELS.normalized}
+              <span class="num">{measure.normalizedText} {measure.normalizedUnit}</span>
+            </span>
           </p>
           {#if measure.limits.length}
             <p class="micro measure__limits">
@@ -1861,29 +1933,29 @@
               {/each}
             </p>
           {/if}
-          <p class="micro">в источнике: «{measure.raw}»</p>
+          <p class="micro">{SHEET_LABELS.source}: «{measure.raw}»</p>
           {#if measure.filterNote}
             <p class="micro measure__filter" class:outside={measure.outsideFilter}>
-              {measure.filterNote}{#if measure.outsideFilter} · наблюдение вне фильтра{/if}
+              {measure.filterNote}
+              {#if measure.outsideFilter}<span>{SHEET_LABELS.outsideFilter}</span>{/if}
             </p>
           {/if}
         </div>
       {/each}
     </div>
   {:else}
-    <p class="thesis__bare">
-      числовых наблюдений нет — тезис держится только на цитате
-    </p>
+    <p class="thesis__bare">{SHEET_LABELS.bare}</p>
   {/if}
 
   {#if rivals.length}
     <div class="rivals">
       <p class="micro rivals__label">
-        расхождение на одном интервале · {subjectTerm(finding).label} ›
-        {predicateTerm(finding).label}
+        <span>{SHEET_LABELS.rivalsLabel}</span>
+        <span>{subjectTerm(finding).label}</span>
+        <span>{predicateTerm(finding).label}</span>
       </p>
       <div class="rivals__row" data-self>
-        <span class="small">{sourceOf(finding)} · этот тезис</span>
+        <span class="small">{sourceOf(finding)}, {SHEET_LABELS.rivalsSelf}</span>
         <span class="num">{valueSummary(finding)}</span>
       </div>
       {#each rivals as rival (rival.finding.id)}
@@ -1897,25 +1969,23 @@
           {finding.observations[0]?.normalized_unit ?? ''}
         </p>
       {/each}
-      <p class="micro">
-        Полный разбор — в разделе «Расхождения»; там видно, какая пара попала в
-        противоречие по всем условиям.
-      </p>
+      <p class="micro">{SHEET_LABELS.rivalsNote}</p>
+      <div class="row">
+        <Button href="/conflicts" variant="quiet" size="sm" icon="conflict">
+          Раздел «{navLabel('/conflicts')}»
+        </Button>
+      </div>
     </div>
   {/if}
 
   <!-- Каждое доказательство раскрывается с клавиатуры -->
   <div class="trace">
     <p class="micro trace__label">
-      доказательство ·
-      {countOf(finding.evidence.length, 'ссылка', 'ссылки', 'ссылок')} на фрагменты
+      {SHEET_LABELS.traceLabel}, {linksToText(finding.evidence.length)}
     </p>
     {#if !finding.evidence.length}
-      <Notice tone="error" title="Тезис не трассируется">
-        <p>
-          Утверждение пришло без единого локатора: проверить его по
-          первоисточнику нельзя, пока разбор не добавит доказательство.
-        </p>
+      <Notice tone="error" title={SHEET_LABELS.untrackedTitle}>
+        <p>{SHEET_LABELS.untrackedBody}</p>
       </Notice>
     {:else}
       {#each finding.evidence as evidence, index (index)}
@@ -1938,12 +2008,11 @@
               <b>{evidence.source_title}</b>
             </span>
             <span class="locator">
-              {#each locParts(evidence) as part, position (part)}
-                {#if position > 0}<span class="locator__sep" aria-hidden="true">·</span>{/if}
+              {#each locParts(evidence) as part (part)}
                 <span>{part}</span>
               {/each}
             </span>
-            <span class="micro">{expanded ? 'скрыть цитату' : 'прочитать цитату'}</span>
+            <span class="micro">{expanded ? ASK_SOURCE.closeQuote : ASK_SOURCE.openQuote}</span>
           </button>
           <div
             class="evidence__body"
@@ -1952,26 +2021,25 @@
           >
             <p class="quote">«{evidence.quote}»</p>
             <dl class="kv evidence__kv">
-              <dt>источник</dt>
+              <dt>{SHEET_LABELS.documentLabel}</dt>
               <dd>{evidence.source_title || 'запись корпуса'}</dd>
               {#if evidence.page != null}
-                <dt>страница</dt><dd class="num">{evidence.page}</dd>
+                <dt>{SHEET_LABELS.page}</dt><dd class="num">{evidence.page}</dd>
               {/if}
               {#if evidence.sheet}
-                <dt>лист</dt><dd>{evidence.sheet}</dd>
+                <dt>{SHEET_LABELS.sheet}</dt><dd>{evidence.sheet}</dd>
               {/if}
               {#if evidence.cell_range}
-                <dt>ячейки</dt><dd class="num">{evidence.cell_range}</dd>
-              {/if}
-              {#if evidence.char_start != null}
-                <dt>смещение символов</dt>
-                <dd class="num">{evidence.char_start}–{evidence.char_end ?? evidence.char_start}</dd>
+                <dt>{SHEET_LABELS.cells}</dt><dd class="num">{evidence.cell_range}</dd>
               {/if}
             </dl>
-            <p class="micro">
-              Esc — закрыть раскрытие; тот же фрагмент доступен в «Находках» и на
-              карте связей.
-            </p>
+            <div class="row evidence__links">
+              <!-- Ровно две ссылки под доказательством: к находке с её
+                   источником и к тому же узлу на карте связей. -->
+              <a class="small" href={findingsHref(finding)}>{ASK_SOURCE.findings}</a>
+              <a class="small" href={graphHref(finding)}>{ASK_SOURCE.graph}</a>
+              <span class="micro">{ASK_SOURCE.esc}</span>
+            </div>
           </div>
         </div>
       {/each}
@@ -1988,21 +2056,21 @@
             type="textarea"
             rows={2}
             placeholder="Что не так с формулировкой или числом"
-            hint="Минимум три символа — иначе правку не принять."
+            hint="Минимум три символа: иначе правку не принять."
             bind:value={correctionComment}
           />
           <Field
-            label="Исправленное утверждение"
+            label="Исправленный тезис"
             name={`correction-text-${finding.id}`}
             type="textarea"
             rows={2}
-            hint="Минимум три символа — текст станет новой версией утверждения."
+            hint="Минимум три символа: текст станет новой версией тезиса."
             bind:value={correctionText}
           />
           <Notice tone="info" title="Правка относится к этому тезису">
             <p>
-              Она создаёт новую версию утверждения и оставляет прежнюю в истории
-              связей — ответ целиком не меняется.
+              Она создаёт новую версию тезиса и оставляет прежнюю в истории связей,
+              ответ целиком не меняется.
             </p>
           </Notice>
           <div class="row">
@@ -2030,22 +2098,22 @@
           disabled={running}
           onclick={() => startCorrection(finding)}
         >
-          Исправить это утверждение
+          Исправить этот тезис
         </Button>
       {/if}
     </div>
   {:else if canFeedback}
     <p class="micro thesis__note">
-      Замена утверждения доступна при расширенном доступе. Отзыв по ответу
-      целиком — ниже.
+      Исправление тезиса доступно эксперту, право выдаёт администратор сервиса.
+      Отзыв по ответу целиком находится ниже.
     </p>
   {/if}
 
-  <!-- История версий открытого утверждения: состояние своё у
-       каждого тезиса, отказ — тоже свой. -->
+  <!-- История версий открытого тезиса: состояние своё у каждого тезиса,
+       отказ тоже свой. -->
   {@const hist = historyState(finding.id)}
   <div class="history">
-    <p class="micro history__label">история версий утверждения</p>
+    <p class="micro history__label">{SHEET_LABELS.historyLabel}</p>
     <div class="row">
       <Button
         variant="quiet"
@@ -2055,11 +2123,11 @@
         disabled={hist.busy}
         onclick={() => void loadHistory(finding.id)}
       >
-        {hist.busy ? 'Читаем…' : hist.data ? 'Обновить версии' : 'Запросить версии'}
+        {hist.busy ? SHEET_LABELS.historyBusy : hist.data ? SHEET_LABELS.historyRefresh : SHEET_LABELS.historyAsk}
       </Button>
     </div>
     {#if hist.error}
-      <Notice tone="error" title="История версий не получена">
+      <Notice tone="error" title={SHEET_LABELS.historyError}>
         <p>{hist.error}</p>
         <div class="row">
           <Button
@@ -2068,19 +2136,19 @@
             icon="refresh"
             onclick={() => void loadHistory(finding.id)}
           >
-            Повторить запрос
+            {SHEET_LABELS.historyRetry}
           </Button>
         </div>
       </Notice>
     {:else if hist.data}
       {#if !hist.data.versions.length}
-        <p class="micro">других версий у этого тезиса нет.</p>
+        <p class="micro">{SHEET_LABELS.historySingle}</p>
       {:else}
         {#each hist.data.versions as version (version.finding_id + version.version)}
           <div class="version">
             <p class="small">{version.statement}</p>
-            <p class="micro">
-              версия <b class="num">{version.version}</b> ·
+            <p class="micro version__meta">
+              <span>{SHEET_LABELS.versionLabel} <b class="num">{version.version}</b></span>
               <StatusPill
                 status={version.status}
                 label={STATUS_PHRASE[version.status]}
@@ -2088,10 +2156,7 @@
               {#if version.review_date}
                 <time datetime={version.review_date}>{reviewDate(version.review_date)}</time>
               {:else}
-                разбор не проводился
-              {/if}
-              {#if version.reviewer_id}
-                · правил <code class="code tech">{shortCode(version.reviewer_id)}</code>
+                <span>{SHEET_LABELS.reviewNone}</span>
               {/if}
             </p>
             {#if version.review_reason}<p class="micro">{version.review_reason}</p>{/if}
@@ -2100,6 +2165,20 @@
       {/if}
     {/if}
   </div>
+
+  <!-- Служебные данные разбора: адрес тезиса, символы цитат и идентификаторы. -->
+  <details class="svc sheet__service">
+    <summary class="micro">{TRUST_PANEL.serviceTitle}</summary>
+    <p class="micro">{SHEET_LABELS.serviceCodes}</p>
+    <ul class="svc__list">
+      {#each sheetServiceRows(finding) as row (row.label)}
+        <li>
+          <span>{row.label}</span>
+          <code class="code tech">{row.value}</code>
+        </li>
+      {/each}
+    </ul>
+  </details>
 {/snippet}
 
 <style>
@@ -2140,8 +2219,8 @@
     font-size: var(--t-micro);
   }
 
-  /* Ряд над полем: показания корпуса, остановка прохода и приложение
-     документа. Переносится, а не уходит в скрытый скролл. */
+  /* Ряд над полем: показания корпуса, остановку сборки и загрузку документа
+     переносит, а не уходит в скрытый скролл. */
   .ask__meta {
     display: flex;
     align-items: center;
@@ -2150,13 +2229,45 @@
     padding-inline: var(--s4);
   }
 
+  /* Каждый счётчик корпуса подписан своей строкой: числа не склеиваются в одну
+     подпись делимитером. */
   .ask__corpus {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--s1);
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
     flex-wrap: wrap;
     min-width: 0;
+    margin: 0;
+    padding: 2px var(--s3);
+    border-radius: var(--r-pill);
+    background: var(--surface-sunk);
+    font-size: var(--t-micro);
+  }
+
+  .ask__corpus-item {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--s1);
+  }
+
+  .ask__corpus dt {
+    color: var(--ink-3);
+  }
+
+  .ask__corpus dd {
+    margin: 0;
+    font-weight: 600;
     font-variant-numeric: tabular-nums;
+  }
+
+  .ask__corpus-note {
+    color: var(--ink-3);
+  }
+
+  .ask__importing {
+    margin: 0;
+    padding-inline: var(--s4);
+    color: var(--ink-2);
   }
 
   .ask__attach {
@@ -2391,22 +2502,11 @@
     flex: 1 1 260px;
   }
 
-  .step__agent {
-    font-weight: 600;
-    font-size: var(--t-small);
-  }
-
   .step__msg {
-    font-size: var(--t-micro);
-    color: var(--ink-3);
+    font-size: var(--t-small);
+    color: var(--ink-2);
     line-height: var(--lh-dense);
     overflow-wrap: anywhere;
-  }
-
-  .step__note {
-    flex: none;
-    font-size: var(--t-micro);
-    color: var(--ink-3);
   }
 
   .stage__kv {
@@ -2551,21 +2651,9 @@
     gap: var(--s2);
   }
 
-  /* Служебное имя или идентификатор — только подписью при человекочитаемом
-     названии: шрифт данных, размер и цвет младше основного текста. */
-  .tech {
-    font-size: var(--t-micro);
-    font-weight: 400;
-    color: var(--ink-4);
-    overflow-wrap: anywhere;
-  }
-
-  .paper__id {
-    color: var(--ink-3);
-  }
-
-  /* Режим сборки и само-оценка — сведения, а не измеренные данные: им не место
-     в моно-шкале метрик. */
+  /* Служебное имя или идентификатор читаются подписью при человекочитаемом
+     названии. Саму подпись задаёт `.tech` из `app.css`: локальное правило с
+     `--ink-4` дублировало его и роняло контраст текста. */
   .paper__mode {
     display: flex;
     align-items: center;
@@ -2574,10 +2662,45 @@
     color: var(--hypothesis);
   }
 
-  .paper__confidence {
-    flex: 1 1 100%;
+  /* Одно раскрытие служебных данных на весь ответ и на каждый разбор. */
+  .svc {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    padding: var(--s3) var(--s4);
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--r-md);
+    background: var(--surface-sunk);
+  }
+
+  .svc summary {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--ink-2);
+  }
+
+  .svc__list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
     margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .svc__list li {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--s3);
+    flex-wrap: wrap;
+    font-size: var(--t-micro);
     color: var(--ink-3);
+  }
+
+  .paper__service,
+  .sheet__service {
+    margin-top: var(--s3);
   }
 
   .paper__body {

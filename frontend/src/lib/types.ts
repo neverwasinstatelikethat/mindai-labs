@@ -70,6 +70,48 @@ export type FindingApiStatus = 'consensus' | 'disputed' | 'hypothesis';
 
 export type FindingListItem = Finding;
 
+// ── Очередь противоречий и решение эксперта ────────────────────────────────
+// Зеркало contracts.ConflictSide / ConflictCandidateView / ConflictReview.
+// Пара — не находка: это два тезиса с непересекающимися числами, которые
+// детектор пересчитывает по текущему корпусу, и живут они только в очереди.
+
+export type ConflictCandidateStatus = 'candidate' | 'confirmed' | 'dismissed';
+
+export interface ConflictSide {
+  claim_id: string;
+  finding_id: string;
+  statement: string;
+  // Диапазон с единицей словами («95–97 %») — величина уже собрана на сервере.
+  value: string;
+  document_ids: string[];
+  data_class: DataClass;
+}
+
+export interface ConflictCandidate {
+  id: string;
+  subject: string;
+  property_name: string;
+  reason: string;
+  scope: Record<string, string>;
+  status: ConflictCandidateStatus;
+  left: ConflictSide;
+  right: ConflictSide;
+  decided_by: string | null;
+  decided_at: string | null;
+}
+
+// Ответ на решение эксперта: записанное решение, а не строка очереди.
+// Свободного текста здесь нет намеренно — только идентификаторы и итог.
+export interface ConflictReview {
+  candidate_id: string;
+  status: 'confirmed' | 'dismissed';
+  actor_id: string;
+  property_name: string;
+  left_finding_id: string;
+  right_finding_id: string;
+  created_at: string;
+}
+
 // ── Graph ────────────────────────────────────────────────────────
 
 export interface GraphNode {
@@ -444,15 +486,20 @@ export interface DashboardData {
 // Единственный источник истины по доступу — сервер: /api/v1/auth/me отдаёт
 // capabilities и data_classes подтверждённой сессии. На клиенте не остаётся
 // зеркала ролей: только человекочитаемые имена для получения и объяснения 403.
+//
+// Имена прав читаются словами навигации (`nav.ts`): человек видит в профиле
+// строку «Вопрос к корпусу» и узнаёт её же в пункте меню. Второй словарь
+// («Запросы», «Обратная связь», «Аудит») заставлял сопоставлять список прав с
+// разделами по памяти.
 export const CAPABILITY_LABELS: Record<Capability, string> = {
-  'knowledge:read': 'Граф и находки',
-  'query:ask': 'Запросы',
-  'feedback:give': 'Обратная связь',
-  'export:run': 'Экспорт и сравнение',
-  'evaluation:view': 'Оценка качества',
-  'proposal:review': 'Проверка предложений',
-  'restricted:read': 'Закрытые данные',
-  'audit:read': 'Аудит',
+  'knowledge:read': 'Находки и карта связей',
+  'query:ask': 'Вопрос к корпусу',
+  'feedback:give': 'Отзывы на ответы',
+  'export:run': 'Выгрузка и сравнение',
+  'evaluation:view': 'Качество',
+  'proposal:review': 'Решения по предложениям',
+  'restricted:read': 'Доступ к закрытым',
+  'audit:read': 'Журнал действий',
 };
 
 export const DATA_CLASS_LABELS: Record<DataClass, string> = {

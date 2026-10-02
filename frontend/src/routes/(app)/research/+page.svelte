@@ -14,6 +14,7 @@
     type TrailStep,
   } from '$lib/ChatPanel.svelte';
   import { num } from '$lib/format';
+  import { navLabel } from '$lib/nav';
   import Notice from '$lib/ui/Notice.svelte';
   import SectionHead from '$lib/ui/SectionHead.svelte';
   import { page } from '$app/state';
@@ -191,14 +192,14 @@
       const text = RUN_FAILURES.busy;
       const busy =
         admission?.active != null && admission.limit != null
-          ? `Сейчас сервис собирает ${admission.active} из ${admission.limit} возможных ответов.`
+          ? `Сейчас сервис собирает ${admission.active} из ${admission.limit} ответов.`
           : text.detail;
       return {
         label: text.label,
-        detail: `${busy} Формулировка ни при чём — ничего менять не нужно.`,
+        detail: busy,
         recovery:
           admission?.retryAfter != null
-            ? `Повторите примерно через ${admission.retryAfter} с: вопрос останется в поле.`
+            ? `Спросите примерно через ${admission.retryAfter} с: набранный вопрос сохранён.`
             : text.recovery,
         question: asked,
       };
@@ -366,11 +367,11 @@
       const version = result.superseded?.version;
       const proposalLine = result.proposal
         ? 'предложение на проверку поставлено'
-        : 'модель предложение не сформировала — записано только решение';
+        : 'модель предложение не сформировала, записано только решение';
       notice = {
         kind: 'ok',
         title: 'Правка принята',
-        detail: `Тезис получил${version != null ? ` версию ${version}` : ' новую версию'}; ${proposalLine}. Решение видно в разделе «Проверка решений» — отменить правку отсюда нельзя.`,
+        detail: `Тезис получил${version != null ? ` версию ${version}` : ' новую версию'}, ${proposalLine}. Решение видно в разделе «${navLabel('/feedback')}», отменить правку отсюда нельзя.`,
       };
       return true;
     } catch (reason) {
@@ -410,7 +411,7 @@
       notice = {
         kind: 'error',
         title: 'Отзыв не отправлен',
-        detail: `${reasonText(reason, 'Не удалось отправить отзыв.')} Введённый текст сохранён — повторите отправку.`,
+        detail: `${reasonText(reason, 'Не удалось отправить отзыв.')} Введённый текст сохранён: повторите отправку.`,
       };
       return false;
     } finally {
@@ -438,7 +439,7 @@
       notice = {
         kind: 'ok',
         title: 'Файл выгружен',
-        detail: `${filename} — ${num(Math.round(blob.size / 1024))} КиБ, тот же ответ, что на экране.`,
+        detail: `${filename}, ${num(Math.round(blob.size / 1024))} КиБ: тот же ответ, что на экране.`,
       };
       return true;
     } catch (reason) {
@@ -465,8 +466,8 @@
       } catch {
         corpusState = 'error';
       }
-      // Хвост документа за бюджетом промпта — не «в корпусе такого нет»: число
-      // утверждений из неполного разбора обязано быть помечено.
+      // Хвост документа за бюджетом разбора обязано быть помечено: число находок
+      // из неполного разбора не выдаётся за полное.
       const tail = receipt.prompt_truncated
         ? ` Разбор дошёл не до конца: без внимания осталось ${receipt.omitted_characters} символов.`
         : '';
@@ -475,14 +476,14 @@
         title: receipt.status === 'duplicate' ? 'Такой документ уже в корпусе' : 'Документ обработан',
         detail: receipt.status === 'duplicate'
           ? 'Второго экземпляра нет: такой файл уже разобран и лежит в корпусе под прежней записью.'
-          : `Извлечено утверждений: ${receipt.extracted_claims}.${tail} Вопрос по новому материалу можно задать сразу.`,
+          : `Находок извлечено: ${receipt.extracted_claims}.${tail} Вопрос по новому материалу можно задать сразу.`,
       };
       return true;
     } catch (reason) {
       notice = {
         kind: 'error',
         title: 'Документ не загружен',
-        detail: `${reasonText(reason, 'Не удалось принять файл.')} Поддерживаются PDF, DOCX, XLSX, JSON и TXT; закрытые документы требуют расширенного доступа.`,
+        detail: `${reasonText(reason, 'Не удалось принять файл.')} Поддерживаются PDF, DOCX, XLSX, JSON и TXT; закрытые документы загружает аккаунт с экспертным правом, право выдаёт администратор сервиса.`,
       };
       return false;
     } finally {
@@ -539,17 +540,12 @@
 </script>
 
 <svelte:head>
-  <title>Запрос — Научный Клубок</title>
+  <title>Вопрос: Научный Клубок</title>
 </svelte:head>
 
 <div class="page research">
   <div class="wrap">
-    <SectionHead
-      level="1"
-      eyebrow={RESEARCH_HEAD.eyebrow}
-      title={RESEARCH_HEAD.title}
-      lead={RESEARCH_HEAD.lead}
-    />
+    <SectionHead level="1" title={RESEARCH_HEAD.title} lead={RESEARCH_HEAD.lead} />
 
     {#if !session.signedIn}
       <p class="micro research__session">
@@ -557,17 +553,16 @@
           <span class="spinner spinner--quiet" aria-hidden="true"></span>
           проверяем доступ…
         {:else}
-          доступа нет — запрос не запустится.
+          доступа нет: запрос не запустится.
           <a href={`/login?next=${encodeURIComponent(page.url.pathname)}`}>Войти</a>
         {/if}
       </p>
     {:else if !canAsk}
+      <!-- Единственное сообщение об отказе в праве на вопрос: композер ниже
+           только показывает заблокированное поле. -->
       <div class="research__blocked">
         <Notice tone="info" title={RUN_FAILURES.forbidden.label}>
-          <p>
-            Спрашивать корпус может аккаунт с доступом к запросам. Находки корпуса и карта связей
-            работают и без него: они собраны по уже извлечённым фактам.
-          </p>
+          <p>{RUN_FAILURES.forbidden.recovery}</p>
         </Notice>
       </div>
     {/if}
