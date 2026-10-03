@@ -172,6 +172,30 @@ def test_silent_routes_are_exactly_the_allowed_lists() -> None:
     assert routes_without_consumer() == sorted({*SERVICE_ONLY, *NO_SURFACE_YET})
 
 
+def test_routes_without_a_nav_entry_are_named_and_reasoned() -> None:
+    """Раздел без ссылки в меню либо назван здесь, либо его не существует.
+
+    Обратная сторона №8: экран появляется, а добраться до него можно только по
+    прямому адресу. Тогда он для аналитика не существует, и проверка «у Surface
+    есть потребитель» этого не заметит: она смотрит на серверные маршруты.
+    """
+
+    nav = (FRONTEND_SRC / "lib" / "nav.ts").read_text(encoding="utf-8")
+    linked = set(re.findall(r"href: '(/[a-z0-9-]+)'", nav))
+    pages = {
+        f"/{path.parent.name}"
+        for path in FRONTEND_SRC.glob("routes/(app)/*/+page.svelte")
+    }
+    # Экран профиля доступен из шапки (аватар), а не из списка разделов.
+    outside_nav = {"/account"}
+    for href in sorted(linked):
+        assert href in pages | outside_nav, f"мень зовёт на {href}, экрана там нет"
+    assert pages - linked == outside_nav, (
+        f"экран без ссылки в меню: {sorted(pages - linked - outside_nav)}, "
+        f"лишние записи: {sorted(outside_nav - pages)}"
+    )
+
+
 def test_matching_has_teeth_against_comments_and_prefixes() -> None:
     """Две дыры, которые эта сверка держала на себе, и закрываются здесь.
 
