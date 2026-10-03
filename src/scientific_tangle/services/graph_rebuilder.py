@@ -98,7 +98,7 @@ ENTITIES: list[DomainEntity] = [
     _ent("nanofiltration", "Нанофильтрация", "process", "water_treatment"),
     _ent("ultrafiltration", "Ультрафильтрация", "process", "water_treatment"),
     _ent("ion-exchange", "Ионный обмен", "process", "water_treatment", "IX, ионообмен"),
-    _ent("evaporation", "Выпаривание", "process", "water_treatment", "蒸发, evaporator"),
+    _ent("evaporation", "Выпаривание", "process", "water_treatment", "evaporator"),
     _ent("ro-membrane", "RO-мембрана", "equipment", "water_treatment"),
     _ent("ix-resin", "Ионообменная смола", "equipment", "water_treatment"),
     _ent("evaporator", "Выпарной аппарат", "equipment", "water_treatment"),
