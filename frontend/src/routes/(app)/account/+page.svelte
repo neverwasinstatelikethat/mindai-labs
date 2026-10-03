@@ -4,7 +4,7 @@
   import { page } from '$app/state';
   import { tick } from 'svelte';
   import { ApiError, api } from '$lib/api';
-  import { dateTime } from '$lib/format';
+  import { dateTime, num } from '$lib/format';
   import { navLabel } from '$lib/nav';
   import { observeReveals } from '$lib/reveal';
   import { session } from '$lib/sessionStore.svelte';
@@ -15,11 +15,16 @@
     ACTIVITY_OUTCOME_UNKNOWN,
     BASIC_RIGHT_NOTE,
     CORPUS_JOURNAL,
+    DECISION_ACTION_LABELS,
     EXPERT_RIGHT_NOTE,
     JOURNAL_NOUNS,
     JOURNAL_WINDOW_WORDS,
+    MY_DECISIONS,
     MY_JOURNAL,
+    MY_USAGE,
     RIGHT_TASK_NOTES,
+    USAGE_WINDOW_LABELS,
+    USAGE_WINDOW_OPTIONS,
     journalIncomplete,
     journalLoadMoreOf,
     journalUnloaded,
@@ -32,6 +37,8 @@
     type ActivityEntry,
     type AuditEntry,
     type Capability,
+    type ExpertDecision,
+    type LlmUsageSummary,
   } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
@@ -249,7 +256,7 @@
       activityTotal = null;
       activityOffset = 0;
       activityStalled = false;
-      activityError = messageOf(caught, 'Журнал ваших действий не пришёл. Повторите запрос.');
+      activityError = messageOf(caught, MY_JOURNAL.failedBody);
     } finally {
       if (call === activitySeq) activityLoading = false;
     }
@@ -308,6 +315,8 @@
       { id: 'account-who', title: 'Кто вы' },
       { id: 'account-rights', title: 'Что вам открыто' },
       { id: 'account-journal', title: MY_JOURNAL.heading },
+      { id: 'account-decisions', title: MY_DECISIONS.heading },
+      { id: 'account-usage', title: MY_USAGE.heading },
     ];
     if (canAudit) rows.push({ id: 'corpus-journal', title: CORPUS_JOURNAL.heading });
     rows.push(
@@ -321,7 +330,7 @@
     return pageSections.find((row) => row.id === id)?.title ?? '';
   }
 
-  // Право на экране называется одним словом с списком ниже: экспертное право
+  // Право на экране называется одним словом со списком ниже: экспертное право
   // открыто либо его нет. Про «уровни доступа» экран не говорит.
   const rightLabel = $derived(
     session.account?.review_enabled ? 'экспертное право открыто' : 'экспертного права нет',
@@ -359,7 +368,7 @@
       corpusTotal = null;
       corpusOffset = 0;
       corpusStalled = false;
-      corpusError = messageOf(caught, 'Журнал корпуса не пришёл. Повторите запрос.');
+      corpusError = messageOf(caught, CORPUS_JOURNAL.failedBody);
     } finally {
       if (call === corpusSeq) corpusLoading = false;
     }
@@ -387,6 +396,125 @@
       if (call === corpusSeq) corpusMoreError = JOURNAL_WINDOW_WORDS.moreFailed;
     } finally {
       if (call === corpusSeq) corpusMoreLoading = false;
+    }
+  }
+
+  // Решения собственного аккаунта: `/audit` отдаёт акты всех под `audit:read`, а
+  // автора подставляет сервер. Окно то же, что у журналов, поэтому неполное
+  // чтение называется отдельно от пустоты и от сбоя.
+  const DECISIONS_PAGE_SIZE = 50;
+  let decisions = $state<ExpertDecision[] | null>(null);
+  let decisionsTotal = $state<number | null>(null);
+  let decisionsOffset = $state(0);
+  let decisionsLoading = $state(false);
+  let decisionsMoreLoading = $state(false);
+  let decisionsError = $state('');
+  let decisionsMoreError = $state('');
+  let decisionsStalled = $state(false);
+  let decisionsSeq = 0;
+
+  const decisionLeft = $derived(
+    decisions === null || decisionsTotal === null
+      ? null
+      : Math.max(0, decisionsTotal - decisions.length),
+  );
+  const decisionUnloaded = $derived(
+    journalUnloaded(decisionsTotal, JOURNAL_NOUNS.entry, MY_DECISIONS.scope)
+  );
+  const decisionPartial = $derived(
+    decisionsTotal === null && decisions !== null && decisions.length >= DECISIONS_PAGE_SIZE
+      ? journalIncomplete(JOURNAL_NOUNS.entry)
+      : '',
+  );
+  // Идентификатор объекта решения нужен при разборе конкретного случая, поэтому
+  // он под «Служебными данными», а не в строке списка.
+  const decisionRefs = $derived(
+    (decisions ?? []).filter((entry) => Boolean(entry.object_id)).slice(0, 40),
+  );
+
+  function decisionName(action: string): string {
+    return knownTerm(DECISION_ACTION_LABELS, action) ?? ACTIVITY_ACTION_FALLBACK;
+  }
+
+  // У решения собственного окна в контракте нет, поэтому ключ строки — пара
+  // «действие, объект, время»: перекрывшиеся порции окна не удваиваются.
+  function decisionKeyOf(entry: ExpertDecision): string {
+    return `${entry.created_at}|${entry.action}|${entry.object_id}|${entry.outcome}`;
+  }
+
+  async function loadDecisions(): Promise<void> {
+    const call = ++decisionsSeq;
+    decisionsLoading = true;
+    decisionsError = '';
+    try {
+      const page = await api.myDecisions(DECISIONS_PAGE_SIZE, 0);
+      if (call !== decisionsSeq) return;
+      decisions = page.items;
+      decisionsTotal = page.total;
+      decisionsOffset = page.items.length;
+      decisionsMoreError = '';
+      decisionsStalled = false;
+    } catch (caught) {
+      if (call !== decisionsSeq) return;
+      decisions = null;
+      decisionsTotal = null;
+      decisionsOffset = 0;
+      decisionsStalled = false;
+      decisionsError = messageOf(caught, MY_DECISIONS.failedBody);
+    } finally {
+      if (call === decisionsSeq) decisionsLoading = false;
+    }
+  }
+
+  async function loadDecisionsMore(): Promise<void> {
+    if (decisions === null) return;
+    const call = ++decisionsSeq;
+    const offset = decisionsOffset;
+    decisionsMoreLoading = true;
+    decisionsMoreError = '';
+    try {
+      const page = await api.myDecisions(DECISIONS_PAGE_SIZE, offset);
+      if (call !== decisionsSeq) return;
+      decisionsOffset = offset + page.items.length;
+      const seen = new Set(decisions.map(decisionKeyOf));
+      decisions = [
+        ...decisions,
+        ...page.items.filter((entry) => !seen.has(decisionKeyOf(entry))),
+      ];
+      decisionsStalled = page.items.length === 0;
+      if (page.total !== null) decisionsTotal = page.total;
+    } catch {
+      if (call === decisionsSeq) decisionsMoreError = JOURNAL_WINDOW_WORDS.moreFailed;
+    } finally {
+      if (call === decisionsSeq) decisionsMoreLoading = false;
+    }
+  }
+
+  // Расход модели под своим входом. Окно выбирается, потому что «чем я работал
+  // сегодня» и «во что обходится корпус» это разные вопросы, а сервер считает
+  // только то, что попросят.
+  const DEFAULT_USAGE_DAYS = 30;
+  let usageDays = $state<number>(DEFAULT_USAGE_DAYS);
+  let usage = $state<LlmUsageSummary | null>(null);
+  let usageLoading = $state(false);
+  let usageError = $state('');
+  let usageSeq = 0;
+
+  async function loadUsage(days: number): Promise<void> {
+    usageDays = days;
+    const call = ++usageSeq;
+    usageLoading = true;
+    usageError = '';
+    try {
+      const summary = await api.myUsage(days);
+      if (call !== usageSeq) return;
+      usage = summary;
+    } catch (caught) {
+      if (call !== usageSeq) return;
+      usage = null;
+      usageError = messageOf(caught, MY_USAGE.failedBody);
+    } finally {
+      if (call === usageSeq) usageLoading = false;
     }
   }
 
@@ -421,6 +549,16 @@
     // пароля сама пишет акт, поэтому перечитываем журнал после подтверждения.
     if (view !== 'ready') return;
     void loadActivity();
+  });
+
+  $effect(() => {
+    // Решения и расход читаются один раз на подтверждённом входе. Окно расхода
+    // в эффекте не читается: его меняет кнопка экрана, и за каждой сменой
+    // стоит собственный запрос, а не повтор этого эффекта.
+    void view;
+    if (view !== 'ready') return;
+    void loadDecisions();
+    void loadUsage(DEFAULT_USAGE_DAYS);
   });
 
   $effect(() => {
@@ -523,7 +661,7 @@
   <title>Профиль и пароль — Научный Клубок</title>
   <meta
     name="description"
-    content="Кто вы в сервисе, какие дела открыты аккаунту, журнал ваших действий и смена пароля."
+    content="Кто вы в сервисе, какие дела открыты аккаунту, журнал ваших действий и решений, расход модели и смена пароля."
   />
 </svelte:head>
 
@@ -558,7 +696,7 @@
           </nav>
           <div class="row">
             <Button href="#account-password" variant="action">Сменить пароль</Button>
-            <span class="micro muted">Имя и журнал действий читаются выше на этом же экране.</span>
+            <span class="micro muted">Имя, права и журнал действий читаются на этой же странице.</span>
           </div>
         </div>
       {/if}
@@ -621,7 +759,7 @@
               </div>
               <StatusPill
                 status={account.review_enabled ? 'consensus' : 'off'}
-                label={account.review_enabled ? 'экспертные права открыты' : 'экспертные права закрыты'}
+                label={rightLabel}
               />
             </div>
             <dl class="kv">
@@ -749,13 +887,13 @@
           </ul>
 
           <p class="micro muted account__note">
-            Экспертные права выдаёт и снимает администратор сервиса, при регистрации их не выбрать.
+            Экспертное право выдаёт и снимает администратор сервиса, при регистрации его не выбрать.
             Служебные ключи прав и классы данных лежат ниже, в раскрытии «Служебные данные».
           </p>
         </Panel>
       </section>
 
-      <!-- ── Журнал моих действий ───────────────────────────────────── -->
+      <!-- ── Журнал ваших действий ──────────────────────────────────── -->
       <section class="account__block" id="account-journal">
         <SectionHead
           level="2"
@@ -783,7 +921,7 @@
         {:else if activityError}
           <Panel tone="coral">
             <div class="account__fault">
-              <p class="eyebrow"><Icon name="alert" size={16} /> журнал не пришёл</p>
+              <p class="eyebrow"><Icon name="alert" size={16} /> {MY_JOURNAL.failedTitle}</p>
               <p class="small">{activityError}</p>
               <div class="row">
                 <Button
@@ -804,8 +942,8 @@
           {#if activityUnloaded}
             <Panel tone="coral">
               <div class="account__fault">
-                <p class="eyebrow"><Icon name="alert" size={16} /> журнал не загружен</p>
-                <p class="small"><strong>{activityUnloaded.title}.</strong> {activityUnloaded.body}</p>
+                <p class="eyebrow"><Icon name="alert" size={16} /> {activityUnloaded.title}</p>
+                <p class="small">{activityUnloaded.body}</p>
                 <div class="row">
                   <Button
                     variant="action"
@@ -822,8 +960,8 @@
           {:else}
             <Empty
               icon="clock"
-              title="Ваших актов в журнале пока нет"
-              body="Задайте вопрос в разделе «Вопрос» или загрузите документ. Запись появится здесь после обновления журнала."
+              title={MY_JOURNAL.emptyTitle}
+              body={MY_JOURNAL.emptyBody}
             >
               {#snippet action()}
                 <Button variant="action" href="/research">Задать вопрос</Button>
@@ -845,7 +983,7 @@
                 </li>
               {/each}
             </ul>
-            <p class="micro muted account__note">
+            <p class="micro muted account__note" role="status">
               {shownSentenceOf(journalRows.length, activityTotal, JOURNAL_NOUNS.entry)}.
               {#if activityPartial}{activityPartial}.{/if}
             </p>
@@ -883,6 +1021,193 @@
         {/if}
       </section>
 
+      <!-- ── Ваши экспертные решения ────────────────────────────────── -->
+      <section class="account__block" id="account-decisions">
+        <SectionHead level="2" title={sectionTitle('account-decisions')} lead={MY_DECISIONS.lead}>
+          <Button
+            variant="quiet"
+            icon="refresh"
+            busy={decisionsLoading}
+            disabled={decisionsLoading}
+            onclick={() => void loadDecisions()}
+          >
+            Обновить решения
+          </Button>
+        </SectionHead>
+
+        {#if decisionsLoading && decisions === null}
+          <Panel tone="sunk">
+            <div class="row account__loading" role="status">
+              <span class="spinner" aria-hidden="true"></span>
+              <p class="small">{MY_DECISIONS.loading}</p>
+            </div>
+          </Panel>
+        {:else if decisionsError}
+          <Panel tone="coral">
+            <div class="account__fault">
+              <p class="eyebrow"><Icon name="alert" size={16} /> {MY_DECISIONS.failedTitle}</p>
+              <p class="small">{decisionsError}</p>
+              <div class="row">
+                <Button
+                  variant="action"
+                  icon="refresh"
+                  busy={decisionsLoading}
+                  disabled={decisionsLoading}
+                  onclick={() => void loadDecisions()}
+                >
+                  Повторить запрос
+                </Button>
+              </div>
+            </div>
+          </Panel>
+        {:else if decisions !== null && decisions.length === 0}
+          {#if decisionUnloaded}
+            <Panel tone="coral">
+              <div class="account__fault">
+                <p class="eyebrow"><Icon name="alert" size={16} /> {decisionUnloaded.title}</p>
+                <p class="small">{decisionUnloaded.body}</p>
+                <div class="row">
+                  <Button
+                    variant="action"
+                    icon="refresh"
+                    busy={decisionsLoading}
+                    disabled={decisionsLoading}
+                    onclick={() => void loadDecisions()}
+                  >
+                    Повторить запрос
+                  </Button>
+                </div>
+              </div>
+            </Panel>
+          {:else}
+            <Empty
+              icon="clock"
+              title={MY_DECISIONS.emptyTitle}
+              body={MY_DECISIONS.emptyBody}
+            />
+          {/if}
+        {:else if decisions !== null}
+          <Panel>
+            <ul class="journal">
+              {#each decisions as entry, i (i)}
+                <li class="journal__row">
+                  <div class="journal__when">
+                    <time datetime={entry.created_at}>{dateTime(entry.created_at)}</time>
+                  </div>
+                  <div class="journal__what">
+                    <p class="small">{decisionName(entry.action)}</p>
+                  </div>
+                  <StatusPill
+                    status={outcomeStatus(entry.outcome)}
+                    label={outcomeLabel(entry.outcome)}
+                  />
+                </li>
+              {/each}
+            </ul>
+            <p class="micro muted account__note" role="status">
+              {shownSentenceOf(decisions.length, decisionsTotal, JOURNAL_NOUNS.entry)}.
+              {#if decisionPartial}{decisionPartial}.{/if}
+            </p>
+            {#if decisionsStalled}
+              <Notice tone="warn" title={JOURNAL_WINDOW_WORDS.stalledTitle}>
+                {JOURNAL_WINDOW_WORDS.stalled}
+              </Notice>
+            {:else if decisionLeft !== null && decisionLeft > 0}
+              <div class="row">
+                <Button
+                  variant="quiet"
+                  busy={decisionsMoreLoading}
+                  disabled={decisionsMoreLoading}
+                  onclick={() => void loadDecisionsMore()}
+                >
+                  {decisionsMoreLoading
+                    ? JOURNAL_WINDOW_WORDS.loadingMore
+                    : journalLoadMoreOf(
+                        decisionLeft ?? DECISIONS_PAGE_SIZE,
+                        DECISIONS_PAGE_SIZE,
+                        JOURNAL_NOUNS.entry,
+                      )}
+                </Button>
+              </div>
+            {/if}
+            {#if decisionsMoreError}
+              <Notice tone="error" title={JOURNAL_WINDOW_WORDS.moreFailedTitle}>
+                {decisionsMoreError}
+              </Notice>
+            {/if}
+          </Panel>
+        {/if}
+      </section>
+
+      <!-- ── Расход модели ──────────────────────────────────────────── -->
+      <section class="account__block" id="account-usage">
+        <SectionHead level="2" title={sectionTitle('account-usage')} lead={MY_USAGE.lead}>
+          <Button
+            variant="quiet"
+            icon="refresh"
+            busy={usageLoading}
+            disabled={usageLoading}
+            onclick={() => void loadUsage(usageDays)}
+          >
+            Обновить расход
+          </Button>
+        </SectionHead>
+
+        <Panel tone="lav">
+          <div class="row" role="group" aria-label={MY_USAGE.windowCaption}>
+            {#each USAGE_WINDOW_OPTIONS as days (days)}
+              <Button
+                variant={days === usageDays ? 'ink' : 'quiet'}
+                disabled={usageLoading}
+                onclick={() => void loadUsage(days)}
+              >
+                {USAGE_WINDOW_LABELS[days]}
+              </Button>
+            {/each}
+          </div>
+
+          {#if usageLoading && usage === null}
+            <div class="row account__loading" role="status">
+              <span class="spinner" aria-hidden="true"></span>
+              <p class="small">{MY_USAGE.loading}</p>
+            </div>
+          {:else if usageError}
+            <div class="account__fault">
+              <p class="eyebrow"><Icon name="alert" size={16} /> {MY_USAGE.failedTitle}</p>
+              <p class="small">{usageError}</p>
+              <div class="row">
+                <Button
+                  variant="action"
+                  icon="refresh"
+                  busy={usageLoading}
+                  disabled={usageLoading}
+                  onclick={() => void loadUsage(usageDays)}
+                >
+                  Повторить запрос
+                </Button>
+              </div>
+            </div>
+          {:else if usage}
+            <dl class="kv">
+              <dt>{MY_USAGE.runs}</dt>
+              <dd class="num">{num(usage.runs)}</dd>
+              <dt>{MY_USAGE.failedRuns}</dt>
+              <dd class="num">{num(usage.failed_runs)}</dd>
+              <dt>{MY_USAGE.promptTokens}</dt>
+              <dd class="num">{num(usage.prompt_tokens)}</dd>
+              <dt>{MY_USAGE.completionTokens}</dt>
+              <dd class="num">{num(usage.completion_tokens)}</dd>
+            </dl>
+            <!-- Активное окно называется строкой, а не только плашкой кнопки:
+                 с клавиатуры выбранное окно иначе не прочитать. -->
+            <p class="micro muted account__note" role="status">
+              {MY_USAGE.windowCaption}: {USAGE_WINDOW_LABELS[usageDays]}.
+              {#if usage.runs === 0}{MY_USAGE.empty}{/if}
+            </p>
+          {/if}
+        </Panel>
+      </section>
+
       <!-- ── Журнал корпуса ─────────────────────────────────────────── -->
       {#if canAudit}
         <section class="account__block" id="corpus-journal">
@@ -912,7 +1237,7 @@
           {:else if corpusError}
             <Panel tone="coral">
               <div class="account__fault">
-                <p class="eyebrow"><Icon name="alert" size={16} /> журнал не пришёл</p>
+                <p class="eyebrow"><Icon name="alert" size={16} /> {CORPUS_JOURNAL.failedTitle}</p>
                 <p class="small">{corpusError}</p>
                 <div class="row">
                   <Button
@@ -932,8 +1257,8 @@
               {#if corpusUnloaded}
                 <Panel tone="coral">
                   <div class="account__fault">
-                    <p class="eyebrow"><Icon name="alert" size={16} /> журнал не загружен</p>
-                    <p class="small"><strong>{corpusUnloaded.title}.</strong> {corpusUnloaded.body}</p>
+                    <p class="eyebrow"><Icon name="alert" size={16} /> {corpusUnloaded.title}</p>
+                    <p class="small">{corpusUnloaded.body}</p>
                     <div class="row">
                       <Button
                         variant="action"
@@ -950,8 +1275,8 @@
               {:else}
                 <Empty
                   icon="clock"
-                  title="В журнале корпуса пока нет актов"
-                  body="Вопросы к корпусу, правки и отказы доступа записываются сюда по мере работы."
+                  title={CORPUS_JOURNAL.emptyTitle}
+                  body={CORPUS_JOURNAL.emptyBody}
                 />
               {/if}
             {:else}
@@ -972,7 +1297,7 @@
                     </li>
                   {/each}
                 </ul>
-                <p class="micro muted account__note">
+                <p class="micro muted account__note" role="status">
                   {shownSentenceOf(
                     corpusJournal.length,
                     corpusTotal,
@@ -1174,6 +1499,22 @@
                 <p class="micro muted">Объект не указан ни в одном акте этого списка журнала.</p>
               {/if}
 
+              {#if decisionRefs.length > 0}
+                <h3 class="h4 account__sub">Объекты ваших решений</h3>
+                <p class="micro muted">
+                  Идентификатор предложения, расхождения или утверждения, по которому принято решение.
+                </p>
+                <ul class="refs">
+                  {#each decisionRefs as entry, i (i)}
+                    <li class="refs__row">
+                      <span class="micro muted">{dateTime(entry.created_at)}</span>
+                      <span class="micro">{decisionName(entry.action)}</span>
+                      <code class="tech">{entry.object_id}</code>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+
               {#if unknownActions.length > 0}
                 <h3 class="h4 account__sub">Действия без названия</h3>
                 <p class="micro muted">
@@ -1230,6 +1571,42 @@
     display: flex;
     flex-direction: column;
     line-height: var(--lh-dense);
+  }
+
+  /* Обзор профиля: кто вы, что здесь есть и одно главное действие. Это должно
+     читаться на первом экране 1280×900 без прокрутки. */
+  .account__brief {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    min-width: 0;
+  }
+
+  /* Разделы экрана — ссылки внутрь страницы, а не в меню: они доступны с Tab
+     наравне с кнопкой действия и названы тем же словом, что и заголовок секции. */
+  .account__toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s2);
+  }
+
+  .account__toc-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 36px;
+    padding: var(--s2) var(--s4);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-pill);
+    background: var(--surface-raised);
+    color: var(--ink-2);
+    font-size: var(--t-micro);
+    text-decoration: none;
+  }
+
+  .account__toc-link:hover {
+    border-color: var(--line-strong);
+    color: var(--ink);
+    text-decoration: underline;
   }
 
   .account__stack {
@@ -1339,9 +1716,9 @@
     min-width: 0;
   }
 
-  .journal__what .tech {
-    display: block;
-  }
+  /* Служебного слоя в строке журнала нет намеренно: ключ действия и идентификатор
+     объекта читаются только под «Служебными данными», поэтому правила для
+     `.journal__what .tech` здесь не осталось. */
 
   .rights {
     list-style: none;

@@ -44,6 +44,12 @@ export const NAV_LINKS: NavLink[] = [
     gloss: 'где источники дают разные числа и где молчат',
   },
   {
+    href: '/resolution',
+    label: 'Сущности',
+    icon: 'list',
+    gloss: 'одно это название или два, и кто подтвердил склейку',
+  },
+  {
     href: '/feedback',
     label: 'Отзывы',
     icon: 'shield',

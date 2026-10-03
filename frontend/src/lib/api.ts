@@ -10,15 +10,19 @@ import type {
   CorpusStats,
   DashboardData,
   DocumentReceipt,
+  EntityMergeProposal,
   EvaluationRun,
   EvolutionExperiment,
   EvolutionProposal,
   ExportFormat,
+  ExpertDecision,
   FeedbackResult,
   FindingApiStatus,
   FindingListItem,
   GoldCase,
   GraphSnapshot,
+  LlmUsageSummary,
+  MergeReviewAction,
   QueryResponse,
   SystemStatus,
 } from './types';
@@ -221,12 +225,12 @@ export const api = {
     comment: string;
     correction?: string;
   }) => request<FeedbackResult>('/api/v1/feedback', { method: 'POST', body: JSON.stringify(input) }),
-  // Очередь предложений и расхождения читаются сервером окном (`limit`/`offset`,
-  // потолок страницы 200), полное число — в X-Total-Count. Форма возврата здесь
-  // остаётся массивом до поры: экраны правятся параллельно, и переключение на
-  // `requestWithTotal` — шаг оркестратора после их приземления (см. план, Р3).
+  // Очередь предложений читается сервером окном (`limit`/`offset`, потолок
+  // страницы 200), полное число подходящих записей приходит в X-Total-Count:
+  // экран обязан называть прочитанное и полное число раздельно, молчаливый срез
+  // на потолке страницы запрещён (Р3).
   proposals: (limit = 200, offset = 0) =>
-    request<EvolutionProposal[]>(`/api/v1/proposals?limit=${limit}&offset=${offset}`),
+    requestWithTotal<EvolutionProposal[]>(`/api/v1/proposals?limit=${limit}&offset=${offset}`),
   // Durable-ленты с серверным окном (`limit` + `offset`): тело — массив
   // страницы, полное число подходящих записей — в X-Total-Count. Экран,
   // показывающий ленту как журнал, обязан называть прочитанное и полное
@@ -268,6 +272,26 @@ export const api = {
   // полное число — те же, что у ленты собственных актов.
   audit: (limit = 50, offset = 0) =>
     requestWithTotal<AuditEntry[]>(`/api/v1/audit?limit=${limit}&offset=${offset}`),
+  // Очередь склеек сущностей под правом `proposal:review`: в `rationale` бывают
+  // ссылки на закрытые источники, поэтому список отдаётся не всем подряд. Окно
+  // режет сервер, полное число пар — в X-Total-Count.
+  mergeProposals: (limit = 50, offset = 0) =>
+    requestWithTotal<EntityMergeProposal[]>(
+      `/api/v1/entity-resolution/proposals?limit=${limit}&offset=${offset}`,
+    ),
+  // Принятие, отказ и откат склейки. Идемпотентность держит сервер: повтор того
+  // же решения отвечает 409, исчезнувшая пара — 404, отсутствие права — 403.
+  mergeReview: (proposalId: string, action: MergeReviewAction) =>
+    request<EntityMergeProposal>(
+      `/api/v1/entity-resolution/proposals/${encodeURIComponent(proposalId)}/review`,
+      { method: 'POST', body: JSON.stringify({ action }) },
+    ),
+  // История собственных экспертных решений: `/audit` закрыт `audit:read` и отдаёт
+  // акты всех аккаунтов, а `actor_id` здесь подставляет сервер по сессии.
+  myDecisions: (limit = 50, offset = 0) =>
+    requestWithTotal<ExpertDecision[]>(`/api/v1/decisions?limit=${limit}&offset=${offset}`),
+  // «Сколько стоили мои вопросы»: права не нужны, виден только свой аккаунт.
+  myUsage: (days = 30) => request<LlmUsageSummary>(`/api/v1/me/usage?days=${days}`),
 };
 
 export function apiUrl(path: string): string {

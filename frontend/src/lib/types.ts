@@ -468,6 +468,56 @@ export interface AuditEntry extends ActivityEntry {
   correlation_id: string;
 }
 
+// Зеркало contracts.ExpertDecision — durable-запись экспертного решения
+// собственного аккаунта. Свободного текста источников здесь нет намеренно: только
+// идентификатор, действие, признак успеха и время, иначе журнал решений стал бы
+// каналом утечки закрытого содержимого.
+export interface ExpertDecision {
+  id: string;
+  actor_id: string;
+  action:
+    | 'proposal.created'
+    | 'proposal.reviewed'
+    | 'resolution.reviewed'
+    | 'claim.superseded'
+    | 'answer.exported'
+    | 'conflict.reviewed';
+  object_id: string;
+  outcome: 'success' | 'denied' | 'failure';
+  created_at: string;
+  metadata: Record<string, string | number | boolean>;
+}
+
+// Зеркало contracts.LlmUsageSummary: расход модели за окном только по своему
+// аккаунту, `account_id` сервер берёт из сессии.
+export interface LlmUsageSummary {
+  window_days: number;
+  runs: number;
+  failed_runs: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+// Зеркало contracts.EntityMergeProposal. `id` — детерминированный uuid5 пары
+// (алиас, канон): повторная регистрация той же пары на импорте обновляет запись,
+// а не плодит новую. `source_id`/`target_id` — настоящие id узлов графа, они
+// пустые, пока узлы не найдены, и заполняются при принятии.
+export interface EntityMergeProposal {
+  id: string;
+  source: string;
+  target: string;
+  confidence: number;
+  rationale: string;
+  status: 'proposed' | 'accepted' | 'rejected' | 'reverted';
+  created_at: string;
+  reviewed_at: string | null;
+  reviewer_id: string | null;
+  source_id: string | null;
+  target_id: string | null;
+}
+
+export type MergeReviewAction = 'accept' | 'reject' | 'revert';
+
 export interface DashboardData {
   documents: number;
   claims: number;
