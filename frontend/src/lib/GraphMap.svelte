@@ -645,6 +645,24 @@
     return () => clearTimeout(timer);
   });
 
+  /**
+   * Выбор мог прийти с экрана, а не с поля: глубокая ссылка `/graph?claim=`
+   * открывает запись до того, как человек вошёл в её область. Поле переходит в
+   * эту область, иначе инспектор рассказывал бы о записи, которой на экране нет.
+   * Один выбор обслуживается один раз: возврат к обзору областей при выбранной
+   * записи остаётся возвратом, а не принудительным прыжком обратно в цепочку.
+   */
+  let revealedFor = '';
+  $effect(() => {
+    const id = selectedId;
+    if (!id || id === revealedFor) return;
+    const node = nodeById.get(id);
+    if (!node) return;
+    revealedFor = id;
+    if (level === 'chain' && areaOf(node) === activeArea) return;
+    openArea(areaOf(node));
+  });
+
   // ── Действия ────────────────────────────────────────────────────────────
   function select(node: GraphNode | null): void {
     onselect?.(node);
@@ -1228,8 +1246,13 @@
           <dd class="num">{scopeEdges.length}</dd>
         </div>
         <div>
-          <dt>Связей на линиях</dt>
-          <dd class="num">{edgeSplit.drawn.length}</dd>
+          <!-- В вертикальной раскладке линий нет: отношения читаются под каждой
+               строкой, поэтому и счётчик обязан называть то, что человек видит, а
+               не то, что лежало бы на линиях в горизонтальной. -->
+          <dt>{narrow ? 'Связей под строками' : 'Связей на линиях'}</dt>
+          <dd class="num">
+            {narrow ? edgeSplit.drawn.length + edgeSplit.other.length : edgeSplit.drawn.length}
+          </dd>
         </div>
         {#if readEdges.length > 0}
           <div>
