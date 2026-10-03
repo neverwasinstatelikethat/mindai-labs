@@ -28,6 +28,18 @@ EXAMPLE = ROOT / ".env.example"
 # документированием, потому что `int | None` со пустым значением в файле
 # окружения читается не как «не задано», а как строка "".
 _KEY_LINE = re.compile(r"^\s*#?\s*([A-Z0-9_]{3,})\s*=")
+# Прокидка в compose: `${КЛЮЧ:-значение}`; вместе с именем захватывается дефолт.
+_COMPOSE_DEFAULT = re.compile(r"\$\{([A-Z0-9_]+):-([^}]*)\}")
+
+
+def _same_value(text: str, default: object) -> bool:
+    """Сравнение без ложного разъезда: `90` и `90.0` одно число, `true` и `True` одна правда."""
+    if isinstance(default, bool):
+        return text.strip().lower() == str(default).lower()
+    try:
+        return float(text) == float(default)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return text.strip() == str(default)
 
 
 def documented_keys() -> set[str]:
@@ -87,13 +99,44 @@ def test_documented_defaults_match_application_defaults() -> None:
         if default is None:
             continue
         text = line.split("=", 1)[1].strip()
-        if isinstance(default, bool):
-            same = text.lower() == str(default).lower()
-        else:
-            try:
-                same = float(text) == float(default)
-            except ValueError:
-                same = False
-        if not same:
+        if not _same_value(text, default):
             drifted.append(f"{key}: в примере {text!r}, в приложении {default!r}")
     assert drifted == [], "; ".join(drifted)
+
+
+def test_compose_defaults_match_application_defaults() -> None:
+    """Третья нога контракта: дефолты прокидки `compose.yaml` не расходятся с кодом.
+
+    Значение живёт в трёх местах: дефолт `Settings`, строка `.env.example` и
+    `${КЛЮЧ:-значение}` в compose. Расходятся они по-тихому: контейнер стартует с
+    одним потолком, локальный прогон без Docker читает другой, а пример обещает
+    третий, и оператор правит не тот файл.
+    """
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    passed = dict(_COMPOSE_DEFAULT.findall(compose))
+    assert passed, "в compose.yaml не найдено ни одной прокидки вида КЛЮЧ:-значение"
+
+    fields = {name.upper(): name for name in Settings.model_fields}
+    drifted: list[str] = []
+    for key, comp_default in sorted(passed.items()):
+        name = fields.get(key)
+        if name is None:
+            continue
+        default = Settings.model_fields[name].default
+        if default is None:
+            continue
+        if not _same_value(comp_default, default):
+            drifted.append(f"{key}: compose {comp_default!r}, приложение {default!r}")
+    assert drifted == [], "; ".join(drifted)
+
+
+def test_every_compose_passthrough_is_documented() -> None:
+    """Ключ, который контейнер читает из окружения, обязан быть описан в примере.
+
+    Прокидка без строки в `.env.example` настраивается только правкой
+    `compose.yaml`: такой ручки оператор в примере не видит.
+    """
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    passed = {key for key, _ in _COMPOSE_DEFAULT.findall(compose)}
+    missing = sorted(passed - documented_keys())
+    assert missing == [], f"прокинуты в compose, но не описаны в примере: {missing}"
