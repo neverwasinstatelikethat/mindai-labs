@@ -51,6 +51,7 @@
     moreThesesText,
     stageOfNode,
     termOf,
+    thesesShown,
     tracePhraseOf,
   } from '$lib/terms';
   import { DATA_CLASS_LABELS } from '$lib/types';
@@ -554,8 +555,18 @@
   function sheetServiceRows(finding: Finding): { label: string; value: string }[] {
     const rows: { label: string; value: string }[] = [
       { label: SHEET_LABELS.thesisId, value: finding.id },
-      ...evidenceServiceRows(finding),
     ];
+    // Ключ онтологии вне словаря: в тексте наблюдения его показывать нельзя,
+    // он остаётся здесь, для сверки с сервером.
+    measuresOf(finding).forEach((measure, index) => {
+      if (measure.propertyCode) {
+        rows.push({
+          label: `${SHEET_LABELS.propertyCode} ${String(index + 1).padStart(2, '0')}`,
+          value: measure.propertyCode,
+        });
+      }
+    });
+    rows.push(...evidenceServiceRows(finding));
     const doc = finding.evidence[0]?.document_id;
     if (doc) rows.push({ label: SHEET_LABELS.documentId, value: doc });
     if (finding.superseded_by) {
@@ -1626,7 +1637,7 @@
                     </div>
                   {/each}
                   {#if findingsHidden > 0}
-                    <p class="micro">{SCALE_LABELS.shown.replace('{shown}', String(visibleFindings.length)).replace('{total}', String(payload.findings.length))}</p>
+                    <p class="micro">{thesesShown(visibleFindings.length, payload.findings.length)}</p>
                   {/if}
                   <p class="micro">{SCALE_LABELS.unitNote}</p>
                 {:else}
@@ -1685,7 +1696,7 @@
                     <span>{valueSummary(finding)}</span>
                     <span>
                       {linksToText(finding.evidence.length)}: цитаты, место в источнике и версии
-                      читает разбор
+                      показывает разбор
                     </span>
                   </p>
                 </article>
@@ -1719,7 +1730,7 @@
             {/each}
             {#each payload.recommendations as item, index (index)}
               <div class="line">
-                <span class="tag">шаг проверки {String(index + 1).padStart(2, '0')}</span>
+                <span class="tag">{ASK_REVIEW.adviceTag} {String(index + 1).padStart(2, '0')}</span>
                 <p class="small">{item}</p>
               </div>
             {/each}
@@ -1734,32 +1745,29 @@
         {#if canFeedback}
           <section class="block">
             <div class="block__head">
-              <h3 class="h4">Отзыв по ответу</h3>
-              <p class="micro">
-                Отзыв сохранится вместе с этим ответом и уйдёт эксперту на проверку. Исправить
-                отдельный тезис можно в его разборе выше.
-              </p>
+              <h3 class="h4">{ASK_FEEDBACK.title}</h3>
+              <p class="micro">{ASK_FEEDBACK.note}</p>
             </div>
             <div class="verdicts">
-              <span class="micro">вердикт</span>
+              <span class="micro">{ASK_FEEDBACK.verdictLabel}</span>
               <Chip pressed={feedbackVerdict === 'accept'} onclick={() => (feedbackVerdict = 'accept')}>
-                Ответ полезен
+                {ASK_FEEDBACK.useful}
               </Chip>
               <Chip pressed={feedbackVerdict === 'reject'} onclick={() => (feedbackVerdict = 'reject')}>
-                Ответу не верю
+                {ASK_FEEDBACK.distrust}
               </Chip>
             </div>
             <Field
-              label="Комментарий"
+              label={ASK_FEEDBACK.commentLabel}
               name="answer-feedback"
               type="textarea"
               rows={2}
-              placeholder="Что в ответе не так"
-              hint="Минимум три символа: пустой комментарий сервис не примет."
+              placeholder={ASK_FEEDBACK.commentPlaceholder}
+              hint={ASK_FEEDBACK.commentHint}
               bind:value={feedbackComment}
             />
             {#if !feedbackVerdict}
-              <p class="micro block__note">Сначала выберите: ответ полезен или нет.</p>
+              <p class="micro block__note">{ASK_FEEDBACK.needVerdict}</p>
             {/if}
             <Button
               variant="action"
@@ -1768,14 +1776,11 @@
               disabled={busy === 'feedback' || !feedbackVerdict || feedbackComment.trim().length < 3}
               onclick={() => void sendFeedback()}
             >
-              Отправить отзыв
+              {ASK_FEEDBACK.send}
             </Button>
           </section>
         {:else}
-          <p class="micro">
-            Отзыв по ответу доступен эксперту, право выдаёт администратор сервиса. Без отзыва ответ
-            остаётся на экране, но предложение на проверку из него не создаётся.
-          </p>
+          <p class="micro">{ASK_FEEDBACK.noRight}</p>
         {/if}
 
         {#if serviceRows.length}
@@ -1814,7 +1819,7 @@
             <dd class="num">{corpus.documents}</dd>
           </div>
           <div class="ask__corpus-item">
-            <dt>находок</dt>
+            <dt>утверждений</dt>
             <dd class="num">{corpus.claims}</dd>
           </div>
           <div class="ask__corpus-item">
@@ -1883,7 +1888,7 @@
     <div class="thesis__marks">
       <StatusPill status={finding.status} label={STATUS_PHRASE[finding.status]} />
       <span class="tag">{DATA_CLASS_LABELS[finding.data_class]}</span>
-      <span class="tag">версия <b class="num">{finding.version}</b></span>
+      <span class="tag">{SHEET_LABELS.versionLabel} <b class="num">{finding.version}</b></span>
     </div>
     <h3 class="h4">{finding.statement}</h3>
     <p class="micro muted sheet__facts">
@@ -1901,7 +1906,6 @@
           <div class="measure__top">
             <span class="micro">
               {measure.property}
-              {#if measure.propertyCode}<code class="code tech">{measure.propertyCode}</code>{/if}
               {measure.operatorLabel}
             </span>
             <span class="measure__value num">{measure.valueText} {measure.unit}</span>
@@ -1964,7 +1968,7 @@
           <span class="num">{valueSummary(rival.finding)}</span>
         </div>
         <p class="micro">
-          нормализованные границы не пересекаются на
+          {SHEET_LABELS.rivalsDelta}
           <b class="num">{num(rival.delta)}</b>
           {finding.observations[0]?.normalized_unit ?? ''}
         </p>
@@ -2958,11 +2962,6 @@
     flex-wrap: wrap;
   }
 
-  .measure__top code {
-    font-family: var(--font-data);
-    color: var(--ink-2);
-  }
-
   .measure__value {
     font-size: var(--t-h4);
     font-weight: 600;
@@ -3214,6 +3213,16 @@
     align-items: center;
     gap: var(--s2);
     flex-wrap: wrap;
+  }
+
+  /* Пока вердикт не выбран, подсказка стоит рядом с кнопкой, а не вместо неё. */
+  .block__note {
+    color: var(--ink-2);
+  }
+
+  /* Число уверенности и пояснение к нему — два элемента, а не склейка. */
+  .trust__note {
+    display: block;
   }
 
   .gap {
