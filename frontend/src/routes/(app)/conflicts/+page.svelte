@@ -40,6 +40,7 @@
     STATUS_SHORT,
     SUBJECT_LABELS,
     conflictsListUnloaded,
+    conflictsNoDivergencePending,
     conflictsRecordNote,
     conflictsSectionLink,
     conflictsShownOf,
@@ -1203,8 +1204,8 @@
       {:else}
         <Empty
           icon="checkCircle"
-          title={CONFLICTS_PAGE.noDivergenceTitle}
-          body={CONFLICTS_PAGE.noDivergenceBody}>
+          title={queueWaitingCount > 0 ? CONFLICTS_PAGE.noDivergencePendingTitle : CONFLICTS_PAGE.noDivergenceTitle}
+          body={queueWaitingCount > 0 ? conflictsNoDivergencePending(queueWaitingCount) : CONFLICTS_PAGE.noDivergenceBody}>
           {#snippet action()}
             {#if corpusClaims !== null}
               <p class="micro muted conf__corpus-size">
