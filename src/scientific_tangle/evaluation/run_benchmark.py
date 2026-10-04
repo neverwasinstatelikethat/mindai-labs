@@ -750,8 +750,14 @@ def load_baseline(path: Path) -> dict[str, Any]:
             f"эталон {path} не подходит: ожидался прогон версии {PAYLOAD_VERSION}"
         )
     headline = data.get("headline")
-    if not isinstance(headline, dict) or not all(
-        isinstance(value, (int, float)) for value in headline.values()
+    # Пустая карта здесь опасна не формой, а следствием: сравнение берёт
+    # пересечение ключей, и при пустом эталоне оно пусто, то получается
+    # «падений нет» при невыполненной сверке. Гейт в CI такую карту отвергает
+    # `assert headline`, поэтому и читатель обязан требовать непустую.
+    if (
+        not isinstance(headline, dict)
+        or not headline
+        or not all(isinstance(value, (int, float)) for value in headline.values())
     ):
         raise ValueError(f"в эталоне {path} нет карты headline — сравнивать нечего")
     return data
@@ -773,6 +779,14 @@ def compare_with_baseline(
     поэтому baseline == 0 пропускается.
     """
     baseline_headline = baseline["headline"]
+    # Пустое пересечение ключей — это не «метрики не упали», а «сверка не
+    # выполнилась»: список регрессий остаётся единственным способом сказать это
+    # языком, который гейт уже умеет читать.
+    if not set(headline) & set(baseline_headline):
+        return [
+            "метрики текущего прогона не пересекаются с эталоном — "
+            f"сверка не выполнена (эталон: {sorted(baseline_headline)[:3]}…)"
+        ]
     regressions: list[str] = []
     for key in sorted(set(headline) & set(baseline_headline)):
         base = float(baseline_headline[key])

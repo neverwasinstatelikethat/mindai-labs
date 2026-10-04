@@ -626,6 +626,71 @@ def test_reconcile_gold_cases_accepts_equal_sets() -> None:
     ]
 
 
+def test_baseline_writer_output_passes_the_ci_gate(tmp_path: Path) -> None:
+    """Файл эталона обязан проходить проверки job'а `benchmark:baseline-gate`.
+
+    Гейт принимает только прогон версии 1, только принятый (`accepted is true`) и
+    только с непустой плоской картой `headline`. Если писатель сменит схему —
+    переименует `headline`, перестанет проставлять `accepted`, отдаст строку вместо
+    числа, — первый настоящий прогон на корпусе упрётся в «сравнить не с чем», и
+    узнаем мы об этом ровно тогда, когда корпуса под рукой уже не будет. Поэтому
+    контракт писателя и гейта проверяется здесь, синтетическим прогоном без
+    притязаний на качество продукта.
+    """
+    from scientific_tangle.evaluation.run_benchmark import (
+        PAYLOAD_VERSION,
+        build_payload,
+        load_baseline,
+        write_payload,
+    )
+
+    payload = build_payload(
+        hybrid={"recall@10": 0.95, "mrr": 0.8},
+        lexical={"recall@10": 0.6, "mrr": 0.5},
+        case_details=[{"query": "Вопрос?", "hybrid_recall": 1.0}],
+        latencies=[0.1, 0.2],
+        doc_count=1,
+        findings_count=2,
+        source_root=tmp_path,
+        criteria={},
+        regressions=None,
+        baseline_path=None,
+        max_relative=0.05,
+    )
+    # `main()` проставляет этот признак перед записью эталона.
+    payload["accepted"] = True
+    path = tmp_path / "baseline.json"
+    write_payload(path, payload)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["version"] == 1 == PAYLOAD_VERSION
+    assert data["accepted"] is True
+    headline = data["headline"]
+    assert headline and all(isinstance(value, (int, float)) for value in headline.values())
+    assert data["corpus"]["gold_cases"] == 1
+    assert data["corpus"]["documents"] == 1
+    # Тот же читатель, что работает при сверке регрессий, обязан принять файл.
+    assert load_baseline(path)["headline"] == headline
+
+    # Проверка с зубами: чужая форма эталона обязана отвергаться, иначе гейт
+    # принимает любой JSON и «сравнить не с чем» превращается в «падений нет».
+    no_headline = dict(data, headline={})
+    path.write_text(json.dumps(no_headline, ensure_ascii=False), "utf-8")
+    with pytest.raises(ValueError, match="headline"):
+        load_baseline(path)
+
+    other_version = dict(data, version=PAYLOAD_VERSION + 1)
+    path.write_text(json.dumps(other_version, ensure_ascii=False), "utf-8")
+    with pytest.raises(ValueError, match="версии"):
+        load_baseline(path)
+
+    # Пустое пересечение измеряемых метрик и эталона обязано читаться как
+    # «сверка не выполнена», а не как «падений нет».
+    from scientific_tangle.evaluation.run_benchmark import compare_with_baseline
+
+    assert compare_with_baseline({"hybrid_new": 0.9}, {"headline": {"hybrid_old": 0.9}}, 0.05, {})
+
+
 def test_real_gold_cases_diverge_from_manifest_and_say_so() -> None:
     """Актуальное расхождение двух носителей зафиксировано тестом, а не забыто.
 
