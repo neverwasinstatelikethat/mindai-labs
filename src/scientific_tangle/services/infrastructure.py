@@ -58,6 +58,7 @@ from scientific_tangle.services.knowledge import (
     stable_uuid,
     supersede_node_id,
 )
+from scientific_tangle.services.provider import redact_provider_error
 from scientific_tangle.services.reranking import query_tokens, rerank_findings
 from scientific_tangle.services.retrieval_semantics import (
     DEMO_ORIGIN,
@@ -1722,8 +1723,18 @@ class Neo4jElasticsearchKnowledgeBase:
             return
 
     def _note_degradation(self, component: str, error: BaseException) -> str:
-        """Фиксирует отказ ветки и возвращает формулировку для честного отчёта."""
-        note = f"Ветка retrieval «{component}» завершилась ошибкой: {str(error)[:200]}."
+        """Фиксирует отказ ветки и возвращает формулировку для честного отчёта.
+
+        Формулировку читает аналитик (``degradation_reasons``) и следом видит
+        модель в промпте, поэтому наружу уходит отредактированный текст:
+        ``ResponseError`` и ``ConnectionError`` приводят к строке с телом ответа,
+        заголовками и строкой подключения (``bolt://``, URL Elasticsearch).
+        Полный текст — в журнале процесса.
+        """
+        note = (
+            f"Ветка retrieval «{component}» завершилась ошибкой: "
+            f"{redact_provider_error(error, context='хранилище')}."
+        )
         logger.warning("Деградация %s: %s", component, error)
         try:
             from scientific_tangle.services.agent_metrics import agent_metrics

@@ -70,6 +70,12 @@ _HTTP_MEANINGS: dict[int, str] = {
 _REDACT_LIMIT = 120
 _STATUS_PREFIX = re.compile(r"(?<!\d)([1-5]\d{2})(?!\d)")
 _URL = re.compile(r"(https?://|bolt://|redis://|postgresql(?:\+psycopg)?://)\S+")
+# Отказ без статуса в начале строки (сбой подключения к хранилищу, таймаут) даёт
+# в ``__str__`` тело ответа и дамп заголовков: там адреса, ``x-request-id`` и
+# служебные заголовки провайдера. Ни одно из них не является причиной для
+# аналитика, поэтому вырезается до усечения.
+_BODY_DUMP = re.compile(r"b'.*?'", re.DOTALL)
+_HEADERS_DUMP = re.compile(r"Headers\(.*?\)\s*$|Headers\([^)]*\)", re.DOTALL)
 
 
 def redact_provider_error(error: BaseException | str, *, context: str = "провайдер") -> str:
@@ -89,7 +95,9 @@ def redact_provider_error(error: BaseException | str, *, context: str = "про�
             meaning = "провайдер недоступен" if code >= 500 else "провайдер отклонил обращение"
         return f"{context}: {meaning} (HTTP {code})"
     cleaned = _URL.sub(f"{context}:", raw)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _HEADERS_DUMP.sub("", cleaned)
+    cleaned = _BODY_DUMP.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;")
     return f"{context}: {cleaned[:_REDACT_LIMIT]}"
 
 
@@ -580,7 +588,11 @@ class GigaChatProvider:
                         else f"ответ не является JSON ({exc.msg} на позиции {exc.pos})"
                     )
                 if isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 2:
-                    raise ModelUnavailableError(f"GigaChat вернул ошибку: {parsed.get('error')}")
+                    raise ModelUnavailableError(
+                        redact_provider_error(
+                            str(parsed.get("error")), context="GigaChat вернул ошибку"
+                        )
+                    )
                 if isinstance(parsed, dict):
                     try:
                         result = schema.model_validate(parsed)
@@ -843,7 +855,12 @@ class GigaChatProvider:
             kind = "transport error"
         else:
             kind = "error"
-        return ModelUnavailableError(f"GigaChat {kind}: {error}")
+        # Текст `ModelUnavailableError` уходит наружу: в 503 всего `/api/v1/...`
+        # и в `degradation_reasons`, которые потом читаются моделью в промпте.
+        # ``GigaChatException.__str__`` — это строка подключения, тело ответа и
+        # заголовки с ``x-request-id``, поэтому наружу идёт отредактированная
+        # формулировка, а полный текст остаётся в журнале процесса.
+        return ModelUnavailableError(redact_provider_error(error, context=f"GigaChat {kind}"))
 
     @staticmethod
     def _extract_content(response: ChatCompletion) -> str:
