@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from collections import defaultdict, deque
 from contextvars import ContextVar
@@ -67,6 +68,15 @@ RETRIEVAL_FAILURES = Counter(
     ["component"],
 )
 GRAPH_CACHE_HITS = Counter("mindai_graph_cache_total", "Попадание в кэш графа", ["result"])
+# Кэш принадлежит процессу. Без этой серии в Prometheus N воркеров выглядят как
+# один сервис с плохим кэшем: сумма попаданий есть, а понять, что холодный снимок
+# графа оплачен N раз, нечем.
+PROCESS_INFO = Gauge(
+    "mindai_process_info",
+    "Процесс, которому принадлежат локальные кэши (structured output, снимок графа)",
+    ["pid"],
+)
+PROCESS_INFO.labels(pid=os.getpid()).set(1)
 CACHE_AGE = Gauge("mindai_full_graph_cache_age_seconds", "Возраст кэша полного графа")
 AGENT_RUN_SLOTS = Gauge(
     "mindai_agent_run_slots",
@@ -396,6 +406,11 @@ class AgentMetricsRegistry:
                 "llm_limit": self._llm_limit,
             }
         return AgentMetricsResponse(
+            process_id=os.getpid(),
+            # Владение кэшем называется, а не выводится из догадки: общий слой
+            # (Redis) для этих кэшей не используется, и при N воркеров холодный
+            # снимок графа оплачивается N раз.
+            cache_scope="process",
             agents=snapshots,
             llm=llm_snapshots,
             total_prompt_tokens=prompt_tokens,

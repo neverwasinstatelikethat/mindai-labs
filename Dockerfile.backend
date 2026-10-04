@@ -20,4 +20,10 @@ USER mindai
 EXPOSE 8000
 HEALTHCHECK --interval=20s --timeout=5s --retries=5 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')"
+# Один воркер — контракт владения кэшем, а не экономия: снимок графа и кэш
+# identical-output живут в процессе (`cache_scope: "process"` в /agents/metrics,
+# серия mindai_process_info{pid}). N воркеров означают N холодных снимков (замер
+# 4 октября: 1531 мс на потолке 600 узлов из 1501) и N копий RAM-каталога корпуса.
+# Общего слоя для этих кэшей не подключено, поэтому менять число воркеров нужно
+# вместе с ним, а не вместо него.
 CMD ["uvicorn", "scientific_tangle.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

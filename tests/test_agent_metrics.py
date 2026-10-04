@@ -458,3 +458,26 @@ async def _postgres_usage_round_trip() -> None:
     summary = next(row for row in rows if row.account_id == account)
     assert (summary.calls, summary.failed_calls) == (2, 1)
     assert summary.total_tokens == 1800
+
+
+def test_metrics_name_the_process_that_owns_the_cache() -> None:
+    """Владение кэшем названо и в снимке, и в серии Prometheus.
+
+    Счётчики Prometheus складываются по всем процессам, поэтому «кэш почти не
+    помогает» может оказаться суммой N холодных воркеров, а не свойством кэша.
+    Пока процесс-владелец не назван, `--workers N` умножает цену снимка графа
+    (1531 мс на потолке среза, замер 4 октября) и RAM-каталог корпуса молча.
+    """
+    import os
+
+    from prometheus_client import generate_latest
+
+    snapshot = AgentMetricsRegistry().snapshot()
+    assert snapshot.process_id == os.getpid()
+    assert snapshot.cache_scope == "process", (
+        "общий слой для этих кэшей не подключен; менять значение можно только вместе с ним"
+    )
+    exposition = generate_latest().decode("utf-8")
+    assert f'mindai_process_info{{pid="{os.getpid()}"}} 1.0' in exposition, (
+        "серия процесса не выставляется: несколько воркеров снова сложатся в один счётчик"
+    )

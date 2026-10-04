@@ -280,6 +280,12 @@ class LlmMetricSnapshot(BaseModel):
 
 class AgentMetricsResponse(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Кэш structured output и снимок графа принадлежат процессу, а не общему
+    # хранилищу. Диагностический снимок обязан называть владельца: при N воркеров
+    # здесь видно N независимых счётчиков попаданий, и «кэш почти не помогает»
+    # перестаёт быть выводом по чужому процессу.
+    process_id: int = Field(default=0, ge=0)
+    cache_scope: Literal["process", "shared"] = "process"
     agents: list[AgentMetricSnapshot]
     llm: list[LlmMetricSnapshot] = Field(default_factory=list)
     total_prompt_tokens: int = Field(default=0, ge=0)
