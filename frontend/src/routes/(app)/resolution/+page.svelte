@@ -97,8 +97,13 @@
   };
 
   const shownRows = $derived(items.slice(0, shown));
+  // Откат — это снятое решение: ребра алиаса в графе нет, строка снова зовёт
+  // «Принять склейку». Считать её рассмотренной значит показывать «нерассмотренных
+  // нет» там, где эксперту прямо сейчас нужно действие.
   const waitingCount = $derived(
-    items.filter((proposal) => proposal.status === 'proposed').length,
+    items.filter(
+      (proposal) => proposal.status === 'proposed' || proposal.status === 'reverted',
+    ).length,
   );
   const left = $derived(total === null ? 0 : Math.max(total - items.length, 0));
   const hasMore = $derived(items.length > 0 && left > 0);
@@ -130,7 +135,7 @@
   /**
    * Набор действий строки. Принятую пару можно только откатить: «отклонить»
    * перевело бы статус, а ребро алиаса осталось бы в графе, и экран показал бы
-   * несвязанную пару там, где связь есть. Отклонённую или отменённую пару можно
+   * несвязанную пару там, где связь есть. Отклонённую или откатанную пару можно
    * принять снова; повтор уже записанного решения не предлагается.
    */
   function actionsFor(proposal: EntityMergeProposal): MergeReviewAction[] {

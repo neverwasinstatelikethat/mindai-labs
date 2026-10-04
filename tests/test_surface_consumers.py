@@ -28,10 +28,19 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
 from scientific_tangle.api.app import app
+from scientific_tangle.domain.contracts import (
+    ConflictReview,
+    EvolutionExperiment,
+    EvolutionProposal,
+    ExpertDecision,
+    ExportFormat,
+    MergeReviewRequest,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_SRC = ROOT / "frontend" / "src"
@@ -242,3 +251,95 @@ def test_routes_really_are_read_from_openapi() -> None:
     ):
         assert reference in paths, f"в OpenAPI нет опорного маршрута {reference}"
     assert len(paths) > 25, f"OpenAPI подозрительно мал: {len(paths)} путей"
+
+
+def _ts_object(text: str, name: str) -> str:
+    """Тело литерала объекта по имени объявления, включая вложенные фигурные скобки."""
+    anchor = text.index(f"const {name}")
+    open_at = text.index("{", anchor)
+    depth, quote = 0, ""
+    for index in range(open_at, len(text)):
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if char in "'\"":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1 : index]
+    raise AssertionError(f"не закрыт литерал {name}")
+
+
+_KEY = re.compile(r"^\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][\w.-]*))\s*:", re.M)
+
+
+def _ts_keys(body: str) -> set[str]:
+    return {next(group for group in match.groups() if group) for match in _KEY.finditer(body)}
+
+
+def test_history_screen_names_every_recorded_decision_verb() -> None:
+    """«Ваши экспертные решения» обязаны называть глагол, а не только «запись успешна».
+
+    Съём экрана 4 октября показал четыре одинаковые строки «Решение по склейке
+    сущностей / успех»: сервис кладёт глагол решения в `metadata` той же записи, а
+    экран его выбрасывал, и эксперт не восстанавливал, что он сделал с парой.
+    Сверка двусторонняя: каждое значение, которое бэкенд правда умеет писать, обязано
+    быть подписано, и ни одной подписи выдуманного значения быть не должно.
+    """
+    terms = (FRONTEND_SRC / "lib" / "terms.ts").read_text(encoding="utf-8")
+    body = _ts_object(terms, "DECISION_DETAILS")
+    details = {
+        action: _ts_keys(inner)
+        for action, inner in re.findall(r"'([\w.]+)':\s*\{([^}]*)\}", body)
+    }
+    # Действие записано в контракте, а глагола у него нет: `proposal.created` и
+    # `claim.superseded` описываются идентификатором и версией, решать там нечего.
+    verbs: dict[str, set[str]] = {
+        "resolution.reviewed": set(
+            get_args(MergeReviewRequest.model_fields["action"].annotation)
+        ),
+        "conflict.reviewed": set(get_args(ConflictReview.model_fields["status"].annotation)),
+        "proposal.reviewed": (
+            set(get_args(EvolutionProposal.model_fields["status"].annotation)) - {"proposed"}
+        )
+        | set(get_args(EvolutionExperiment.model_fields["decision"].annotation)),
+        "answer.exported": set(get_args(ExportFormat)),
+    }
+
+    assert details, "в терминах нет ни одной подписи глагола решения"
+    for action, values in verbs.items():
+        assert values, f"контракт {action} не называет ни одного значения"
+        assert details.get(action) == values, (
+            f"история решений называет {sorted(details.get(action, set()))}, "
+            f"а сервис пишет {sorted(values)}"
+        )
+
+    labelled = _ts_keys(_ts_object(terms, "DECISION_ACTION_LABELS"))
+    actions = set(get_args(ExpertDecision.model_fields["action"].annotation))
+    assert actions - labelled == set(), (
+        f"действие попалось в истории без читаемого имени: {sorted(actions - labelled)}"
+    )
+    assert actions, "контракт ExpertDecision не перечисляет действий"
+
+
+def test_the_verb_check_has_teeth() -> None:
+    """Проверка не должна превратиться в сверку саму с собой.
+
+    Парсер обязан различать ключи без кавычек, с кавычками и с дефисом, видеть второй
+    блок и не проходить на пустом теле. Иначе недостающая подпись стала бы молчанием,
+    а не падением. Ключи читаются с начала строки: таков формат литерала в `terms.ts`.
+    """
+    sample = _ts_object(
+        "const THING = {\n  'a': {\n    accept: 'x',\n    'json-ld': 'y',\n  },\n"
+        "  b: {\n    reject: 'z',\n  },\n};",
+        "THING",
+    )
+    parsed = dict(re.findall(r"'?([\w.]+)'?:\s*\{([^}]*)\}", sample))
+    assert _ts_keys(parsed["a"]) == {"accept", "json-ld"}
+    assert _ts_keys(parsed["b"]) == {"reject"}
+    assert _ts_object("const EMPTY = {};", "EMPTY").strip() == ""

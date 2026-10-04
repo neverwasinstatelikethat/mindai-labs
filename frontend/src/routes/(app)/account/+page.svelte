@@ -25,6 +25,7 @@
     RIGHT_TASK_NOTES,
     USAGE_WINDOW_LABELS,
     USAGE_WINDOW_OPTIONS,
+    decisionDetail,
     journalIncomplete,
     journalLoadMoreOf,
     journalUnloaded,
@@ -1090,12 +1091,16 @@
           <Panel>
             <ul class="journal">
               {#each decisions as entry, i (i)}
+                {@const detail = decisionDetail(entry.action, entry.metadata)}
                 <li class="journal__row">
                   <div class="journal__when">
                     <time datetime={entry.created_at}>{dateTime(entry.created_at)}</time>
                   </div>
                   <div class="journal__what">
                     <p class="small">{decisionName(entry.action)}</p>
+                    {#if detail}
+                      <p class="micro muted">{detail}</p>
+                    {/if}
                   </div>
                   <StatusPill
                     status={outcomeStatus(entry.outcome)}

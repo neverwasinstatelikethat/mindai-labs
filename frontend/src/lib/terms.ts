@@ -2315,7 +2315,9 @@ export const MERGE_STATUS_LABELS: Record<MergeStatus, string> = {
   proposed: 'ждёт решения',
   accepted: 'склейка принята',
   rejected: 'склейка отклонена',
-  reverted: 'склейка отменена',
+  // «Отменена» и «отклонена» различаются одной буквой, а смысл разный: отклонили
+  // предложение, откатили уже записанную склейку. Подпись берёт глагол кнопки.
+  reverted: 'склейка откатана',
 };
 
 // Плашка статуса: тон несёт смысл вместе с подписью и не заменяет её.
@@ -2446,7 +2448,7 @@ export const RESOLUTION_FAILURE = {
  *  приходит с ответом на запись. */
 export function mergeOutcome(status: MergeStatus): string {
   if (status === 'accepted') {
-    return 'Решение записано: пары склеены, левое имя стало алиасом правого в графе.';
+    return 'Решение записано: пара склеена, левое имя стало алиасом правого в графе.';
   }
   if (status === 'rejected') {
     return 'Решение записано: склейка отклонена, узлы графа не менялись.';
@@ -2470,6 +2472,48 @@ export function mergeWaiting(count: number): string {
  *  а списка нет. Это сбой чтения окна, а не «пар нет». */
 export function mergeNotLoadedBody(total: number): string {
   return `По сведениям сервиса, в очереди ${countOf(total, 'пара', 'пары', 'пар')}, но страница пришла пустой. Повторите загрузку.`;
+}
+
+/** Что именно решено, а не только «запись успешна». Глагол решения лежит в
+ *  `metadata` той же записи; без него эксперт видит в истории четыре одинаковых
+ *  строки «Решение по склейке сущностей» и не восстанавливает, что он сделал с
+ *  парой. Значений вне словаря не выдумываем: тогда поясняющей строки нет. */
+const DECISION_DETAILS: Record<string, Record<string, string>> = {
+  'resolution.reviewed': {
+    accept: 'склейка принята',
+    reject: 'склейка отклонена',
+    revert: 'склейка откатана',
+  },
+  'conflict.reviewed': {
+    confirmed: 'расхождение подтверждено',
+    dismissed: 'расхождение отклонено',
+  },
+  'proposal.reviewed': {
+    accepted: 'предложение принято',
+    rejected: 'предложение отклонено',
+    promote: 'кандидат развёрнут по A/B',
+    reject: 'кандидат отклонён по A/B',
+  },
+  'answer.exported': {
+    markdown: 'выгрузка в Markdown',
+    'json-ld': 'выгрузка в JSON-LD',
+    pdf: 'выгрузка в PDF',
+  },
+};
+
+export function decisionDetail(
+  action: string,
+  metadata: Record<string, string | number | boolean>,
+): string | null {
+  const source = DECISION_DETAILS[action];
+  if (!source) return null;
+  // У записей двух проходов `proposal.reviewed` разные носители глагола:
+  // отзыв предложения приходит со `status`, результат A/B — с `decision`.
+  for (const key of ['action', 'decision', 'status', 'format']) {
+    const value = metadata[key];
+    if (typeof value === 'string' && Object.hasOwn(source, value)) return source[value];
+  }
+  return null;
 }
 
 /* ZONE:ER:END */
