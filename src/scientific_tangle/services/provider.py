@@ -55,6 +55,27 @@ class ModelUnavailableError(RuntimeError):
     """LLM недоступен или вернул не-экземпляр схемы после всех попыток."""
 
 
+class ModelBusyError(ModelUnavailableError):
+    """Слоты модели заняты и ожидание исчерпано: отказ повторимый, это 429.
+
+    ``503`` читается как «сервис сломан», а сервис здоров и занят: потолок
+    серверного ожидания (``gigachat_queue_wait_seconds``) уже потрачен, и держать
+    в очереди ещё один запрос нечего. Наследование от ``ModelUnavailableError``
+    сохраняет честную деградацию внутри рабочего процесса: узел, поймавший
+    занятость модели, отдаёт неполный ответ с ``degradation_reasons``, а не
+    теряет накопленные находки.
+    """
+
+    def __init__(
+        self, message: str, *, retry_after: int, active: int, waiting: int, limit: int
+    ) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.active = active
+        self.waiting = waiting
+        self.limit = limit
+
+
 # ── Сокрытие сбоя провайдера в пользовательских текстах ────────────────────────
 
 _HTTP_MEANINGS: dict[int, str] = {
@@ -697,6 +718,28 @@ class GigaChatProvider:
                 **account,  # type: ignore[arg-type]
             )
 
+    async def _acquire_slot(self) -> None:
+        """Занять слот модели не дольше ``gigachat_queue_wait_seconds``.
+
+        Выделено потому, что отказ обязан быть различимым: занятое ожидание —
+        повторяемый сбой (429 с ``Retry-After``), сбой провайдера — нет (503).
+        ``retry_after`` равен потраченному потолку ожидания: раньше слот, как
+        правило, не освобождается, а молча держать запрос во второй очереди
+        нечего.
+        """
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), self._queue_wait_seconds)
+        except TimeoutError:
+            raise ModelBusyError(
+                "GigaChat: сервис занят — все слоты модели заняты, ожидание "
+                f"свободного слота превысило {self._queue_wait_seconds:g} с; "
+                "повторите запрос позже",
+                retry_after=max(1, int(self._queue_wait_seconds)),
+                active=self._in_flight,
+                waiting=self._waiting,
+                limit=self._slots,
+            ) from None
+
     async def _request(
         self, messages: Sequence[Messages], *, max_tokens: int | None = None
     ) -> ChatCompletion:
@@ -726,17 +769,8 @@ class GigaChatProvider:
             # Ожидание ограничено ``gigachat_queue_wait_seconds``: без потолка
             # очередь при ``gigachat_max_concurrent=1`` съедала бы
             # ``agent_deadline_seconds`` молча, и аналитик видел бы медленный
-            # таймаут там, где честный ответ — «сервис занят» (503).
-            try:
-                await asyncio.wait_for(
-                    self._semaphore.acquire(), self._queue_wait_seconds
-                )
-            except TimeoutError:
-                raise ModelUnavailableError(
-                    "GigaChat: сервис занят — все слоты модели заняты, ожидание "
-                    f"свободного слота превысило {self._queue_wait_seconds:g} с; "
-                    "повторите запрос позже"
-                ) from None
+            # таймаут там, где честный ответ — «сервис занят, повторите позже».
+            await self._acquire_slot()
             entered = True
             if will_wait:
                 self._metrics.observe_llm_queue_wait()

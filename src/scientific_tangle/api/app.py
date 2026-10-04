@@ -119,7 +119,11 @@ from scientific_tangle.services.infrastructure import Neo4jElasticsearchKnowledg
 from scientific_tangle.services.ingestion import IngestionService
 from scientific_tangle.services.knowledge import FindingWindow, KnowledgeBase
 from scientific_tangle.services.ontology import OntologyValidationError
-from scientific_tangle.services.provider import ModelUnavailableError, build_provider
+from scientific_tangle.services.provider import (
+    ModelBusyError,
+    ModelUnavailableError,
+    build_provider,
+)
 from scientific_tangle.services.research_intelligence import (
     ResearchIntelligenceService,
     build_research_space,
@@ -1106,6 +1110,30 @@ app.add_middleware(AccessMiddleware)
 @app.exception_handler(ModelUnavailableError)
 async def model_unavailable(_: Request, error: ModelUnavailableError) -> JSONResponse:
     return JSONResponse(status_code=503, content={"detail": str(error)})
+
+
+@app.exception_handler(ModelBusyError)
+async def model_busy(_: Request, error: ModelBusyError) -> JSONResponse:
+    """Модель занята свободными слотами: это 429, а не 503.
+
+    503 обещает, что с сервисом что-то не так, и интерфейс зовёт администратора.
+    Здесь сервис здоров и просто занят до предела, который сервер держал уже
+    ``gigachat_queue_wait_seconds``. Тело повторяет форму отказа приёмной
+    границы (``active`` / ``limit`` / ``retry_after``), поэтому аналитик видит,
+    сколько ответов собирается и через сколько секунд спросить снова, а вопрос
+    его не теряется.
+    """
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": str(error),
+            "active": error.active,
+            "waiting": error.waiting,
+            "limit": error.limit,
+            "retry_after": error.retry_after,
+        },
+        headers={"Retry-After": str(error.retry_after)},
+    )
 
 
 def _validation_field(loc: Sequence[object]) -> str:
