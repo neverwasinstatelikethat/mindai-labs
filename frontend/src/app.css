@@ -2186,3 +2186,17 @@ html.motion-ok .site-foot a {
     animation: none;
   }
 }
+
+
+/* Длинный email в шапке профиля и в карточке доступа: без min-width: 0 flex-ячейка
+   не сжимается, адрес упирался в плашку права и обрезался на середине (390 px:
+   «expert@min»), а прочитать его было нечем — title у строки нет. */
+.account__head .grow,
+.account__id-head .grow {
+  min-width: 0;
+}
+
+.account__head .grow > span {
+  display: block;
+  overflow-wrap: anywhere;
+}
