@@ -114,44 +114,52 @@ def reconcile_gold_cases(
 ) -> GoldCaseReconciliation:
     """Сверяет записи манифеста прелоада с ``REAL_GOLD_CASES``.
 
-    Пара — совпадение заголовка файла корпуса (``Path(path).stem`` ==
-    ``source_documents[0]``) И формулировки вопроса. Всё остальное называется
-    отдельно: источник без пары, кейс без пары и «тот же источник, но другой
-    вопрос» — потому что recall по 10 и по 12 кейсам, да ещё с разными вопросами,
-    это уже разные измерения, а сравнение с одним эталоном CI этого не различает.
+    Источник считается покрытым, если хотя бы один кейс бенчмарка ссылается на
+    его заголовок файла (``Path(path).stem`` == ``source_documents[0]``): второй
+    вопрос к тому же документу — это не сирота. Отдельно называются три разных
+    дефекта: источник манифеста без единого кейса, кейс об источнике, которого в
+    манифесте нет, и «источник покрыт, но вопрос манифеста не задаёт никто» —
+    потому что recall по разным вопросам это уже разные измерения, а сравнение с
+    одним эталоном CI этого не различает.
     """
     cases = list(real if real is not None else REAL_GOLD_CASES)
     manifest_by_source: dict[str, str] = {}
     for item in manifest_items:
         manifest_by_source[Path(str(item["path"])).stem] = str(item["gold_question"])
 
-    paired_sources: set[str] = set()
-    paired_case_ids: set[int] = set()
-    for index, case in enumerate(cases):
+    # Источник вправе нести несколько gold-вопросов: манифест хранит по одному
+    # вопросу на файл корпуса, бенчмарк добавляет к тому же документу вторую
+    # формулировку. Парит 1:1 по точной формулировке такой кейс становился
+    # «сиротой без пары в манифесте», а тот же файл — «источником, не покрытым
+    # кейсом»: две противоположные диагностики об одном и том же документе.
+    queries_by_source: dict[str, list[str]] = {}
+    for case in cases:
         source = case.source_documents[0] if case.source_documents else ""
-        question = manifest_by_source.get(source)
-        if question is not None and _normalize_question(question) == _normalize_question(
-            case.query
-        ):
-            paired_sources.add(source)
-            paired_case_ids.add(index)
+        queries_by_source.setdefault(source, []).append(case.query)
 
-    matched: list[str] = [
-        source for source in manifest_by_source if source in paired_sources
-    ]
+    matched: list[str] = [source for source in manifest_by_source if source in queries_by_source]
     manifest_only: list[str] = [
-        source for source in manifest_by_source if source not in paired_sources
+        source for source in manifest_by_source if source not in queries_by_source
     ]
-    question_mismatches: list[str] = []
-    for source in manifest_only:
-        for case in cases:
-            if case.source_documents and case.source_documents[0] == source:
-                question_mismatches.append(
-                    f"{source}: манифест — «{manifest_by_source[source]}», "
-                    f"бенчмарк — «{case.query}»"
-                )
+    # Сиротой считается кейс, источника которого в манифесте нет вовсе: такой
+    # замер невыполним на этом корпусе, и это надо видеть.
     benchmark_only: list[str] = [
-        case.query for index, case in enumerate(cases) if index not in paired_case_ids
+        query
+        for source, queries in queries_by_source.items()
+        if source not in manifest_by_source
+        for query in queries
+    ]
+    # Разная формулировка — расхождение только тогда, когда ни один вопрос
+    # бенчмарка не совпадает с вопросом манифеста: иначе оба набора измеряют
+    # один и тот же ответ, просто у бенчмарка есть дополнительные вопросы.
+    question_mismatches: list[str] = [
+        f"{source}: манифест — «{manifest_by_source[source]}», "
+        f"бенчмарк — «{queries_by_source[source][0]}»"
+        for source in matched
+        if not any(
+            _normalize_question(query) == _normalize_question(manifest_by_source[source])
+            for query in queries_by_source[source]
+        )
     ]
 
     return GoldCaseReconciliation(

@@ -578,14 +578,41 @@ def test_reconcile_gold_cases_names_divergence() -> None:
     ]
 
     report = reconcile_gold_cases(manifest, real)
-    assert report.matched == 1
+    # Оба источника манифеста покрыты кейсами, поэтому matched — про источники,
+    # а не про пары «файл + точная формулировка».
+    assert report.matched == 2
     assert report.manifest_total == 2
     assert report.benchmark_total == 3
     assert report.balanced is False
     assert "Обеднение_шлаков" in report.matched_sources
-    assert "Очистка от Fe 2020" in report.manifest_only
+    assert report.manifest_only == (), "источник с другим вопросом всё ещё покрыт"
     assert "Новый вопрос?" in report.benchmark_only
     assert any("Очистка от Fe 2020" in line for line in report.describe())
+
+
+def test_second_question_to_same_source_is_not_an_orphan() -> None:
+    """Вопросов у файла может быть больше одного — сверка не должна это штрафовать.
+
+    Манифест хранит по одному вопросу на документ, бенчмарк задаёт к тому же
+    файлу второй. Прежняя паровка 1:1 по формулировке выдавала за это сразу две
+    противоположные диагностики: «источник не покрыт» и «кейс без пары в
+    манифесте». Проверка держит контракт: покрыт — значит покрыт, а лишние
+    вопросы видны по числам, не по ложным сиротам.
+    """
+    manifest = [{"path": "Обзоры/A.docx", "gold_question": "Вопрос манифеста?"}]
+    real = [
+        RealGoldCase(query="Вопрос манифеста?", source_documents=["A"], category="c"),
+        RealGoldCase(query="Второй вопрос к A?", source_documents=["A"], category="c"),
+    ]
+
+    report = reconcile_gold_cases(manifest, real)
+
+    assert report.matched == 1
+    assert report.manifest_only == ()
+    assert report.benchmark_only == ()
+    assert report.question_mismatches == ()
+    assert report.balanced is True
+    assert report.benchmark_total == 2, "числа всё равно показывают два вопроса"
 
 
 def test_reconcile_gold_cases_accepts_equal_sets() -> None:
@@ -612,10 +639,14 @@ def test_real_gold_cases_diverge_from_manifest_and_say_so() -> None:
 
     assert report.manifest_total == len(EvaluationHarness.gold_cases()) == 10
     assert report.benchmark_total == len(REAL_GOLD_CASES) == 12
-    # Известное расхождение: два «дополнительных» кейса бенчмарка поверх манифеста
-    # и другой вопрос у хлорного выщелачивания.
+    # Известное расхождение одно: у хлорного выщелачивания бенчмарк спрашивает
+    # «…никеля?», а манифест — без уточнения. Два «лишних» кейса при этом
+    # задают вторые вопросы к уже покрытым файлам, а не висят сиротами.
+    assert report.matched == 10
+    assert report.manifest_only == ()
+    assert report.benchmark_only == ()
     assert report.balanced is False
-    assert len(report.benchmark_only) == report.benchmark_total - report.matched
+    assert len(report.question_mismatches) == 1
     assert any("хлорного выщелачивания" in line for line in report.describe())
     # Каждый заголовок бенчмарка обязан существовать в манифесте: новый источник без
     # файла корпуса — это не gold-кейс, а невыполнимое измерение.
