@@ -1556,38 +1556,66 @@ class Neo4jElasticsearchKnowledgeBase:
         return snapshot
 
     def _load_graph_from_neo4j(self) -> GraphSnapshot:
+        # Срез обязана быть backbone'ом, а не алфавитным префиксом. До этой правки
+        # узлы резались `ORDER BY label`, а рёбра — независимо, по `rel.id`: на
+        # живом замере (1501 узел) пересечение двух посторонних срезов оставляло
+        # обходу 120 узлов из 600, и в снимке доживали до сообщества только те
+        # сущности, чьи имена случайно оказались в начале алфавита и чьи рёбра
+        # попали в начало списка. Теперь узлы берутся по убывающей степени
+        # связности, а рёбра читаются только между уже выбранными узлами:
+        # снимок становится настоящим подграфом, а не пересечением двух лимитов.
         with self._driver.session() as session:
             node_record = session.run(
                 """
                 MATCH (node:Entity)
                 WHERE node.type <> 'chunk'
-                WITH node
-                ORDER BY coalesce(node.label, node.id), node.id
+                WITH node, COUNT { (node)--() } AS degree
+                ORDER BY degree DESC, coalesce(node.label, node.id), node.id
                 WITH collect(properties(node)) AS nodes, count(node) AS total
                 RETURN nodes[0..$limit] AS nodes, total
                 """,
                 limit=GRAPH_NODE_LIMIT,
             ).single()
             total = int((node_record["total"] if node_record else 0) or 0)
-            edge_record = session.run(
+            raw_nodes = (node_record["nodes"] if node_record else []) or []
+            selected = [
+                node["id"] for node in raw_nodes if isinstance(node.get("id"), str)
+            ]
+            edge_record = (
+                session.run(
+                    """
+                    UNWIND $ids AS id
+                    MATCH (a:Entity {id: id})-[rel]->(b:Entity)
+                    WHERE a.type <> 'chunk' AND b.type <> 'chunk'
+                      AND type(rel) <> 'HAS_CHUNK' AND b.id IN $ids
+                    WITH a, rel, b
+                    ORDER BY rel.id, a.id, b.id
+                    WITH collect(DISTINCT {
+                        id: rel.id, source: a.id, target: b.id,
+                        relation: type(rel), confidence: rel.confidence,
+                        data_class: coalesce(rel.data_class, 'public')
+                    }) AS edges, count(*) AS shown
+                    RETURN edges[0..$limit] AS edges, shown
+                    """,
+                    ids=selected,
+                    limit=GRAPH_EDGE_LIMIT,
+                ).single()
+                if selected
+                else None
+            )
+            # Полное число рёбёр корпуса считается отдельно: ограничение сверху
+            # (показано, всего) обязано называть весь корпус, а не подграф среза,
+            # иначе «3000 из 3000» читалось бы как «потолка не было».
+            edges_total_record = session.run(
                 """
                 MATCH (a:Entity)-[rel]->(b:Entity)
                 WHERE a.type <> 'chunk' AND b.type <> 'chunk' AND type(rel) <> 'HAS_CHUNK'
-                WITH a, rel, b
-                ORDER BY rel.id, a.id, b.id
-                WITH collect(DISTINCT {
-                    id: rel.id, source: a.id, target: b.id,
-                    relation: type(rel), confidence: rel.confidence,
-                    data_class: coalesce(rel.data_class, 'public')
-                })[0..$limit] AS edges, count(*) AS total
-                RETURN edges, total
-                """,
-                limit=GRAPH_EDGE_LIMIT,
+                RETURN count(rel) AS total
+                """
             ).single()
 
-        raw_nodes = (node_record["nodes"] if node_record else []) or []
         raw_edges = (edge_record["edges"] if edge_record else []) or []
-        edges_total = _record_int(edge_record, "total")
+        edges_total = _record_int(edges_total_record, "total")
         nodes = [node for item in raw_nodes if (node := _parse_node(item)) is not None]
         edges = [edge for item in raw_edges if (edge := _parse_edge(item)) is not None]
         # Потолки GRAPH_NODE_LIMIT и GRAPH_EDGE_LIMIT — не молчаливая потеря: пара
@@ -1604,10 +1632,11 @@ class Neo4jElasticsearchKnowledgeBase:
             if node.id in connected or node.metadata.get("domain") or node.id.startswith("dom-")
         ]
         # Раскрытие называет то число узлов, на котором действительно считаются
-        # сообщества и обход. Потолок среза (600) — ещё не видимый корпус: фильтр
-        # связности выбрасывает из него несвязанные узлы, и на живом замере
-        # (1501 узел, срез 600) обходу оставалось 120. Числиться 600 — значит
-        # недооценить потерю ровно в тот момент, когда её надо назвать.
+        # сообщества и обход: потолок среза (600) — ещё не видимый корпус, потому
+        # что фильтр связности выбрасывает из него узлы без рёбер внутри среза.
+        # Числиться 600 значило бы недооценить потерю ровно в тот момент, когда
+        # её надо назвать; на старом алфавитном порядке эта же потеря и была
+        # причиной 120 узлов вместо 600 на замере 2 октября.
         with self._lock:
             self._graph_window = (len(keep), max(total, len(keep)))
             self._graph_edge_window = (len(edges), max(edges_total, len(edges)))

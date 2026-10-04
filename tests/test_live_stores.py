@@ -181,3 +181,23 @@ def test_corpus_stats_come_from_the_same_graph_as_the_snapshot(knowledge) -> Non
     assert stats.claims == claims
     assert stats.documents == publications
     assert stats.semantic_documents <= stats.documents
+
+
+def test_graph_snapshot_is_a_subgraph_not_a_pair_of_unrelated_slices(knowledge) -> None:
+    """Снимок полного графа обязан быть подграфом: рёбра только между показанными узлами.
+
+    Пока узлы резались по алфавиту метки, а рёбра независимо по `rel.id`, два лимита
+    пересекались случайно, и обходу доставалось 120 узлов из 600 (замер 2 октября на
+    1501 узле). Алфавитный префикс к тому же смещал витрину к одной области: имена не
+    из начала алфавита в снимок не попадали, даже будучи центрами связей.
+    """
+    graph = knowledge.full_graph(ALL_CLASSES)
+    ids = {node.id for node in graph.nodes}
+    for edge in graph.edges:
+        assert edge.source in ids and edge.target in ids, (
+            f"ребро {edge.relation} ведёт на узел вне среза: снимок не подграф"
+        )
+    connected = {edge.source for edge in graph.edges} | {edge.target for edge in graph.edges}
+    assert connected, "в непустом корпусе не одной связи — срез сломан"
+    # Порядок отсечения: снимок держит связное ядро, а не набор имён.
+    assert len(graph.communities) <= len(graph.nodes)
