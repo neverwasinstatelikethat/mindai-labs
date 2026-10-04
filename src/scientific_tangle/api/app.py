@@ -2392,13 +2392,19 @@ async def run_evolution_experiment(
     proposal_id: UUID,
     request: Request,
     account: CurrentAccount,
-    max_cases: Annotated[int, Query(ge=1, le=3)] = 1,
+    max_cases: Annotated[int, Query(ge=1, le=10)] = MIN_AB_CASES,
     _: None = Depends(require_permission("proposal:review")),
 ) -> EvolutionExperiment:
     """A/B-прогон: один эксперимент — одна сборка кандидата, результат в серверном состоянии.
 
     Право ``proposal:review``, а не ``evaluation:view``: запуск меняет активную
     политику агента после промоушена, и это экспертное действие, а не чтение метрик.
+
+    Размер выборки по умолчанию равен ``MIN_AB_CASES``: A/B платит двумя агентными
+    прогонами на кейс, и прежний потолок `le=3` делал различающий замер
+    недостижимым, то есть ворота принимали только равенство на одном кейсе.
+    Явный `max_cases` ниже порога разрешён — прогон состоится и честно скажет
+    «выборка мала», а не схлопнется в 422 над интерфейсом.
     """
     deps = dependencies(request)
     # Тот же потолок ленты, что у ``/proposals``: предложение, видимое в очереди,

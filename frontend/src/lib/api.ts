@@ -239,8 +239,10 @@ export const api = {
     requestWithTotal<EvolutionExperiment[]>(
       `/api/v1/experiments?limit=${limit}&offset=${offset}`,
     ),
+  // Выборку A/B задаёт сервер (MIN_AB_CASES): один кейс не различает варианты, а
+  // решение о смене политики агента принимается именно по этому прогону.
   runExperiment: (proposalId: string) =>
-    request<EvolutionExperiment>(`/api/v1/proposals/${proposalId}/experiment?max_cases=1`, {
+    request<EvolutionExperiment>(`/api/v1/proposals/${proposalId}/experiment`, {
       method: 'POST',
     }),
   review: (proposalId: string, accepted: boolean) =>
