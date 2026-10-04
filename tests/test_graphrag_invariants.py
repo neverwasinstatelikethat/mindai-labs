@@ -1081,3 +1081,29 @@ def test_domain_seed_stats_report_actual_writes() -> None:
         "edges_created": 0,
         "claims_created": 0,
     }
+
+def test_graph_snapshot_slices_by_connectivity_not_by_alphabet() -> None:
+    """Полный снимок режется по степени связности, а рёбра берутся внутри среза.
+
+    Живой прогон на Neo4j скажет числа, но порядок отсечения можно потерять и без
+    базы: правка, вернувшая `ORDER BY label`, молча прошла бы все тесты на
+    in-memory контуре, а витрина снова начала бы показывать алфавитный префикс
+    корпуса (120 узлов из 600 на замере 2 октября). Поэтому форма запроса
+    проверяется по исходнику.
+    """
+    from inspect import getsource
+
+    from scientific_tangle.services.infrastructure import Neo4jElasticsearchKnowledgeBase
+
+    source = " ".join(getsource(Neo4jElasticsearchKnowledgeBase._load_graph_from_neo4j).split())
+    assert "ORDER BY degree DESC, coalesce(node.label, node.id), node.id" in source, (
+        "узы среза снова идут по алфавиту метки: снимок смещён к началу алфавита"
+    )
+    assert "COUNT { (node)--() } AS degree" in source, "степень узла больше не считается"
+    assert "UNWIND $ids AS id" in source and "b.id IN $ids" in source, (
+        "рёбра снова читаются независимо от выбранного набора узлов: снимок "
+        "перестаёт быть подграфом"
+    )
+    # Потолок и полный счётчик — разные числа: раскрытие обязано называть корпус.
+    assert 'count(rel) AS total' in source, "полное число рёбер корпуса больше не считается"
+    assert "edges_total = _record_int(edges_total_record" in source
