@@ -1036,10 +1036,18 @@ class Neo4jElasticsearchKnowledgeBase:
         """
         depth = min(max(retrieval_plan.max_hops, 1), 4)
         classes = _class_values(allowed_data_classes)
-        entities = [name for name in retrieval_plan.entity_names if name.strip()] or [
-            retrieval_plan.lexical_query
-        ]
+        planned = [name for name in retrieval_plan.entity_names if name.strip()]
+        entities = planned or [retrieval_plan.lexical_query]
         notes: list[str] = []
+        if not planned:
+            # Приёмка 4 октября на живом GigaChat: из четырёх вопросов план не назвал
+            # сущностей ни в одном, и обход держался только на формулировке. Путь
+            # рабочий, но он обязан быть назван: «граф по якорям плана» и «граф по
+            # тексту вопроса» — разное доверие к ответу, а не два
+            # способа одного и того же запроса.
+            notes.append(
+                "Якоря обхода взяты из формулировки вопроса: план не назвал сущностей."
+            )
         visited: dict[str, GraphNode] = {}
         with self._driver.session() as session:
             # Первая ветка — точное совпадение метки (seek по индексу `label`),
@@ -1057,6 +1065,15 @@ class Neo4jElasticsearchKnowledgeBase:
                 if node is not None:
                     visited[node.id] = node
             exact_matched = _record_int(exact, "matched")
+            if planned and exact_matched == 0:
+                # Имена план назвал, но ни одно не совпало с меткой: покрытие обхода
+                # держится на подстроке и на формулировке, и это тот случай, где
+                # «id узлов в плане» ничего бы не спасло (замер 4 октября: 1 имя из
+                # 4 вопросов, совпадений 0).
+                notes.append(
+                    "Ни одно имя из плана не совпало с меткой графа: "
+                    "якоря добираются подстрокой и формулировкой вопроса."
+                )
             if len(visited) < MAX_ANCHORS:
                 record = session.run(
                     ANCHORS_CYPHER,

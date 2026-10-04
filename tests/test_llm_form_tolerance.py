@@ -362,3 +362,24 @@ def test_critique_keeps_its_verdict_strict_but_not_its_lists() -> None:
     assert critique.absent_list_sections() == {"revision_instructions"}
     with pytest.raises(ValidationError, match="approved"):
         CritiqueResult.model_validate({"issues": []})
+
+
+def test_planner_zero_year_and_zero_hops_are_absent_values_not_errors() -> None:
+    """`year_from: 0` у плана — это «фильтра нет», а не испорченный год.
+
+    Приёмка 4 октября на живом GigaChat: модель возвращала нули, `ge=1800`
+   читало это как ошибку схемы, ремонт вывода повторял то же, и агентный запрос
+    умирал на `ModelUnavailableError` до всякого retrieval. Настояще чужой
+    год (1700) обязан оставаться ошибкой: иначе план начал бы молча
+    переписывать временной фильтр.
+    """
+    from scientific_tangle.domain.models import QueryPlan
+
+    plan = QueryPlan.model_validate(
+        {"question": "сравнение технологий", "year_from": 0, "year_to": "-1", "max_hops": 0}
+    )
+    assert plan.year_from is None and plan.year_to is None
+    assert plan.max_hops == 3, "нулевая глубина обязана вернуться к default, а не к 1"
+
+    with pytest.raises(ValidationError):
+        QueryPlan.model_validate({"question": "сравнение технологий", "year_from": 1700})

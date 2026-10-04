@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class EvidenceLocator(BaseModel):
@@ -95,6 +95,11 @@ class NumericFilter(BaseModel):
         return self
 
 
+# Глубина обхода по умолчанию: 0 от модели читается как «не указано»,
+# и это же значение стоит как default поля.
+_DEFAULT_MAX_HOPS = 3
+
+
 class QueryPlan(BaseModel):
     question: str = Field(min_length=3)
     # Язык плана — факт входящего запроса, а не вывод модели: planning_agent
@@ -107,7 +112,25 @@ class QueryPlan(BaseModel):
     countries: list[str] = Field(default_factory=list)
     year_from: int | None = Field(default=None, ge=1800, le=2100)
     year_to: int | None = Field(default=None, ge=1800, le=2100)
-    max_hops: int = Field(default=3, ge=1, le=4)
+    max_hops: int = Field(default=_DEFAULT_MAX_HOPS, ge=1, le=4)
+
+    @field_validator("year_from", "year_to", mode="before")
+    @classmethod
+    def _absent_year_is_no_filter(cls, value: object) -> object:
+        """Нулевой год у модели означает «фильтра нет», а не «год 0».
+
+        Приёмка 4 октября на живом GigaChat: план приходил с `year_from: 0`,
+        `ge=1800` читал это как испорченный год, ремонт вывода не помогал
+        (модель повторяла то же), и весь агентный запрос умирал с
+        `ModelUnavailableError`. Настояще негодное значение (1700) по-прежнему
+        остаётся ошибкой: терпимость касается только явных пустых маркеров.
+        """
+        return None if value in (0, -1, "0", "-1") else value
+
+    @field_validator("max_hops", mode="before")
+    @classmethod
+    def _zero_hops_is_default(cls, value: object) -> object:
+        return _DEFAULT_MAX_HOPS if value in (0, "0", None, "") else value
 
     @model_validator(mode="after")
     def validate_years(self) -> QueryPlan:
