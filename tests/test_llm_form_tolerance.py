@@ -383,3 +383,31 @@ def test_planner_zero_year_and_zero_hops_are_absent_values_not_errors() -> None:
 
     with pytest.raises(ValidationError):
         QueryPlan.model_validate({"question": "сравнение технологий", "year_from": 1700})
+
+
+def test_absence_literal_is_not_promoted_into_a_list_item() -> None:
+    """Модель пишет `null` вместо `[]` — это отсутствие данных, не пункт.
+
+    Прежний привод превращал этот отказ в элемент списка: в ответ попадала
+    «находка» со значением «null», то есть вакуум становился содержательным
+    утверждением. Целое предложение при этом остаётся пунктом — вывод
+    «противоречий нет» терять нельзя, он и есть ответ.
+    """
+    from pydantic import Field
+
+    from scientific_tangle.domain.contracts import LlmForm, _as_sequence
+
+    class _Form(LlmForm):
+        conflicts: list[str] = Field(default_factory=list)
+
+    for literal in ("null", "None", "NIL", ""):
+        assert _as_sequence(literal) == [], literal
+        assert _Form.model_validate({"conflicts": literal}).conflicts == [], literal
+
+    # Высказывание модели пунктом остаётся: «нет» и прочерк — это ответ, а не
+    # способ записать пустоту (тот же контракт держат тесты выше).
+    assert _Form.model_validate({"conflicts": "противоречий нет"}).conflicts == [
+        "противоречий нет"
+    ]
+    assert _Form.model_validate({"conflicts": "нет"}).conflicts == ["нет"]
+    assert _Form.model_validate({"conflicts": "-"}).conflicts == ["-"]

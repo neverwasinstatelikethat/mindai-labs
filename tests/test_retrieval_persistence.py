@@ -1059,7 +1059,12 @@ def test_anchor_lookup_prefers_indexed_exact_label(monkeypatch: pytest.MonkeyPat
     substring = harness.driver.issued_containing("toLower(anchor.label) CONTAINS")
     assert exact and len(nodes.nodes) == 5
     assert substring == [], "поиск подстрокой не нужен, когда точных якорей хватило до потолка"
-    assert notes == []
+    # План не назвал сущностей, поэтому обход стартует от формулировки вопроса, и
+    # происхождение якорей называется вслух даже здесь: читатель ответа обязан
+    # отличать «сущности из графа» от «якорь = текст вопроса».
+    assert notes == [
+        "Якоря обхода взяты из формулировки вопроса: план не назвал сущностей."
+    ]
 
 
 def test_anchor_truncation_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
