@@ -736,7 +736,12 @@ def evaluate_acceptance(
 
 
 def acceptance_passed(criteria: dict[str, dict[str, Any]]) -> bool:
-    return all(item["passed"] for item in criteria.values() if item.get("checked", True))
+    checked = [item for item in criteria.values() if item.get("checked", True)]
+    # Прогон, в котором не проверено ничего, не может быть «принят»: пустой
+    # список даёт истинное `all`, и такой итог ещё и пишет эталон (флаг
+    # `--write-baseline` срабатывает только на принятом прогоне). Отличие
+    # «не измеряли» от «провалили» здесь и теряется.
+    return bool(checked) and all(item["passed"] for item in checked)
 
 
 def load_baseline(path: Path) -> dict[str, Any]:

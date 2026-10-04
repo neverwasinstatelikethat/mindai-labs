@@ -691,6 +691,24 @@ def test_baseline_writer_output_passes_the_ci_gate(tmp_path: Path) -> None:
     assert compare_with_baseline({"hybrid_new": 0.9}, {"headline": {"hybrid_old": 0.9}}, 0.05, {})
 
 
+def test_run_with_nothing_checked_is_not_accepted() -> None:
+    """Ноль проверенных критериев — это «не измеряли», а не «приёмка подтверждена».
+
+    Итог принимает `all()` по проверенным критериям, а на пустом списке `all()`
+    истинен: прогон без единой проверки получил бы статус принятого и был записан
+    эталоном, после чего все последующие сравнения шли бы против него.
+    """
+    from scientific_tangle.evaluation.run_benchmark import acceptance_passed
+
+    unchecked = {"recall": {"passed": True, "checked": False}}
+    assert acceptance_passed(unchecked) is False
+    assert acceptance_passed({}) is False
+    assert acceptance_passed({"p95": {"passed": True, "checked": False}}) is False
+    # Один проверенный критерий возвращает смысл: он и есть измерение.
+    assert acceptance_passed({"p95": {"passed": True, "checked": True}}) is True
+    assert acceptance_passed({"p95": {"passed": False, "checked": True}}) is False
+
+
 def test_real_gold_cases_diverge_from_manifest_and_say_so() -> None:
     """Актуальное расхождение двух носителей зафиксировано тестом, а не забыто.
 
