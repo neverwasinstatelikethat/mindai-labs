@@ -218,6 +218,9 @@ METRICS_UNAUTHENTICATED_DETAIL = (
     "Для чтения метрик нужен заголовок Authorization: Bearer <METRICS_TOKEN>"
 )
 STATE_CHANGING_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
+# Минимальная различающая выборка A/B: ниже неё решение о смене промпта не имеет
+# доказательственной силы (на одном кейсе делья pass_rate равна -1, 0 или +1).
+MIN_AB_CASES = 5
 # pydantic описывает отказ схемы типом ошибки и значением, присланным клиентом.
 # Значение (``input``, ``ctx``) наружу не уходит: в него попадает весь текст
 # restricted-документа, который 422 отдавал бы обратно в браузере и в чужих
@@ -2427,20 +2430,41 @@ async def run_evolution_experiment(
     passed_baseline = {result.case_id for result in baseline_results if result.passed}
     passed_candidate = {result.case_id for result in candidate_results if result.passed}
     regressions = sorted(passed_baseline - passed_candidate)
+    # A/B обязан РАЗЛИЧИТЬ варианты. Прежние критерии («нет падений» и «не хуже»)
+    # на дефолтном `max_cases=1` давали promote при одном совпавшем кейсе: два
+    # одинаковых нуля на незасеянном корпусе тоже проходят по всем строкам. Итог
+    # попадал в `nk_experiments`, а `_ab_gate_passed` читает ровно эту запись, то
+    # есть эксперт принимал правку промпта по замеру, который ничего не измерил.
+    newly_passed = sorted(passed_candidate - passed_baseline)
+    sample_too_small = len(cases) < MIN_AB_CASES
+    undiscriminated = not newly_passed and not regressions
     promote = (
-        not regressions
+        not sample_too_small
+        and not regressions
+        and not undiscriminated
         and candidate.pass_rate >= baseline.pass_rate
         and candidate.source_recall >= baseline.source_recall
         and candidate.citation_coverage >= baseline.citation_coverage
         and candidate.average_latency_ms <= baseline.average_latency_ms * 1.25
     )
+    reasons: list[str] = list(regressions)
+    if sample_too_small:
+        reasons.append(
+            f"выборка {len(cases)} кейс(ов): нужно не меньше {MIN_AB_CASES} — "
+            "на одном кейсе делья физически равна -1, 0 или +1"
+        )
+    if undiscriminated and not sample_too_small:
+        reasons.append(
+            "ни один кейс не стал проходить лучше: равенство метрик — это не "
+            "подтверждённое улучшение, а отсутствие различия"
+        )
     experiment = EvolutionExperiment(
         proposal_id=proposal_id,
         cases=len(cases),
         baseline=baseline,
         candidate=candidate,
         delta_pass_rate=round(candidate.pass_rate - baseline.pass_rate, 3),
-        regressions=regressions,
+        regressions=reasons,
         decision="promote" if promote else "reject",
     )
     async with _storage_or_unavailable(request, "Результат A/B"):
