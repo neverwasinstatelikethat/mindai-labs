@@ -34,6 +34,11 @@ TEXT_GLOBS = (
     "*.yaml",
     "*.yml",
     "*.md",
+    # Проза ревью и гайдлайнов пачкается иероглификой чаще кода: за вечер она
+    # осела в четырёх абзацах, и ни один из них не был под проверкой. В CI этих
+    # каталогов может не быть — шаблон тогда просто ничего не находит.
+    "docs/**/*.md",
+    ".agents/**/*.md",
 )
 
 # Границы задаются кодовыми точками, а не символами: иначе файл с этим правилом
@@ -94,5 +99,6 @@ def test_glob_actually_covers_the_known_text_files() -> None:
         "src/scientific_tangle/services/graph_rebuilder.py",
         "frontend/src/lib/terms.ts",
         "ops/grafana/dashboards/agent-quality.json",
+        "docs/requirements.md",
     ):
         assert reference in covered, f"{reference} не попадает под проверку"
