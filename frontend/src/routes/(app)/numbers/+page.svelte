@@ -11,7 +11,6 @@
    */
   import { browser } from '$app/environment';
   import { page } from '$app/state';
-  import { tick } from 'svelte';
   import { api } from '$lib/api';
   import { countOf, num } from '$lib/format';
   import {
@@ -106,6 +105,11 @@
     { id: 'disputed', label: 'Где источники спорят', lead: DIVERGENCE_VIEW.lead },
     { id: 'gaps', label: 'Где источники молчат', lead: GAPS_VIEW.lead },
   ];
+  const FACET_NOTES: Record<Facet, string> = {
+    topics: 'Сравнить значения и условия в материалах.',
+    disputed: 'Увидеть, где источники дают разные результаты.',
+    gaps: 'Найти, каких данных не хватает для сравнения.',
+  };
 
   /** Подпись сверки с пределом: «нечем сверить» не выдаётся за «в пределе». */
   const LIMIT_LABEL: Record<LimitCheck, string> = {
@@ -149,7 +153,6 @@
   let trace = $state<{ finding: FindingListItem; point: ValuePoint } | null>(null);
   let verdict = $state<{ subject: string; note: string; findingId: string | null } | null>(null);
 
-  let seg = $state<HTMLDivElement | undefined>();
 
   const canRead = $derived(session.can('knowledge:read'));
   const canQueue = $derived(session.can('proposal:review'));
@@ -279,25 +282,8 @@
     }
   }
 
-  function placeIndicator(): void {
-    if (!browser || !seg) return;
-    const active = seg.querySelector<HTMLElement>('[aria-current="true"]');
-    if (!active) {
-      seg.style.setProperty('--ind-o', '0');
-      return;
-    }
-    const box = active.getBoundingClientRect();
-    const host = seg.getBoundingClientRect();
-    seg.style.setProperty('--ind-x', `${box.left - host.left + seg.scrollLeft}px`);
-    seg.style.setProperty('--ind-y', `${box.top - host.top}px`);
-    seg.style.setProperty('--ind-w', `${box.width}px`);
-    seg.style.setProperty('--ind-h', `${box.height}px`);
-    seg.style.setProperty('--ind-o', '1');
-  }
-
   function chooseFacet(next: Facet): void {
     facet = next;
-    void tick().then(placeIndicator);
   }
 
   function toggleGroup(id: string): void {
@@ -399,13 +385,6 @@
     void loadCorpus();
   });
 
-  $effect(() => {
-    const current = facet;
-    if (!browser) return;
-    void tick().then(() => {
-      if (current === facet) placeIndicator();
-    });
-  });
 </script>
 
 <svelte:head>
@@ -413,24 +392,25 @@
 </svelte:head>
 
 <div class="page numbers">
-  <!-- На поверхности экрана остаётся одна фраза фасета. Методика размаха,
-       несопоставимости и порядка отбора переехала к тому, что объясняет: в
-       строку размаха, в признак несопоставимости и к порядку отбора. -->
-  <SectionHead level="1" title={navLabel('/numbers')} lead={activeLead} />
+  <header class="numbers__masthead">
+    <SectionHead level="1" title={navLabel('/numbers')} lead={activeLead} />
+    <p class="numbers__masthead-note">Проверяйте не только сами значения, но и условия, источники и пробелы в данных.</p>
+  </header>
 
-  <div class="seg numbers__seg" bind:this={seg} role="group" aria-label="Что показывать в разделе">
-    <span class="seg__ind" aria-hidden="true"></span>
+  <nav class="numbers__facets" aria-label="Виды сигналов">
     {#each FACETS as item (item.id)}
       <button
         type="button"
-        class="seg__item"
-        aria-current={facet === item.id ? 'true' : undefined}
+        class={`numbers__facet numbers__facet--${item.id} ${facet === item.id ? 'numbers__facet--active' : ''}`}
+        aria-current={facet === item.id ? 'page' : undefined}
+        aria-pressed={facet === item.id}
         onclick={() => chooseFacet(item.id)}
       >
-        {item.label}
+        <span class="numbers__facet-title">{item.label}</span>
+        <span class="numbers__facet-note">{FACET_NOTES[item.id]}</span>
       </button>
     {/each}
-  </div>
+  </nav>
 
   {#if loading}
     <p class="small muted" role="status">{DIVERGENCE_VIEW.loading}</p>
@@ -889,29 +869,81 @@
     min-block-size: 32px;
   }
 
-  /* Полоса фасетов на узком экране переносится целиком: третий фасет обязан
-     быть прочитан, а не обрезан краем. Если переносить нечего и полоса всё же
-     шире своей области — она прокручивается с видимой полосой прокрутки. */
-  .numbers__seg {
-    overflow-x: auto;
-    flex-wrap: wrap;
-    scrollbar-width: thin;
-    scrollbar-color: var(--ink-4) var(--surface-sunk);
+  .numbers__masthead {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(16rem, 0.85fr);
+    align-items: end;
+    gap: var(--s5);
+    padding: var(--s5) var(--s6);
+    border-radius: var(--r-lg);
+    background: var(--peach-wash);
   }
 
-  /* app.css красит выбранный пункт только по aria-current="page", а фасеты
-     помечены aria-current="true". Выбранное состояние держит пилюля самого
-     пункта: общий индикатор полосы после переноса строки замирает на прежней
-     координате и выбранное состояние читается сдвигом. */
-  .numbers__seg .seg__ind {
-    display: none;
+  .numbers__masthead :global(.section-head) {
+    align-items: flex-start;
   }
 
-  .numbers__seg .seg__item[aria-current='true'] {
-    background: var(--surface);
-    box-shadow: var(--shadow-soft);
-    color: var(--ink);
+  .numbers__masthead-note {
+    max-width: 40ch;
+    margin: 0 0 var(--s1);
+    color: var(--ink-2);
+    font-size: var(--t-lead);
+    line-height: var(--lh-body);
+    text-wrap: pretty;
+  }
+
+  .numbers__facets {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    overflow: hidden;
+    border-radius: var(--r-md);
+    background: var(--surface-sunk);
+  }
+
+  .numbers__facet {
+    display: grid;
+    align-content: space-between;
+    gap: var(--s3);
+    min-height: 104px;
+    padding: var(--s4) var(--s5);
+    border: 0;
+    border-radius: 0;
+    color: var(--ink-2);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    transition: background-color var(--dur-fast) var(--ease-soft), color var(--dur-fast) var(--ease-soft);
+  }
+
+  .numbers__facet + .numbers__facet {
+    border-inline-start: 1px solid var(--surface);
+  }
+
+  .numbers__facet--topics { background: var(--sage); }
+  .numbers__facet--disputed { background: var(--coral-mist); }
+  .numbers__facet--gaps { background: var(--lavender); }
+
+  .numbers__facet--active.numbers__facet--topics { background: var(--sage-deep); }
+  .numbers__facet--active.numbers__facet--disputed { background: var(--disputed); color: var(--ink-inverse); }
+  .numbers__facet--active.numbers__facet--gaps { background: var(--lavender-deep); }
+
+  .numbers__facet:focus-visible {
+    position: relative;
+    z-index: 1;
+    outline: 3px solid var(--action-ink);
+    outline-offset: -3px;
+  }
+
+  .numbers__facet-title {
+    font-size: var(--t-h4);
     font-weight: 600;
+  }
+
+  .numbers__facet-note {
+    max-width: 34ch;
+    color: inherit;
+    font-size: var(--t-small);
+    line-height: var(--lh-body);
   }
 
   .numbers__controls {
@@ -936,6 +968,12 @@
     flex-wrap: wrap;
     gap: var(--s2);
     align-items: center;
+  }
+
+  .numbers__filters :global(.btn:active),
+  .numbers__facet:active,
+  .topic__toggle:active {
+    transform: none;
   }
 
   .numbers__count,
@@ -1187,6 +1225,26 @@
   }
 
   @media (max-width: 720px) {
+    .numbers__masthead {
+      grid-template-columns: minmax(0, 1fr);
+      padding: var(--s4);
+    }
+
+    .numbers__facets {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .numbers__facet {
+      min-height: 0;
+      grid-template-columns: minmax(0, 1fr);
+      align-items: start;
+    }
+
+    .numbers__facet + .numbers__facet {
+      border-inline-start: 0;
+      border-block-start: 1px solid var(--surface);
+    }
+
     .numbers__controls {
       grid-template-columns: minmax(0, 1fr);
     }

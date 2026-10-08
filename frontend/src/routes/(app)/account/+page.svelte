@@ -6,23 +6,15 @@
   import { navLabel } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import {
-    ACTIVITY_ACTION_FALLBACK,
-    ACTIVITY_ACTION_LABELS,
-    ACTIVITY_OUTCOME_LABELS,
-    ACTIVITY_OUTCOME_UNKNOWN,
     DECISION_ACTION_LABELS,
     JOURNAL_WINDOW_WORDS,
     MY_WORK,
     PROFILE,
-    WORK_FEED_NOUNS,
-    WORK_NOUNS,
-    journalIncomplete,
+    DECISION_NOUN,
     journalLoadMoreOf,
-    journalUnloaded,
     knownTerm,
-    workFeedLine,
   } from '$lib/terms';
-  import type { ActivityEntry, Capability, ExpertDecision } from '$lib/types';
+  import type { Capability, ExpertDecision } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
   import Field from '$lib/ui/Field.svelte';
@@ -42,6 +34,7 @@
 
   const RIGHTS: RightRow[] = [
     { capability: 'knowledge:read', href: '/findings' },
+    { capability: 'knowledge:read', href: '/graph' },
     { capability: 'query:ask', href: '/research' },
     { capability: 'feedback:give', href: '/research' },
     { capability: 'export:run', href: '/numbers' },
@@ -65,18 +58,8 @@
   let outBusy = $state('');
   let outError = $state('');
 
-  // Лента своей работы собирается из двух серверных страниц: действия аккаунта
-  // и его экспертные решения. Сервер режет каждую своим `limit`/`offset`, полное
-  // число подходит заголовком ответа, поэтому остаток считается от него, а не от
-  // длины показывает.
-  let activity = $state<ActivityEntry[] | null>(null);
-  let activityTotal = $state<number | null>(null);
-  let activityOffset = $state(0);
-  let activityMoreLoading = $state(false);
-  let activityError = $state('');
-  let activityStalled = $state(false);
-  let activitySeq = 0;
-
+  // В профиле остаются решения по содержимому пространства; входы и другие
+  // системные события не превращаются в пользовательскую ленту.
   let decisions = $state<ExpertDecision[] | null>(null);
   let decisionsTotal = $state<number | null>(null);
   let decisionsOffset = $state(0);
@@ -84,16 +67,6 @@
   let decisionsError = $state('');
   let decisionsStalled = $state(false);
   let decisionsSeq = 0;
-
-  let filter = $state<'all' | 'activity' | 'decisions'>('all');
-
-  // Отбор ленты: имена переключателей читаются из того же словаря, что и
-  // заголовок раздела, поэтому ключ отбора не выходит наружу служебным словом.
-  const WORK_FILTERS: { key: 'all' | 'activity' | 'decisions'; label: string }[] = [
-    { key: 'all', label: MY_WORK.filterAll },
-    { key: 'activity', label: MY_WORK.filterActivity },
-    { key: 'decisions', label: MY_WORK.filterDecisions },
-  ];
 
   const view = $derived.by(() => {
     if (session.state === 'unknown') return 'pending';
@@ -125,78 +98,30 @@
     key: string;
     at: string;
     label: string;
-    outcome: string;
-    kind: 'activity' | 'decisions';
+    outcome: ExpertDecision['outcome'];
   };
 
   const workRows = $derived.by<WorkRow[]>(() => {
-    const rows: WorkRow[] = [];
-    for (const entry of activity ?? []) {
-      rows.push({
-        key: `a|${entry.created_at}|${entry.action}|${entry.object_id}|${entry.outcome}`,
-        at: entry.created_at,
-        label: knownTerm(ACTIVITY_ACTION_LABELS, entry.action) ?? ACTIVITY_ACTION_FALLBACK,
-        outcome: entry.outcome,
-        kind: 'activity',
-      });
-    }
-    for (const entry of decisions ?? []) {
-      rows.push({
-        key: `d|${entry.created_at}|${entry.action}|${entry.object_id}|${entry.outcome}`,
-        at: entry.created_at,
-        label: knownTerm(DECISION_ACTION_LABELS, entry.action) ?? ACTIVITY_ACTION_FALLBACK,
-        outcome: entry.outcome,
-        kind: 'decisions',
-      });
-    }
+    const rows = (decisions ?? []).map((entry) => ({
+      key: `${entry.created_at}|${entry.action}|${entry.object_id}|${entry.outcome}`,
+      at: entry.created_at,
+      label: knownTerm(DECISION_ACTION_LABELS, entry.action) ?? 'Решение по материалу',
+      outcome: entry.outcome,
+    }));
     rows.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
-    return filter === 'all' ? rows : rows.filter((row) => row.kind === filter);
+    return rows;
   });
 
-  const activityLeft = $derived(
-    activity === null || activityTotal === null
-      ? null
-      : Math.max(0, activityTotal - activity.length),
-  );
   const decisionsLeft = $derived(
     decisions === null || decisionsTotal === null
       ? null
       : Math.max(0, decisionsTotal - decisions.length),
   );
-  const feedLine = $derived(
-    workFeedLine(
-      { read: activity?.length ?? 0, total: activityTotal },
-      { read: decisions?.length ?? 0, total: decisionsTotal },
-    )
-  );
-  // Неполнота каждой ленты называется отдельно: одна строка о прочитанном не
-  // скрывает, что сервис не дочитал действия или решения.
-  const feedPartial = $derived.by(() => {
-    const parts: string[] = [];
-    if (activityTotal === null && (activity?.length ?? 0) >= PAGE_SIZE) {
-      parts.push(journalIncomplete(WORK_FEED_NOUNS.activity));
-    }
-    if (decisionsTotal === null && (decisions?.length ?? 0) >= PAGE_SIZE) {
-      parts.push(journalIncomplete(WORK_FEED_NOUNS.decisions));
-    }
-    return parts.join('; ');
-  });
-  const feedUnloaded = $derived.by(() => {
-    const a = journalUnloaded(activityTotal, WORK_NOUNS, 'ваших действий');
-    const d = journalUnloaded(decisionsTotal, WORK_NOUNS, 'ваших решений');
-    if (a && d) return a;
-    return a ?? d;
-  });
-
   function messageOf(caught: unknown, fallback: string): string {
     if (caught instanceof ApiError && caught.status === 401) {
       return 'Вход больше не подтверждён: войдите заново и повторите действие.';
     }
     return fallback;
-  }
-
-  function outcomeLabel(outcome: string): string {
-    return ACTIVITY_OUTCOME_LABELS[outcome] ?? ACTIVITY_OUTCOME_UNKNOWN;
   }
 
   // Исход записи несут знак и слово, а не только цвет.
@@ -206,32 +131,10 @@
     return 'hypothesis';
   }
 
-  function mergeActivity(current: ActivityEntry[], incoming: ActivityEntry[]): ActivityEntry[] {
-    const seen = new Set(current.map((e) => `${e.created_at}|${e.action}|${e.object_id}|${e.outcome}`));
-    return [...current, ...incoming.filter((e) => !seen.has(`${e.created_at}|${e.action}|${e.object_id}|${e.outcome}`))];
-  }
-
-  async function loadActivity(offset = 0): Promise<void> {
-    const call = ++activitySeq;
-    activityMoreLoading = offset > 0;
-    activityError = '';
-    try {
-      const page = await api.myActivity(PAGE_SIZE, offset);
-      if (call !== activitySeq) return;
-      activity = offset > 0 && activity ? mergeActivity(activity, page.items) : page.items;
-      activityTotal = page.total;
-      activityOffset = offset + page.items.length;
-      activityStalled = offset > 0 && page.items.length === 0;
-    } catch (caught) {
-      if (call !== activitySeq) return;
-      if (offset === 0) {
-        activity = null;
-        activityTotal = null;
-      }
-      activityError = messageOf(caught, MY_WORK.failedBody);
-    } finally {
-      if (call === activitySeq) activityMoreLoading = false;
-    }
+  function outcomeLabel(outcome: ExpertDecision['outcome']): string {
+    if (outcome === 'success') return 'Записано';
+    if (outcome === 'denied') return 'Отклонено';
+    return 'Не завершено';
   }
 
   async function loadDecisions(offset = 0): Promise<void> {
@@ -262,10 +165,6 @@
     }
   }
 
-  async function loadWork(): Promise<void> {
-    await Promise.all([loadActivity(0), loadDecisions(0)]);
-  }
-
   $effect(() => {
     const incoming = session.account?.display_name;
     if (typeof incoming === 'string' && !namePrimed) {
@@ -275,10 +174,9 @@
   });
 
   $effect(() => {
-    // Аккаунт подтверждён — тогда и спрашиваем его ленты. Смена имени или пароля
-    // сама пишет запись, поэтому перечитываем ленту после подтверждения.
+    // Решения загружаются только для подтверждённого аккаунта.
     if (view !== 'ready') return;
-    void loadWork();
+    void loadDecisions(0);
   });
 
   async function saveProfile(event: SubmitEvent): Promise<void> {
@@ -301,7 +199,6 @@
       nameConfirmed = updated.display_name;
       nameDraft = updated.display_name;
       nameEditing = false;
-      void loadActivity(0);
     } catch (caught) {
       nameError = messageOf(caught, PROFILE.nameFailed);
     } finally {
@@ -333,7 +230,6 @@
       newPwd = '';
       confirmPwd = '';
       pwdConfirmed = true;
-      void loadActivity(0);
     } catch (caught) {
       if (caught instanceof ApiError && caught.status === 403) {
         pwdErrors = { current: 'Текущий пароль не подошёл. Введите его ещё раз.' };
@@ -371,9 +267,9 @@
   />
 </svelte:head>
 
-<div class="page account">
-  <div class="wrap wrap--narrow stack" style="--gap: var(--s5)">
-    <SectionHead level="1" title="Профиль">
+<div class="page profile">
+  <div class="wrap account__layout">
+    <SectionHead level="1" title="Профиль" class="account__title">
       {#if view === 'ready' && session.account}
         {@const account = session.account}
         <div class="ac__id">
@@ -405,10 +301,10 @@
       {@const account = session.account}
 
       <!-- ── Кто вы и что открыто ───────────────────────────────────── -->
-      <section class="ac__block" id="account-rights">
+      <section class="ac__block ac__access" id="account-rights">
         <SectionHead level="2" title="Разделы пространства" />
 
-        <Panel>
+        <Panel tone="sage">
           <nav class="ac__links" aria-label="Доступные разделы">
             {#if openLinks.length > 0}
               {#each openLinks as [href, label] (href)}
@@ -450,61 +346,33 @@
         </Panel>
       </section>
 
-      <!-- ── Ваша работа ────────────────────────────────────────────── -->
-      <section class="ac__block" id="account-work">
+      <!-- ── Решения по материалам ──────────────────────────────────── -->
+      <section class="ac__block ac__work" id="account-work">
         <SectionHead level="2" title={MY_WORK.heading}>
-          <div class="row" role="group" aria-label={MY_WORK.heading}>
-            {#each WORK_FILTERS as item (item.key)}
-              <Button variant={filter === item.key ? 'ink' : 'quiet'} onclick={() => (filter = item.key)}>
-                {item.label}
-              </Button>
-            {/each}
-            <Button variant="ghost" icon="refresh" onclick={() => void loadWork()}>Обновить</Button>
+          <div class="row">
+            <Button variant="ghost" icon="refresh" onclick={() => void loadDecisions(0)}>Обновить</Button>
           </div>
         </SectionHead>
 
-        {#if activityError || decisionsError}
+        {#if decisionsError}
           <Panel tone="coral">
             <div class="ac__fault">
               <p class="eyebrow"><Icon name="alert" size={16} /> {MY_WORK.failedTitle}</p>
-              <p class="small">{activityError || decisionsError}</p>
+              <p class="small">{decisionsError}</p>
               <div class="row">
-                <Button variant="action" icon="refresh" onclick={() => void loadWork()}>Повторить запрос</Button>
+                <Button variant="action" icon="refresh" onclick={() => void loadDecisions(0)}>Повторить</Button>
               </div>
             </div>
           </Panel>
-        {:else if workRows.length === 0 && (activity === null || decisions === null)}
+        {:else if decisions === null}
           <Panel tone="sunk">
             <div class="row ac__loading" role="status">
               <span class="spinner" aria-hidden="true"></span>
               <p class="small">{MY_WORK.loading}</p>
             </div>
           </Panel>
-        {:else if workRows.length === 0 && feedUnloaded}
-          <Panel tone="coral">
-            <div class="ac__fault">
-              <p class="eyebrow"><Icon name="alert" size={16} /> {feedUnloaded.title}</p>
-              <p class="small">{feedUnloaded.body}</p>
-              <div class="row">
-                <Button variant="action" icon="refresh" onclick={() => void loadWork()}>Повторить запрос</Button>
-              </div>
-            </div>
-          </Panel>
-        {:else if workRows.length === 0 && filter !== 'all'}
-          <!-- Отбор не нашёл записей там, где другой поток их показывает: это не
-               пустая работа и не сбой, а пустой отбор. -->
-          <Panel>
-            <p class="small">{MY_WORK.filterEmpty}</p>
-            <div class="row">
-              <Button variant="quiet" onclick={() => (filter = 'all')}>{MY_WORK.filterAll}</Button>
-            </div>
-          </Panel>
         {:else if workRows.length === 0}
-          <Empty icon="clock" title={MY_WORK.emptyTitle} body={MY_WORK.emptyBody}>
-            {#snippet action()}
-              <Button variant="action" href="/research">Задать вопрос</Button>
-            {/snippet}
-          </Empty>
+          <Empty icon="checkCircle" title={MY_WORK.emptyTitle} body={MY_WORK.emptyBody} />
         {:else}
           <Panel>
             <ul class="ac__feed">
@@ -517,31 +385,12 @@
               {/each}
             </ul>
 
-            <p class="micro muted ac__note" role="status">
-              {feedLine}
-              {#if feedPartial}{feedPartial}.{/if}
-            </p>
-
             <div class="row ac__more">
-              {#if activityStalled}
-                <Notice tone="warn" title={JOURNAL_WINDOW_WORDS.stalledTitle}>{JOURNAL_WINDOW_WORDS.stalled}</Notice>
-              {:else if activityLeft !== null && activityLeft > 0 && filter !== 'decisions'}
-                <Button
-                  variant="quiet"
-                  busy={activityMoreLoading}
-                  disabled={activityMoreLoading}
-                  onclick={() => void loadActivity(activityOffset)}
-                >
-                  {activityMoreLoading
-                    ? JOURNAL_WINDOW_WORDS.loadingMore
-                    : journalLoadMoreOf(activityLeft ?? PAGE_SIZE, PAGE_SIZE, WORK_FEED_NOUNS.activity)}
-                </Button>
-              {/if}
               {#if decisionsStalled}
                 <Notice tone="warn" title={JOURNAL_WINDOW_WORDS.stalledTitle}>
                   {JOURNAL_WINDOW_WORDS.stalled}
                 </Notice>
-              {:else if decisionsLeft !== null && decisionsLeft > 0 && filter !== 'activity'}
+              {:else if decisionsLeft !== null && decisionsLeft > 0}
                 <Button
                   variant="quiet"
                   busy={decisionsMoreLoading}
@@ -550,7 +399,7 @@
                 >
                   {decisionsMoreLoading
                     ? JOURNAL_WINDOW_WORDS.loadingMore
-                    : journalLoadMoreOf(decisionsLeft ?? PAGE_SIZE, PAGE_SIZE, WORK_FEED_NOUNS.decisions)}
+                    : journalLoadMoreOf(decisionsLeft ?? PAGE_SIZE, PAGE_SIZE, DECISION_NOUN)}
                 </Button>
               {/if}
             </div>
@@ -559,10 +408,10 @@
       </section>
 
       <!-- ── Смена пароля      <!-- ── Смена пароля ───────────────────────────────────────────── -->
-      <section class="ac__block" id="account-password">
+      <section class="ac__block ac__security" id="account-password">
         <SectionHead level="2" title={PROFILE.passwordTitle} lead={PASSWORD_NOTE} />
 
-        <Panel>
+        <Panel tone="lav">
           <form class="stack" style="--gap: var(--s4)" onsubmit={savePassword}>
             <Field
               label="Текущий пароль"
@@ -623,7 +472,7 @@
       </section>
 
       <!-- ── Выход ──────────────────────────────────────────────────── -->
-      <section class="ac__block" id="account-signout">
+      <section class="ac__block ac__signout" id="account-signout">
         <SectionHead level="2" title={PROFILE.signoutTitle} lead={SIGNOUT_NOTE} />
         <Panel tone="coral">
           {#if outError}
@@ -643,14 +492,36 @@
 <style>
   /* (app)-layout уже отступил на высоту навигации: верх не удваиваем. Прокрутку
      ведёт документ — собственной высоты у экрана нет. */
-  .page.account {
+  .page.profile {
     padding-top: var(--s5);
   }
+
+  .account__layout {
+    display: grid;
+    grid-template-columns: minmax(18rem, 0.8fr) minmax(0, 1.35fr);
+    grid-template-areas:
+      "title title"
+      "access work"
+      "security work"
+      "signout work";
+    align-items: start;
+    gap: var(--s5);
+  }
+
+  .profile :global(.account__title) { grid-area: title; }
+  .ac__access { grid-area: access; }
+  .ac__work { grid-area: work; }
+  .ac__security { grid-area: security; }
+  .ac__signout { grid-area: signout; }
 
   .ac__block {
     display: flex;
     flex-direction: column;
     gap: var(--s4);
+  }
+
+  .ac__block :global(.h2) {
+    font-size: var(--t-h3);
   }
 
   .ac__id {
@@ -719,11 +590,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .ac__note {
-    max-width: 92ch;
-    margin-top: var(--s4);
-  }
-
   .ac__more {
     --gap: var(--s3);
     flex-wrap: wrap;
@@ -731,6 +597,16 @@
   }
 
   @media (max-width: 640px) {
+    .account__layout {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas:
+        "title"
+        "access"
+        "work"
+        "security"
+        "signout";
+    }
+
     .ac__block {
       gap: var(--s3);
     }

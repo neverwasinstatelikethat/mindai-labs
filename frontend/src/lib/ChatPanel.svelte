@@ -34,6 +34,7 @@
   } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
+  import Mascot from '$lib/ui/Mascot.svelte';
   import Icon from '$lib/ui/Icon.svelte';
   import Notice from '$lib/ui/Notice.svelte';
   import Panel from '$lib/ui/Panel.svelte';
@@ -185,9 +186,8 @@
   const canExport = $derived(session.can('export:run'));
   const canSupersede = $derived(session.can('restricted:read'));
 
-  // Прежний ответ остаётся на экране, пока новый не пришёл или пока человек
-  // не убрал его сам: серверного перечня прошлых ответов нет, и молча потерять
-  // собранный ответ — значит потерять работу без возможности вернуться.
+  // Пока новый ответ собирается, предыдущий остаётся на экране; после замены
+  // к нему можно вернуться из серверной истории чатов.
   const staleAnswer = $derived(
     !!answer && (answer.question ?? '').trim() !== (question ?? '').trim(),
   );
@@ -713,7 +713,11 @@
     {/if}
 
     {#if !showPaper && !running && !error}
-      <Empty icon={null} title={ASK_EMPTY.title} />
+      <div class="chat__welcome">
+        <Mascot size={64} label="StormIdea" />
+        <h2 class="h3">{ASK_EMPTY.title}</h2>
+        <p class="small muted">Задайте вопрос по вашим материалам.</p>
+      </div>
     {/if}
 
     {#if error}
@@ -891,7 +895,6 @@
       placeholder="Напишите сообщение…"
       busy={running}
       disabled={!canAsk}
-      mascot={false}
       tools={composerTools}
       onsubmit={ask}
     />
@@ -1186,13 +1189,29 @@
     display: flex;
     flex-direction: column;
     gap: var(--s5);
+    min-height: 100%;
   }
 
   .ask__flow {
     display: flex;
+    flex: 1 1 auto;
     flex-direction: column;
     gap: var(--s5);
     min-width: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-inline: clamp(var(--s2), 1.5vw, var(--s4));
+  }
+
+  .chat__welcome {
+    display: grid;
+    flex: 1;
+    align-content: center;
+    justify-items: center;
+    gap: var(--s3);
+    min-height: 15rem;
+    padding: var(--s6) var(--s4);
+    text-align: center;
   }
 
   /* ── Композер: прилип ко дну листа вместе со своими подсказками ──────── */
@@ -1355,11 +1374,11 @@
 
   .chat__question {
     align-self: flex-end;
-    max-width: min(80%, 48rem);
+    max-width: min(80%, 62ch);
     margin: 0;
     padding: var(--s3) var(--s4);
     border-radius: var(--r-lg);
-    background: var(--surface-sunk);
+    background: var(--coral-mist);
     color: var(--ink);
   }
 

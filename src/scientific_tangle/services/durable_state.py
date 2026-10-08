@@ -67,7 +67,8 @@ logger = logging.getLogger(__name__)
 # всего процесса.
 MAX_STORED_ANSWERS = 100
 MAX_STORED_ANSWERS_TOTAL = 5000
-ANSWER_TTL = timedelta(hours=12)
+# Сохранённые вопросы доступны в истории чата в течение месяца.
+ANSWER_TTL = timedelta(days=30)
 MAX_DECISIONS = 5000
 # Журнал аудита вытесняет старейшие события безвозвратно: потолок держится
 # достаточно большим, чтобы разбор инцидента не терял начало цепочки
@@ -211,6 +212,10 @@ class DurableState(Protocol):
     async def put_answer(self, answer: AnswerPayload, *, owner_id: str) -> StoredAnswer: ...
 
     async def get_answer(self, query_id: str) -> StoredAnswer | None: ...
+
+    async def recent_answers(
+        self, *, owner_id: str, limit: int = 30, offset: int = 0
+    ) -> list[StoredAnswer]: ...
 
     async def record_decision(self, decision: ExpertDecision) -> None: ...
 
@@ -418,6 +423,18 @@ class InMemoryDurableState:
             # пользования», и перечитанный ответ обязан перестать быть кандидатом.
             self._answers.move_to_end(query_id)
             return replace(record, answer=record.answer.model_copy(deep=True))
+
+    async def recent_answers(
+        self, *, owner_id: str, limit: int = 30, offset: int = 0
+    ) -> list[StoredAnswer]:
+        now = datetime.now(UTC)
+        async with self._lock:
+            self._prune(now)
+            owned = [item for item in self._answers.values() if item.owner_id == owner_id]
+            owned.sort(key=lambda item: item.created_at)
+            owned.reverse()
+            page = owned[offset : offset + max(limit, 1)]
+        return [replace(item, answer=item.answer.model_copy(deep=True)) for item in page]
 
     async def record_decision(self, decision: ExpertDecision) -> None:
         async with self._lock:
@@ -947,6 +964,18 @@ class PostgresDurableState:
         except Exception as error:  # noqa: BLE001 - отметка пользования не критична для ответа
             logger.warning("Отметка обращения к ответу %s не сохранена: %s", query_id, error)
         return _answer_from_row(row)
+
+    async def recent_answers(
+        self, *, owner_id: str, limit: int = 30, offset: int = 0
+    ) -> list[StoredAnswer]:
+        now = datetime.now(UTC)
+        rows = await self._fetchall(
+            "SELECT query_id, owner_id, answer_json, created_at, expires_at FROM nk_answers "
+            "WHERE owner_id = %s AND expires_at > %s ORDER BY created_at DESC "
+            "LIMIT %s OFFSET %s",
+            (owner_id, now, max(limit, 1), max(offset, 0)),
+        )
+        return [_answer_from_row(row) for row in rows]
 
     async def record_decision(self, decision: ExpertDecision) -> None:
         await self._execute(

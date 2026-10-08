@@ -1039,6 +1039,19 @@ class StoredAnswerInfo(BaseModel):
     findings: int = Field(ge=0)
 
 
+class AnswerHistoryItem(BaseModel):
+    """Краткая запись ответа для личной истории вопросов."""
+
+    query_id: UUID
+    question: str
+    created_at: datetime
+
+
+class AnswerHistoryPage(BaseModel):
+    items: list[AnswerHistoryItem]
+    has_more: bool
+
+
 class ExpertDecision(BaseModel):
     """Durable-запись экспертного решения: перезапуск процесса её не стирает.
 

@@ -1739,9 +1739,9 @@ class InMemoryKnowledgeBase:
                         "составило 18–22 минуты.",
                     )
                 ],
-                subject="request-template",
+                subject="шаблон обработки запроса",
                 predicate="REDUCES_PROCESSING_TIME",
-                scope={"group": "general"},
+                scope={"group": "все запросы"},
                 observations=[
                     self._range_obs("processing_time", 18, 22, "min", "18–22 минуты"),
                 ],
@@ -1761,9 +1761,9 @@ class InMemoryKnowledgeBase:
                         "Среднее время обработки запроса составило 24–29 минут.",
                     )
                 ],
-                subject="request-handling",
+                subject="обработка запросов",
                 predicate="HAS_PROCESSING_TIME",
-                scope={"group": "pilot"},
+                scope={"group": "группа сравнения"},
                 observations=[
                     self._range_obs("processing_time", 24, 29, "min", "24–29 минут")
                 ],
@@ -1782,7 +1782,7 @@ class InMemoryKnowledgeBase:
                         "Проверка выявила пропуски в 82–91% записей.",
                     )
                 ],
-                subject="record-check",
+                subject="проверка заполнения записей",
                 predicate="FINDS_MISSING_FIELDS",
                 scope={},
                 observations=[self._range_obs("missing_records", 82, 91, "%", "82–91%")],
@@ -1803,7 +1803,7 @@ class InMemoryKnowledgeBase:
                         "В часы пик число ожидающих задач было в 3–5 раз выше среднего.",
                     )
                 ],
-                subject="task-queue",
+                subject="очередь задач",
                 predicate="HAS_PEAK_LOAD",
                 scope={},
                 observations=[self._range_obs("queue_growth", 3, 5, "ratio", "3–5 раз")],
@@ -1822,7 +1822,7 @@ class InMemoryKnowledgeBase:
                         "При загрузке выше 80% дополнительная проверка занимала более 8 минут.",
                     )
                 ],
-                subject="extra-check",
+                subject="дополнительная проверка заявки",
                 predicate="HAS_MINIMUM_PROCESSING_TIME",
                 scope={"load": "high"},
                 observations=[self._point_obs("check_duration", 8, "min", "не менее 8 минут")],

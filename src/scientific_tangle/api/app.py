@@ -41,6 +41,8 @@ from scientific_tangle.domain.contracts import (
     AccountRegisterRequest,
     ActivityEntry,
     AgentMetricsResponse,
+    AnswerHistoryItem,
+    AnswerHistoryPage,
     AnswerPayload,
     ClaimHistory,
     ClaimHistoryEntry,
@@ -1771,10 +1773,7 @@ async def research_query(
 
 
 # Демо-вопрос зафиксирован: витрина не выбирает тему на каждом обращении.
-DEMO_QUESTION = (
-    "Какие методы обессоливания подходят для шахтной воды с сульфатами и "
-    "хлоридами 200–300 мг/л при сухом остатке ≤1000 мг/л?"
-)
+DEMO_QUESTION = "Где в материалах расходятся данные о времени обработки запросов?"
 
 
 @app.get("/api/v1/demo", tags=["queries"], response_model=QueryResponse)
@@ -2845,6 +2844,50 @@ async def compare_entities(
     # читают не только авторы сравнения.
     await _log_audit(request, "compare.run", _reference_id(comparison.question))
     return deps.comparison.compare(findings, comparison)
+
+
+@app.get("/api/v1/answers", tags=["queries"], response_model=AnswerHistoryPage)
+async def answer_history(
+    request: Request,
+    account: CurrentAccount,
+    limit: Annotated[int, Query(ge=1, le=100)] = 30,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AnswerHistoryPage:
+    """Личная история вопросов; владельца всегда определяет серверная сессия."""
+    deps = dependencies(request)
+    async with _storage_or_unavailable(request, "История чата"):
+        rows = await deps.state.recent_answers(owner_id=account.id, limit=limit + 1, offset=offset)
+    return AnswerHistoryPage(
+        items=[
+            AnswerHistoryItem(
+                query_id=UUID(row.query_id),
+                question=row.answer.question,
+                created_at=row.created_at,
+            )
+            for row in rows[:limit]
+        ],
+        has_more=len(rows) > limit,
+    )
+
+
+@app.get("/api/v1/answers/{query_id}", tags=["queries"], response_model=AnswerPayload)
+async def get_saved_answer(
+    query_id: UUID,
+    request: Request,
+    account: CurrentAccount,
+) -> AnswerPayload:
+    """Открывает только собственный ответ и повторно проверяет его класс доступа."""
+    deps = dependencies(request)
+    async with _storage_or_unavailable(request, "Сохранённый ответ"):
+        stored = await deps.state.get_answer(str(query_id))
+    if stored is None or stored.owner_id != account.id:
+        raise HTTPException(status_code=404, detail="Ответ не найден или срок хранения истёк")
+    if not stored.data_classes <= _allowed_classes(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Для этого ответа изменился доступ к материалам",
+        )
+    return access_engine.apply_acl(stored.answer, _allowed_classes(request))
 
 
 @app.post("/api/v1/export", tags=["export"])

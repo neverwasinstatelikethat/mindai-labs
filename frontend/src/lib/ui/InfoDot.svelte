@@ -35,6 +35,8 @@
   let open = $state(false);
   let uid = $state('');
   let flip = $state(false);
+  let flipBlock = $state(false);
+  let mobileViewport = $state(false);
   let button = $state<HTMLButtonElement | undefined>();
   let pop = $state<HTMLDivElement | undefined>();
   let host = $state<HTMLSpanElement | undefined>();
@@ -43,14 +45,32 @@
     if (!browser || !host || !pop) return;
     const box = pop.getBoundingClientRect();
     const anchor = host.getBoundingClientRect();
+    mobileViewport = window.innerWidth <= 640;
+    if (mobileViewport) {
+      const left = Math.min(Math.max(8, anchor.left), window.innerWidth - box.width - 8);
+      const below = anchor.bottom + 8;
+      const above = anchor.top - box.height - 8;
+      const top = below + box.height <= window.innerHeight - 8
+        ? below
+        : above >= 8
+          ? above
+          : Math.max(8, window.innerHeight - box.height - 8);
+      pop.style.setProperty('--infodot-x', `${left}px`);
+      pop.style.setProperty('--infodot-y', `${top}px`);
+      flip = false;
+      flipBlock = false;
+      return;
+    }
     const left = align === 'end' ? anchor.right - box.width : anchor.left;
     flip = left < 8 || left + box.width > window.innerWidth - 8;
+    flipBlock = anchor.bottom + box.height > window.innerHeight - 12 && anchor.top - box.height > 12;
   }
 
   function close(restore = true): void {
     if (!open) return;
     open = false;
     flip = false;
+    flipBlock = false;
     if (restore) button?.focus();
   }
 
@@ -86,7 +106,7 @@
 
 <svelte:window onpointerdown={onWindowPointer} />
 
-<span class="infodot" class:infodot--open={open} bind:this={host}>
+<span class={`infodot ${open ? 'infodot--open' : ''}`} bind:this={host}>
   <button
     class="infodot__btn"
     type="button"
@@ -102,9 +122,7 @@
 
   {#if open}
     <div
-      class="infodot__pop"
-      class:infodot__pop--end={align === 'end'}
-      class:infodot__pop--flip={flip}
+      class={`infodot__pop ${align === 'end' ? 'infodot__pop--end' : ''} ${flip ? 'infodot__pop--flip' : ''} ${flipBlock ? 'infodot__pop--above' : ''} ${mobileViewport ? 'infodot__pop--mobile' : ''}`}
       id={uid}
       role="dialog"
       aria-label={title}
@@ -198,7 +216,9 @@
     top: calc(100% + var(--s2));
     inset-inline-start: 0;
     z-index: var(--z-dock);
-    inline-size: min(21rem, calc(100vw - 2rem));
+    inline-size: min(34rem, calc(100vw - 2rem));
+    max-block-size: min(70dvh, 34rem);
+    overflow: auto;
     padding: var(--s4);
     border: 1px solid var(--line);
     border-radius: var(--r-sm);
@@ -223,6 +243,17 @@
   .infodot__pop--end.infodot__pop--flip {
     inset-inline-end: auto;
     inset-inline-start: 0;
+  }
+
+  .infodot__pop--above {
+    top: auto;
+    bottom: calc(100% + var(--s2));
+  }
+
+  .infodot__pop--mobile {
+    position: fixed;
+    inset: var(--infodot-y) auto auto var(--infodot-x);
+    inline-size: min(34rem, calc(100vw - 1rem));
   }
 
   .infodot__pop:focus {

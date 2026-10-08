@@ -287,6 +287,17 @@ export interface AnswerPayload {
   degradation_reasons: string[];
 }
 
+export interface AnswerHistoryItem {
+  query_id: string;
+  question: string;
+  created_at: string;
+}
+
+export interface AnswerHistoryPage {
+  items: AnswerHistoryItem[];
+  has_more: boolean;
+}
+
 export interface QueryResponse {
   answer: AnswerPayload;
   evaluation: EvaluationRun;

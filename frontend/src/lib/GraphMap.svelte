@@ -1035,6 +1035,7 @@
         <div class="map__types" role="group" aria-label="Виды записей на поле">
           {#each legend as item (item.type)}
             <Button
+              class="map__type-button"
               size="sm"
               variant={item.on ? 'ink' : 'quiet'}
               current={item.on}
@@ -1581,6 +1582,18 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--s2);
+  }
+
+  .map__types :global(.map__type-button .num) {
+    padding: 0;
+    border-radius: 0;
+    background: transparent;
+    color: inherit;
+    font-weight: 600;
+  }
+
+  .map__types :global(.btn:active) {
+    transform: none;
   }
 
   .map__focus {

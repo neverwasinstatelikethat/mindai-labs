@@ -1096,7 +1096,7 @@
          того, как человек начал читать список. Методика экрана за «i», а не
          абзацем под заголовком. -->
     <section class="row reveal" aria-label="Фасет экрана">
-      <div class="seg" role="group" aria-label="Раздел гипотез">
+      <div class="seg findings__filters" role="group" aria-label="Раздел гипотез">
         <button
           class="seg__item"
           type="button"
@@ -2012,6 +2012,10 @@
 {/if}
 
 <style>
+  .findings__filters :global(.seg__item:active) {
+    transform: none;
+  }
+
   /* (app)-layout уже отступил на высоту pill-навигации: верх не удваиваем. */
   .page.findings {
     padding-top: var(--s5);

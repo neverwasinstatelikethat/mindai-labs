@@ -439,17 +439,18 @@
 .skip-link {
   position: absolute;
   left: var(--s4);
-  top: -80px;
+  top: var(--s4);
+  transform: translateY(calc(-80px - var(--s4)));
   z-index: 100;
   padding: var(--s3) var(--s5);
   border-radius: var(--r-pill);
   background: var(--ink);
   color: var(--ink-inverse);
-  transition: top var(--dur) var(--ease-enter);
+  transition: transform var(--dur) var(--ease-enter);
 }
 
 .skip-link:focus {
-  top: var(--s4);
+  transform: none;
 }
 
 /* Подписи для ассистивных технологий: в потоке не видны, в дереве доступны. */
@@ -468,8 +469,6 @@
 /* ── Плавающая pill-навигация (текучая полоса разделов) ────────────────── */
 
 .pill-nav {
-  --nav-pad: var(--s2);
-
   position: fixed;
   top: var(--s4);
   left: 50%;
@@ -479,22 +478,20 @@
   align-items: center;
   gap: var(--s3);
   width: min(100% - var(--s8), var(--maxw-page));
-  padding: var(--nav-pad) var(--nav-pad) var(--nav-pad) var(--s5);
+  padding: var(--s2) var(--s2) var(--s2) var(--s5);
   border-radius: var(--r-pill);
   border: 1px solid var(--line-soft);
   background: color-mix(in oklab, var(--surface) 72%, transparent);
   backdrop-filter: blur(20px) saturate(1.1);
   box-shadow: var(--shadow-soft);
-  transition: top var(--dur-dock) var(--ease-enter), padding var(--dur-dock) var(--ease-enter),
-    background var(--dur) var(--ease-soft), box-shadow var(--dur) var(--ease-soft),
+  transition: transform var(--dur-dock) var(--ease-enter), background var(--dur) var(--ease-soft),
+    box-shadow var(--dur) var(--ease-soft),
     border-radius var(--dur-dock) var(--ease-enter);
 }
 
 /* Док: после прокрутки полоса поднимается, сжимается и плотнее держит бумагу. */
 .pill-nav--dock {
-  --nav-pad: var(--s1);
-
-  top: var(--s2);
+  transform: translate(-50%, calc(var(--s2) - var(--s4)));
   background: color-mix(in oklab, var(--surface) 90%, transparent);
   box-shadow: var(--shadow-lift);
 }
@@ -707,8 +704,7 @@
   box-shadow: var(--shadow-soft);
   opacity: var(--ind-o, 0);
   pointer-events: none;
-  transition: transform var(--dur) var(--ease-enter), width var(--dur) var(--ease-enter),
-    opacity var(--dur-fast) var(--ease-soft);
+  transition: transform var(--dur) var(--ease-enter), opacity var(--dur-fast) var(--ease-soft);
 }
 
 .seg__item {
@@ -1289,10 +1285,7 @@
   display: grid;
   place-items: center;
   gap: var(--s3);
-  padding: clamp(var(--s6), 6vw, var(--s9)) var(--s5);
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--r-lg);
-  background: var(--surface-raised);
+  padding: var(--s5) var(--s4);
   text-align: center;
 }
 
@@ -1994,7 +1987,7 @@ html.motion-ok .site-foot a {
   }
 
   .pill-nav--dock {
-    top: var(--s2);
+    transform: translateY(calc(var(--s2) - var(--s3)));
   }
 
   .pill-nav__brand span:last-child {

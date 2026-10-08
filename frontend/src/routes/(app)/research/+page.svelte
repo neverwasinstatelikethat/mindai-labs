@@ -6,7 +6,7 @@
    * состоянии. Права читаются из подтверждённой сессии (`session.can`),
    * заголовков роли клиент не отправляет.
    */
-  import { api, apiUrl } from '$lib/api';
+  import { ApiError, api, apiUrl } from '$lib/api';
   import ChatPanel, {
     type HistoryResult,
     type RunFailure,
@@ -18,7 +18,9 @@
   import { session } from '$lib/sessionStore.svelte';
   import { FAILURE_WORDS, RUN_FAILURES } from '$lib/terms';
   import type { RunFailureKind } from '$lib/terms';
-  import type { AnswerPayload } from '$lib/types';
+  import type { AnswerHistoryItem, AnswerPayload } from '$lib/types';
+  import Button from '$lib/ui/Button.svelte';
+  import Empty from '$lib/ui/Empty.svelte';
 
   interface StreamEvent {
     type: string;
@@ -34,12 +36,17 @@
 
   let question = $state('');
   let answer = $state<AnswerPayload | null>(null);
+  let history = $state<AnswerHistoryItem[]>([]);
+  let historyHasMore = $state(false);
+  let historyOffset = $state(0);
+  let historyLoading = $state(false);
+  let historyLoaded = $state(false);
+  let historyError = $state('');
+  let historyOpen = $state(false);
+  let historySelection = $state('');
+  let historyRequest = 0;
   let running = $state(false);
-  // Новый вопрос не стирает прежний ответ: серверного перечня прошлых ответов
-  // нет — api.ts знает только query/stream, export по query_id и claimHistory.
-  // Молча потерять единственный собранный ответ значит потерять работу, поэтому
-  // прежний ответ сходит с экрана, только когда пришёл новый или когда человек
-  // убрал его сам кнопкой.
+  // Прежний ответ остаётся доступен в серверной истории после нового вопроса.
   let delivered = false;
   let failure = $state<RunFailure | null>(null);
   // Отдельное состояние для эталонных вопросов: пустой набор и непрогруженный
@@ -60,18 +67,57 @@
 
   function reasonText(reason: unknown, fallback: string): string {
     if (reason instanceof TypeError) return fallback;
+    if (reason instanceof ApiError && reason.status === 404) return fallback;
     const message = reason instanceof Error ? reason.message : '';
     return message || fallback;
   }
 
   // ── Сборка ответа: SSE поверх прокси /backend ────────────────────────────
 
-  function applyAnswer(payload: AnswerPayload): void {
+  function applyAnswer(payload: AnswerPayload, refreshHistory = true): void {
     delivered = true;
     answer = payload;
     question = payload.question;
     openClaimId = payload.findings[0]?.id ?? null;
     focusKey = null;
+    historySelection = payload.query_id;
+    if (refreshHistory) void loadAnswerHistory(0);
+  }
+
+  async function loadAnswerHistory(offset = 0): Promise<void> {
+    if (!session.signedIn) return;
+    const requestId = ++historyRequest;
+    historyLoading = true;
+    historyError = '';
+    try {
+      const page = await api.answerHistory(30, offset);
+      if (requestId !== historyRequest) return;
+      history = offset ? [...history, ...page.items] : page.items;
+      historyOffset = offset + page.items.length;
+      historyHasMore = page.has_more;
+      if (offset === 0) historyLoaded = true;
+    } catch (reason) {
+      if (requestId !== historyRequest) return;
+      historyError = reasonText(reason, 'История пока недоступна.');
+    } finally {
+      if (requestId === historyRequest) historyLoading = false;
+    }
+  }
+
+  async function openSavedAnswer(item: AnswerHistoryItem): Promise<void> {
+    historySelection = item.query_id;
+    historyOpen = false;
+    if (item.query_id === answer?.query_id) return;
+    historyLoading = true;
+    historyError = '';
+    failure = null;
+    try {
+      applyAnswer(await api.savedAnswer(item.query_id), false);
+    } catch (reason) {
+      historyError = reasonText(reason, 'Этот ответ больше недоступен.');
+    } finally {
+      historyLoading = false;
+    }
   }
 
   // Причина из ответа сервиса попадает в интерфейс только тогда, когда она
@@ -277,6 +323,8 @@
     notice = null;
     focusKey = null;
     openClaimId = null;
+    historySelection = '';
+    historyOpen = false;
   }
 
   // ── Отзывы, выгрузка, импорт, версии ────────────────────────────────────
@@ -361,6 +409,12 @@
       controller?.abort();
     };
   });
+
+  $effect(() => {
+    if (session.state === 'authenticated' && canAsk && !historyLoaded && !historyLoading && !historyError) {
+      void loadAnswerHistory(0);
+    }
+  });
 </script>
 
 <svelte:head>
@@ -370,6 +424,19 @@
 <div class="page research">
   <div class="wrap research__head">
     <h1 class="h2">Чат</h1>
+
+    {#if session.signedIn}
+      <Button
+        class="research__history-toggle"
+        variant="quiet"
+        size="sm"
+        icon="clock"
+        expanded={historyOpen}
+        onclick={() => (historyOpen = !historyOpen)}
+      >
+        {historyOpen ? 'Скрыть историю' : 'История чатов'}
+      </Button>
+    {/if}
 
     {#if !session.signedIn}
       <p class="small research__session">
@@ -392,8 +459,64 @@
     {/if}
   </div>
 
-  <!-- Поток и композер начинаются у левого края одной рабочей колонки. -->
-  <div class="wrap wrap--bleed">
+  <div class="wrap wrap--bleed research__workspace">
+    {#if session.signedIn}
+      <aside
+        class={`research__history ${historyOpen ? 'research__history--open' : ''}`}
+        aria-label="История чатов"
+      >
+        <div class="research__history-head">
+          <div>
+            <h2 class="h4">История чатов</h2>
+            <p class="micro muted">Вопросы за последние 30 дней</p>
+          </div>
+          <Button variant="action" size="sm" icon="plus" onclick={clearAnswer}>Новый чат</Button>
+        </div>
+        {#if historyError}
+          <div class="research__history-error" role="status">
+            <p class="small">{historyError}</p>
+            <Button variant="quiet" size="sm" icon="refresh" onclick={() => void loadAnswerHistory(0)}>
+              Повторить
+            </Button>
+          </div>
+        {:else if history.length === 0 && historyLoading}
+          <p class="small muted" role="status">Загружаем историю…</p>
+        {:else if history.length === 0}
+          <Empty title="Здесь будут ваши вопросы" body="Новый вопрос появится в истории после ответа." />
+        {:else}
+          <ul class="research__history-list">
+            {#each history as item (item.query_id)}
+              <li>
+                <button
+                  type="button"
+                  class={`research__history-item ${historySelection === item.query_id ? 'research__history-item--active' : ''}`}
+                  aria-current={historySelection === item.query_id ? 'true' : undefined}
+                  disabled={historyLoading}
+                  onclick={() => void openSavedAnswer(item)}
+                >
+                  <span>{item.question}</span>
+                  <time datetime={item.created_at}>
+                    {new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(item.created_at))}
+                  </time>
+                </button>
+              </li>
+            {/each}
+          </ul>
+          {#if historyHasMore}
+            <Button
+              variant="ghost"
+              size="sm"
+              busy={historyLoading}
+              onclick={() => void loadAnswerHistory(historyOffset)}
+            >
+              Показать ещё
+            </Button>
+          {/if}
+        {/if}
+      </aside>
+    {/if}
+
+    <div class="research__conversation">
     <ChatPanel
       {answer}
       {question}
@@ -414,12 +537,16 @@
       onnotice={(value) => (notice = value)}
       onhistory={loadHistory}
     />
+    </div>
   </div>
 </div>
 
 <style>
   .research {
-    padding-bottom: var(--s5);
+    display: flex;
+    flex-direction: column;
+    min-height: calc(100dvh - var(--topbar-h) - var(--s4));
+    padding-bottom: var(--s4);
   }
 
   .research__head {
@@ -431,15 +558,135 @@
     padding-bottom: var(--s3);
   }
 
-  .research > .wrap--bleed :global(.ask) {
-    max-width: 58rem;
-    margin-inline: 0;
+  .research__history-toggle {
+    display: none;
   }
 
-  .research > .wrap--bleed :global(.ask__flow),
-  .research > .wrap--bleed :global(.ask__composer) {
+  .research__workspace {
+    display: grid;
+    flex: 1;
+    min-height: max(26rem, calc(100dvh - var(--topbar-h) - var(--s10) - var(--s6)));
+    grid-template-columns: minmax(15rem, 18rem) minmax(0, 1fr);
+    gap: var(--s5);
+    align-items: stretch;
+  }
+
+  .research__history {
+    min-width: 0;
+    padding: var(--s4);
+    border-radius: var(--r-md);
+    background: var(--sage);
+  }
+
+  .research__history-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--s3);
+    margin-bottom: var(--s4);
+  }
+
+  .research__history-head h2,
+  .research__history-head p {
+    margin: 0;
+  }
+
+  .research__history-head p {
+    margin-top: var(--s1);
+  }
+
+  .research__history-list {
+    display: grid;
+    gap: var(--s1);
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .research__history-item {
+    display: grid;
     width: 100%;
-    max-width: 58rem;
+    gap: var(--s1);
+    padding: var(--s3);
+    border: 0;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--ink);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .research__history-item:hover,
+  .research__history-item--active {
+    background: var(--surface-raised);
+  }
+
+  .research__history-item:focus-visible {
+    outline: 2px solid var(--action-ink);
+    outline-offset: 2px;
+  }
+
+  .research__history-item span {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+
+  .research__history-item time {
+    color: var(--ink-3);
+    font-size: var(--t-micro);
+  }
+
+  .research__conversation {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .research__conversation :global(.ask) {
+    flex: 1;
+    min-height: 100%;
+  }
+
+  .research__conversation :global(.prompt__lead) {
+    display: grid;
+  }
+
+  @media (max-width: 720px) {
+    .research__history-toggle {
+      display: inline-flex;
+    }
+
+    .research__workspace {
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+
+    .research__history {
+      display: none;
+      position: absolute;
+      inset: 0 auto auto 0;
+      z-index: var(--z-dock);
+      width: min(22rem, calc(100vw - 2rem));
+      max-height: min(70dvh, 38rem);
+      overflow: auto;
+      box-shadow: var(--shadow-lift);
+    }
+
+    .research__history--open {
+      display: block;
+    }
+
+    .research__head {
+      justify-content: space-between;
+    }
   }
 
   .research__session {
