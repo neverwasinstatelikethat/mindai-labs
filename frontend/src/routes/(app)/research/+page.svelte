@@ -364,20 +364,20 @@
 </script>
 
 <svelte:head>
-  <title>Вопрос: Научный Клубок</title>
+  <title>Чат — StormIdea</title>
 </svelte:head>
 
 <div class="page research">
-  <div class="wrap stack">
-    <h1 class="sr-only">Чат</h1>
+  <div class="wrap research__head">
+    <h1 class="h2">Чат</h1>
 
     {#if !session.signedIn}
-      <p class="micro research__session">
+      <p class="small research__session">
         {#if session.state === 'unknown'}
           <span class="spinner spinner--quiet" aria-hidden="true"></span>
-          проверяем доступ…
+          Загружаем чат…
         {:else}
-          доступа нет: запрос не запустится.
+          Войдите, чтобы начать разговор.
           <a href={`/login?next=${encodeURIComponent(page.url.pathname)}`}>Войти</a>
         {/if}
       </p>
@@ -392,8 +392,7 @@
     {/if}
   </div>
 
-  <!-- Ответ и композер занимают всю ширину: читается мера колонки, а не поля
-       вокруг неё. -->
+  <!-- Поток и композер начинаются у левого края одной рабочей колонки. -->
   <div class="wrap wrap--bleed">
     <ChatPanel
       {answer}
@@ -420,18 +419,27 @@
 
 <style>
   .research {
-    /* Композер прилип ко дну листа, поэтому нижнее поле не нужно:
-       last-child решают отступы самой ленты. */
     padding-bottom: var(--s5);
   }
 
-  .research > .wrap {
+  .research__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
     padding-top: var(--s4);
+    padding-bottom: var(--s3);
   }
 
   .research > .wrap--bleed :global(.ask) {
     max-width: 58rem;
     margin-inline: 0;
+  }
+
+  .research > .wrap--bleed :global(.ask__flow),
+  .research > .wrap--bleed :global(.ask__composer) {
+    width: 100%;
+    max-width: 58rem;
   }
 
   .research__session {

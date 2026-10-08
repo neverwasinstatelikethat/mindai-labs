@@ -1070,10 +1070,10 @@
 </script>
 
 <svelte:head>
-  <title>Находки корпуса: Научный Клубок</title>
+  <title>Гипотезы — StormIdea</title>
   <meta
     name="description"
-    content="Числа из документов корпуса: находка с доказательством, где именно в источнике, с условиями применения и версиями утверждения."
+    content="Гипотезы и находки с подтверждениями, условиями и ссылками на исходные материалы."
   />
 </svelte:head>
 
@@ -1081,11 +1081,11 @@
   <div class="wrap stack" style="--gap: var(--s5)">
     <SectionHead
       level="1"
-      eyebrow={pane === 'merges' ? 'Фасет «Находок»' : 'Корпус'}
-      title={pane === 'merges' ? 'Склейки имён' : 'Находки корпуса'}
+      eyebrow={pane === 'merges' ? 'Проверка названий' : 'Рабочее пространство'}
+      title={pane === 'merges' ? 'Объединение названий' : 'Гипотезы'}
       lead={pane === 'merges'
-        ? 'Решение по паре имён записывает сервис: оно остаётся после перезапуска и меняет разбор следующих документов.'
-        : 'Найдите число в документе и откройте доказательство: страницу, лист или диапазон ячеек.'}
+        ? 'Проверьте, обозначают ли два названия одно и то же. Решение повлияет на будущие материалы.'
+        : 'Просматривайте найденные гипотезы, проверяйте подтверждения и открывайте исходные материалы.'}
     >
       <p class="micro findings__count" role="status" aria-live="polite">
         {pane === 'merges' ? mergeCountText : listNote}
@@ -1096,14 +1096,14 @@
          того, как человек начал читать список. Методика экрана за «i», а не
          абзацем под заголовком. -->
     <section class="row reveal" aria-label="Фасет экрана">
-      <div class="seg" role="group" aria-label="Что смотреть в корпусе">
+      <div class="seg" role="group" aria-label="Раздел гипотез">
         <button
           class="seg__item"
           type="button"
           aria-pressed={pane === 'findings'}
           onclick={() => setPane('findings')}
         >
-          Находки
+          Гипотезы
         </button>
         <button
           class="seg__item"
@@ -1111,7 +1111,7 @@
           aria-pressed={pane === 'merges'}
           onclick={() => setPane('merges')}
         >
-          Склейки имён
+          Объединить названия
         </button>
       </div>
       <!-- Пояснения стоят у того, что объясняют: у статусов, у счёта покрытия и
@@ -1206,7 +1206,7 @@
                  второй слой техники, а не как ответ на вопрос. -->
             <InfoDot
               title="Что меняет решение по паре"
-              body={`${RESOLUTION_HINTS.accept} ${RESOLUTION_HINTS.reject} ${RESOLUTION_HINTS.revert} ${RESOLUTION_WORDS.confidenceHint}`}
+              body={`${RESOLUTION_HINTS.accept} ${RESOLUTION_HINTS.reject} ${RESOLUTION_HINTS.revert}`}
             />
           </div>
           {#each mergeVisible as proposal (proposal.id)}
@@ -1272,8 +1272,8 @@
       <Panel class="findings__state">
         <Empty
           icon="lock"
-          title="Нужен вход в аккаунт"
-          body="Находки корпуса это рабочие данные: без входа в аккаунт они не открываются."
+          title="Войдите, чтобы открыть гипотезы"
+          body="Гипотезы и материалы доступны участникам рабочего пространства."
         >
           {#snippet action()}
             <!-- Второго действия здесь нет: повторный запрос с неподтверждённым
@@ -1288,8 +1288,8 @@
       <Panel class="findings__state">
         <Empty
           icon="shield"
-          title="Корпус для этого аккаунта закрыт"
-          body="Находки, карта связей и сравнение открываются при доступе к корпусу. Право выдаёт администратор сервиса, на экране его не включить."
+          title="Нет доступа к материалам пространства"
+          body="Попросите владельца пространства открыть доступ к гипотезам и связанным материалам."
         >
           {#snippet action()}
             <!-- Одно действие и здесь: повторный запрос ничего не меняет, а
@@ -1304,7 +1304,7 @@
       <Panel class="findings__state">
         <div class="row" role="status">
           <span class="spinner"></span>
-          <p class="small">Загружаем находки корпуса…</p>
+              <p class="small">Загружаем гипотезы…</p>
         </div>
         <div class="stack" style="--gap: var(--s3)">
           {#each [0, 1, 2, 3] as line (line)}
@@ -1364,7 +1364,7 @@
                 {FINDINGS_ACTION.resetFilter}
               </Button>
               <Button variant="ghost" icon="list" expanded={subjectsOpen} onclick={toggleSubjects}>
-                Субъекты корпуса
+                Объекты и темы
               </Button>
             </div>
           </form>
@@ -1406,7 +1406,7 @@
           <Panel tag="aside" class="findings__subjects reveal">
             <div class="panel__head">
               <div class="grow">
-                <h2 class="h4">Субъекты корпуса</h2>
+                <h2 class="h4">Объекты и темы</h2>
                 <!-- Счётчики отдельными подписями: склеенная строка читается как
                      одно число, а их здесь два. -->
                 <div class="findings__tally">
@@ -1705,7 +1705,7 @@
             />
             <label class="dropzone__face" for="findings-file">
               <strong class="h4">
-                {uploading ? 'Загружаем документы в корпус…' : 'Перетащите документы сюда или выберите файлы'}
+                {uploading ? 'Добавляем материалы…' : 'Перетащите документы сюда или выберите файлы'}
               </strong>
               <span class="micro">{ACCEPT_NOTE}</span>
             </label>
@@ -1730,11 +1730,11 @@
                     {#if item.state === 'queued'}
                       <p class="micro">Документ в очереди, ждёт своей загрузки.</p>
                     {:else if item.state === 'uploading'}
-                      <p class="micro">Отправляем документ в корпус…</p>
+                      <p class="micro">Добавляем материал…</p>
                     {:else if item.receipt}
                       <p class="micro upload__ok">
                         {item.receipt.status === 'duplicate'
-                          ? 'Дубликат: документ уже в корпусе'
+                          ? 'Этот материал уже добавлен'
                           : 'Документ принят'}
                       </p>
                       <p class="micro upload__ok">

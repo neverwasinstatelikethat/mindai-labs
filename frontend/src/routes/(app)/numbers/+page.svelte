@@ -13,7 +13,7 @@
   import { page } from '$app/state';
   import { tick } from 'svelte';
   import { api } from '$lib/api';
-  import { countOf, dateTime, num } from '$lib/format';
+  import { countOf, num } from '$lib/format';
   import {
     anyDivergence,
     bandOf,
@@ -60,21 +60,18 @@
     TOPIC_WORDS,
     deltaPhrase,
     deniedNote,
-    divergencesShownOf,
     gapBody,
     gapsCounter,
     limitTagText,
     noDivergenceBody,
     othersShown,
     outsideLimitText,
-    queueCounter,
     queueOutcome,
     queueWaiting,
     retryNote,
     sectionLink,
     topicCounts,
     topicDifference,
-    topicsShown,
   } from '$lib/terms';
   import type { ConflictCandidate, FindingListItem, NumericObservation } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
@@ -137,8 +134,6 @@
   let disputedTotal = $state<number | null>(null);
   let queueTotal = $state<number | null>(null);
   let windowNote = $state('');
-  let loadedAt = $state('');
-  let queueLoadedAt = $state('');
   let loading = $state(false);
   let failed = $state(false);
   let queueLoading = $state(false);
@@ -233,7 +228,6 @@
       disputed = contested.items;
       disputedTotal = contested.total;
       windowNote = contested.windowNote === '' ? corpus.windowNote : contested.windowNote;
-      loadedAt = new Date().toISOString();
       openClaimVerdict();
     } catch {
       failed = true;
@@ -263,7 +257,6 @@
       const rows = await api.conflictCandidates(QUEUE_WINDOW, 0);
       candidates = rows.items;
       queueTotal = rows.total;
-      queueLoadedAt = new Date().toISOString();
     } catch {
       queueFailed = true;
     } finally {
@@ -416,7 +409,7 @@
 </script>
 
 <svelte:head>
-  <title>{navLabel('/numbers')}: Научный Клубок</title>
+  <title>{navLabel('/numbers')} — StormIdea</title>
 </svelte:head>
 
 <div class="page numbers">
@@ -508,20 +501,6 @@
     {/if}
 
     {#if facet === 'topics' || facet === 'disputed'}
-      <p class="micro muted numbers__count">
-        <span>{topicsShown(topicsView.length, sourceGroups.length)}</span>
-        {#if facet === 'disputed'}
-          <span>{divergencesShownOf(disputed.length, disputedTotal)}</span>
-        {/if}
-        {#if loadedAt !== ''}
-          <span>{DIVERGENCE_VIEW.loadedAt}: {dateTime(loadedAt)}</span>
-        {/if}
-        <!-- Один «i» на весь список: он объясняет и размах полосы, и то, от
-             чего считается процент. Построчных кружков нет, потому что их
-             количество росло вместе с числом тем. -->
-        <InfoDot title={DIVERGENCE_HELP.spreadTitle} body={DIVERGENCE_HELP.spread} align="end" />
-      </p>
-
       {#if topicsView.length === 0}
         {#if findings.length === 0 && disputed.length === 0}
           <Empty title={DIVERGENCE_VIEW.emptyCorpusTitle} body={DIVERGENCE_VIEW.emptyCorpusBody} />
@@ -723,11 +702,7 @@
             <Empty title={QUEUE_WORDS.emptyTitle} body={QUEUE_WORDS.emptyBody} />
           {:else}
             <p class="micro muted queue__count">
-              <span>{queueCounter(candidates.length, queueTotal)}</span>
               <span>{queueWaiting(queueWaitingCount)}</span>
-              {#if queueLoadedAt !== ''}
-                <span>{QUEUE_WORDS.loadedAt}: {dateTime(queueLoadedAt)}</span>
-              {/if}
               <InfoDot title={QUEUE_HINTS.confirmTitle} body={QUEUE_HINTS.confirm} />
             </p>
 

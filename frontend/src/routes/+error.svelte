@@ -3,25 +3,14 @@
   import { navLabel } from '$lib/nav';
   import Button from '$lib/ui/Button.svelte';
   import Icon from '$lib/ui/Icon.svelte';
-  import InfoDot from '$lib/ui/InfoDot.svelte';
   import type { IconName } from '$lib/ui/icons';
-
-  let { error }: { error?: App.Error } = $props();
 
   // Статус перехода — признак для ветвления: он остаётся в коде и не выходит
   // в текст экрана.
   const status = $derived(page.status || 500);
-  const pathname = $derived(page.url.pathname);
   // Адрес возврата держит и путь, и запрос к нему: страница, на которой случился
   // сбой, открывается ровно такой, какой была.
   const selfHref = $derived(`${page.url.pathname}${page.url.search}`);
-  const message = $derived((page.error?.message ?? error?.message ?? '').trim());
-
-  // Причина, названная сервером (например, «Сервис не отвечает» из guard'а
-  // сессии), единственная, которую экран вправе показать: она формулируется
-  // для читателя-аналитика. Технические тексты сборки и сообщения фреймворка
-  // на русском не выглядят и в прозу экрана не попадают.
-  const serverReason = $derived(/[А-Яа-яЁё]/.test(message) ? message : '');
 
   type Action = { kind: 'back' } | { kind: 'href'; href: string; label: string };
 
@@ -32,8 +21,6 @@
     title: string;
     /** Одна фраза о том, что произошло. Не абзац. */
     problem: string;
-    /** Методика и частные случаи — за «i». */
-    detail?: string;
     /** Ровно одно действие: назад или в раздел. */
     action: Action;
   };
@@ -48,7 +35,7 @@
       return {
         icon: 'key',
         label: 'нужен вход',
-        title: 'Клубок вас не узнал',
+        title: 'Войдите в StormIdea',
         problem: 'Рабочее пространство открыто только по входу: находки, карта связей и история ваших запросов ждут за ним.',
         action: { kind: 'href', href: `/login?next=${encodeURIComponent(selfHref)}`, label: 'Войти' },
       };
@@ -59,8 +46,6 @@
         label: 'право не выдано',
         title: 'Это действие вашему аккаунту не открыто',
         problem: 'Решения по предложениям и закрытые данные относятся к экспертным правам.',
-        detail:
-          'Экспертное право выдаёт администратор сервиса. Остальные разделы доступны как обычно.',
         action: back,
       };
     }
@@ -68,7 +53,7 @@
       return {
         icon: 'compass',
         label: 'адрес не найден',
-        title: 'Такой страницы в Клубке нет',
+        title: 'Такой страницы в StormIdea нет',
         problem: 'Ссылка не ведёт ни в один раздел: обычно это опечатка или устаревшая закладка.',
         action: toResearch,
       };
@@ -78,9 +63,7 @@
         icon: 'sparkles',
         label: 'ответ не собран',
         title: 'Сервис не смог ответить',
-        problem: 'Модель недоступна или контур занят; ничего в корпусе не изменилось.',
-        detail:
-          'У запроса есть срок и предел шагов: если ответ собран не полностью, сервис говорит об этом словами в самом ответе.',
+        problem: 'Не удалось подготовить ответ. Попробуйте задать вопрос ещё раз чуть позже.',
         action: toResearch,
       };
     }
@@ -88,7 +71,7 @@
       return {
         icon: 'alert',
         label: 'сервис не отвечает',
-        title: 'Клубок не ответил',
+        title: 'StormIdea не ответил',
         problem: 'Переход не дошёл до рабочего контура, данные при этом не менялись.',
         action: back,
       };
@@ -99,8 +82,6 @@
         label: 'сбой страницы',
         title: 'Страница не открылась',
         problem: 'Ошибка могла затронуть только этот переход: повторите его, ничего не потеряется.',
-        detail:
-          'Если это был импорт документа или экспертная правка, проверьте результат в разделе «Находки» перед повтором.',
         action: back,
       };
     }
@@ -109,7 +90,7 @@
         icon: 'info',
         label: 'переход не принят',
         title: 'Переход не выполнен',
-        problem: 'Клубок не принял такой переход: обычно адрес устарел после перестройки разделов.',
+        problem: 'StormIdea не открыл этот адрес: проверьте ссылку или вернитесь в чат.',
         action: toResearch,
       };
     }
@@ -122,14 +103,6 @@
     };
   });
 
-  // Служебные строки нужны тому, кто передаст их администратору сервиса: код
-  // ответа, путь и названная сервером причина. На поверхности экрана их нет.
-  const rows = $derived([
-    { label: 'Код ответа', value: String(status) },
-    { label: 'Путь', value: `${pathname}${page.url.search}` },
-    { label: 'Причина сервиса', value: serverReason },
-  ]);
-
   function goBack(): void {
     // Если истории нет (прямая загрузка ошибки), выход — в рабочий раздел.
     if (window.history.length > 1) window.history.back();
@@ -138,7 +111,7 @@
 </script>
 
 <svelte:head>
-  <title>Научный Клубок: {scene.title}</title>
+  <title>StormIdea: {scene.title}</title>
 </svelte:head>
 
 <div class="page fault page--cover">
@@ -161,9 +134,6 @@
         <Button variant="action" onclick={goBack}>Вернуться назад</Button>
       {:else}
         <Button variant="action" href={scene.action.href}>{scene.action.label}</Button>
-      {/if}
-      {#if scene.detail}
-        <InfoDot title="Что проверить" body={scene.detail} />
       {/if}
     </div>
   </div>

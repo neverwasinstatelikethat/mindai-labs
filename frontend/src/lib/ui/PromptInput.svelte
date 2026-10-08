@@ -11,8 +11,8 @@
    */
   let {
     value = $bindable(''),
-    placeholder = 'Что найти в корпусе?',
-    label = 'Вопрос к корпусу',
+    placeholder = 'Что хотите проверить или найти?',
+    label = 'Сообщение',
     busy = false,
     disabled = false,
     variant = 'inline',

@@ -1,0 +1,26 @@
+- generic [ref=f4e2]:
+  - link "Перейти к содержанию" [ref=f4e3] [cursor=pointer]:
+    - /url: "#main"
+  - main [ref=f4e4]:
+    - navigation "Основная навигация" [ref=f4e5]:
+      - link "StormIdea" [ref=f4e6] [cursor=pointer]:
+        - /url: /
+      - generic [ref=f4e14]:
+        - link "Чат" [ref=f4e15] [cursor=pointer]:
+          - /url: /research
+        - link "Гипотезы" [ref=f4e16] [cursor=pointer]:
+          - /url: /findings
+        - link "Сигналы" [ref=f4e17] [cursor=pointer]:
+          - /url: /numbers
+        - link "Связи" [ref=f4e18] [cursor=pointer]:
+          - /url: /graph
+      - generic [ref=f4e19]:
+        - button "Все разделы и что они делают" [ref=f4e20] [cursor=pointer]
+        - link "Войти" [ref=f4e23] [cursor=pointer]:
+          - /url: /login
+        - link "Создать аккаунт" [ref=f4e24] [cursor=pointer]:
+          - /url: /register
+    - generic [ref=f4e27] [cursor=pointer]:
+      - heading "Профиль" [level=1] [ref=f4e30]
+      - status [ref=f4e32]:
+        - paragraph [ref=f4e34]: Читаем профиль аккаунта…

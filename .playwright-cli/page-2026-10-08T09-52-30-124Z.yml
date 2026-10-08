@@ -1,0 +1,47 @@
+- generic [ref=e2]:
+  - link "Перейти к содержанию" [ref=e3] [cursor=pointer]:
+    - /url: "#main"
+  - main [ref=e4]:
+    - navigation "Основная навигация" [ref=e5]:
+      - link "StormIdea" [ref=e6] [cursor=pointer]:
+        - /url: /
+      - generic [ref=e13]:
+        - link "Войти" [ref=e14] [cursor=pointer]:
+          - /url: /login
+        - link "Создать аккаунт" [ref=e15] [cursor=pointer]:
+          - /url: /register
+    - generic [ref=e17]:
+      - heading "Создать пространство" [level=1] [ref=e18]
+      - paragraph [ref=e19]: "Аккаунт нужен, чтобы рабочее пространство оставалось вашим: история запросов, находки с цитатами и адресами в источниках, ваши отзывы на ответы."
+      - generic [ref=e20]:
+        - generic [ref=e21]:
+          - generic [ref=e22]:
+            - generic [ref=e23]: Email
+            - textbox "Email" [ref=e25]:
+              - /placeholder: analyst@example.org
+          - generic [ref=e26]:
+            - generic [ref=e27]: Имя для рабочего пространства
+            - textbox "Имя для рабочего пространства" [ref=e29]:
+              - /placeholder: Как вас подписывать в находках
+          - generic [ref=e30]:
+            - generic [ref=e31]: Пароль
+            - generic [ref=e32]:
+              - textbox "Пароль" [ref=e33]:
+                - /placeholder: Длинный пароль, который не повторяется
+              - button "Показать пароль" [ref=e34] [cursor=pointer]
+            - paragraph [ref=e38]: "Не короче 10 символов: длинная фраза надёжнее короткого набора."
+          - generic [ref=e39]:
+            - generic [ref=e40]: Пароль ещё раз
+            - generic [ref=e41]:
+              - textbox "Пароль ещё раз" [ref=e42]:
+                - /placeholder: Тот же пароль
+              - button "Показать пароль" [ref=e43] [cursor=pointer]
+        - paragraph [ref=e47]:
+          - text: Регистрация означает согласие на обработку указанных вами данных.
+          - 'button "Пояснение: Зачем сервису эти данные" [ref=e49] [cursor=pointer]'
+        - generic [ref=e53]:
+          - button "Создать аккаунт" [ref=e54] [cursor=pointer]
+          - link "Уже есть аккаунт? Войти" [ref=e55] [cursor=pointer]:
+            - /url: /login
+        - paragraph [ref=e56]: После регистрации будут доступны рабочие разделы по вашему аккаунту.
+        - paragraph [ref=e57]: Экспертное право на разбор предложений по ответам выдаёт администратор сервиса.

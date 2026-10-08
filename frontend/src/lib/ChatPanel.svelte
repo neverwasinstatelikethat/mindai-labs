@@ -27,7 +27,6 @@
     STATUS_PHRASE,
     SUBJECT_LABELS,
     TERM_FALLBACKS,
-    degradationOf,
     describeScope,
     describeValue,
     knownTerm,
@@ -308,7 +307,7 @@
   // Источник тезиса: название документа, а не идентификатор записи — UUID сам
   // по себе аналитику не о чём говорит.
   function sourceOf(finding: Finding): string {
-    return finding.evidence[0]?.source_title || 'запись корпуса';
+    return finding.evidence[0]?.source_title || 'исходный материал';
   }
 
   function railCode(finding: Finding): string {
@@ -321,8 +320,8 @@
           ? `лист ${evidence.sheet}`
           : (evidence.cell_range ?? '');
     return place
-      ? `${evidence.source_title || 'запись корпуса'}, ${place}`
-      : evidence.source_title || 'запись корпуса';
+      ? `${evidence.source_title || 'исходный материал'}, ${place}`
+      : evidence.source_title || 'исходный материал';
   }
 
   // Место в источнике человекочитаемыми словами.
@@ -802,12 +801,7 @@
         {#if payload.degradation_reasons.length}
             <!-- Если ответ неполный, рядом указана причина. -->
           <div class="paper__degraded">
-            <Notice tone="warn" title={DEGRADED.title}>
-              {#each payload.degradation_reasons as reason (reason)}
-                <p>{degradationOf(reason)}</p>
-              {/each}
-            </Notice>
-            <p class="micro">{DEGRADED.hint}</p>
+            <Notice tone="warn" title={DEGRADED.title}>{DEGRADED.hint}</Notice>
           </div>
         {/if}
 
@@ -1090,7 +1084,7 @@
             <p class="quote">«{evidence.quote}»</p>
             <dl class="kv evidence__kv">
               <dt>{SHEET_LABELS.documentLabel}</dt>
-              <dd>{evidence.source_title || 'запись корпуса'}</dd>
+              <dd>{evidence.source_title || 'исходный материал'}</dd>
               {#if evidence.page != null}
                 <dt>{SHEET_LABELS.page}</dt><dd class="num">{evidence.page}</dd>
               {/if}

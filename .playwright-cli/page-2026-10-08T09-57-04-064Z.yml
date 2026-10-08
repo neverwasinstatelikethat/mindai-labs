@@ -1,0 +1,35 @@
+- generic [ref=e2]:
+  - link "Перейти к содержанию" [ref=e3] [cursor=pointer]:
+    - /url: "#main"
+  - main [ref=e4]:
+    - navigation "Основная навигация" [ref=e57]:
+      - link "StormIdea" [ref=e58] [cursor=pointer]:
+        - /url: /
+      - generic [ref=e66]:
+        - link "Чат" [ref=e67] [cursor=pointer]:
+          - /url: /research
+        - link "Гипотезы" [ref=e68] [cursor=pointer]:
+          - /url: /findings
+        - link "Сигналы" [ref=e69] [cursor=pointer]:
+          - /url: /numbers
+        - link "Связи" [ref=e70] [cursor=pointer]:
+          - /url: /graph
+      - generic [ref=e71]:
+        - button "Все разделы и что они делают" [ref=e72] [cursor=pointer]
+        - button "StormIdea" [ref=e76] [cursor=pointer]:
+          - generic [aria-hidden] [ref=e77]: S
+    - generic [ref=e82]:
+      - heading "Чат" [level=1] [ref=e84]
+      - generic [ref=e86]:
+        - heading "Чем помочь?" [level=3] [ref=e89]
+        - generic [ref=e91]:
+          - generic [ref=e92]: Сообщение
+          - textbox "Сообщение" [ref=e93]:
+            - /placeholder: Напишите сообщение…
+          - generic [ref=e94]:
+            - generic [ref=e96] [cursor=pointer]:
+              - text: Добавить файл
+              - button "Добавить файл"
+            - generic [ref=e101]: Enter — отправить
+            - button "Отправить запрос" [disabled] [ref=e102]
+  - generic [ref=e56]: Чат — StormIdea

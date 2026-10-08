@@ -1,7 +1,6 @@
 <script lang="ts">
   import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/state';
-  import { navLabel } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import { ApiError } from '$lib/api';
   import Button from '$lib/ui/Button.svelte';
@@ -66,8 +65,8 @@
 </script>
 
 <svelte:head>
-  <title>Вход в Научный Клубок</title>
-  <meta name="description" content="Вход в рабочее пространство Научного Клубка: вопрос к корпусу, находки, карта связей." />
+  <title>Вход в StormIdea</title>
+  <meta name="description" content="Войдите в StormIdea, чтобы продолжить работу с гипотезами и материалами." />
 </svelte:head>
 
 <div class="page auth page--cover">
@@ -77,7 +76,7 @@
   </div>
 
   <div class="wrap wrap--narrow auth__inner">
-    <h1 class="display reveal">Вход в Клубок</h1>
+    <h1 class="display reveal">Войти в StormIdea</h1>
 
     {#if cameToContinue}
       <Notice tone="info" title="Нужен вход">
@@ -87,8 +86,7 @@
       <!-- Что будет сразу после входа: экран называет раздел, а не обещает
            «рабочее пространство» вообще. -->
       <p class="lead reveal" style="--reveal-delay: 90ms">
-        После входа открывается «{navLabel('/research')}»: там вводят вопрос и получают ответ с
-        цитатами и адресами в источниках.
+        После входа вы вернётесь к работе с гипотезами и проверке материалов.
       </p>
     {/if}
 
@@ -136,7 +134,7 @@
       </div>
 
       <p class="micro muted auth__gate">
-        Забытый пароль и экспертное право на разбор ответов открывает администратор сервиса.
+        Если не получается войти, проверьте email и пароль или обратитесь к владельцу пространства.
       </p>
     </form>
   </div>

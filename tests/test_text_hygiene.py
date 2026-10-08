@@ -97,7 +97,7 @@ def test_glob_actually_covers_the_known_text_files() -> None:
     for reference in (
         "src/scientific_tangle/api/app.py",
         "src/scientific_tangle/services/graph_rebuilder.py",
-        "frontend/src/lib/terms.ts",
+        "frontend/src/lib/terms/merges.ts",
         "ops/grafana/dashboards/agent-quality.json",
         "docs/requirements.md",
     ):

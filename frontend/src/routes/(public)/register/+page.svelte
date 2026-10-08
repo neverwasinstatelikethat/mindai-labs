@@ -1,8 +1,6 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/state';
-  import { NAV_LINKS } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import { api, ApiError } from '$lib/api';
   import Button from '$lib/ui/Button.svelte';
@@ -40,23 +38,6 @@
   let formError = $state('');
   let taken = $state(false);
   let busy = $state(false);
-
-  // Сервис может работать без постоянного хранилища: тогда аккаунт живёт до
-  // перезапуска. Это называют до отправки формы, а не после потери записей.
-  let volatileStorage = $state(false);
-
-  onMount(() => {
-    void (async () => {
-      try {
-        const status = await api.status();
-        volatileStorage = status.accounts === 'in-memory' || status.state_backend === 'in-memory';
-      } catch {
-        // Показания не пришли: про хранение не говорим ничего, ложь дороже
-        // молчания.
-        volatileStorage = false;
-      }
-    })();
-  });
 
   // Названия разделов берутся из того же списка, что и навигация: регистрация не
   // имеет права учить одному языку, а рабочее пространство называть иначе.
@@ -125,10 +106,10 @@
 </script>
 
 <svelte:head>
-  <title>Регистрация в Научном Клубке</title>
+  <title>Создать пространство — StormIdea</title>
   <meta
     name="description"
-    content="Аккаунт Научного Клубка: вопрос к корпусу, находки с адресами в источниках, карта связей, отзывы на ответы."
+    content="Создайте аккаунт StormIdea для работы с гипотезами и материалами."
   />
 </svelte:head>
 
@@ -140,17 +121,10 @@
   </div>
 
   <div class="wrap wrap--narrow auth__inner">
-    <h1 class="display reveal">Регистрация в Клубке</h1>
+    <h1 class="display reveal">Создать пространство</h1>
     <p class="lead reveal" style="--reveal-delay: 90ms">
-      Аккаунт нужен, чтобы рабочее пространство оставалось вашим: история запросов, находки
-      с цитатами и адресами в источниках, ваши отзывы на ответы.
+      Создайте аккаунт, чтобы работать со своими материалами в StormIdea.
     </p>
-
-    {#if volatileStorage}
-      <Notice tone="warn" title="Хранилище непостоянное">
-        Аккаунт и история ответов проживут до перезапуска сервиса.
-      </Notice>
-    {/if}
 
     <form
       class="panel reveal auth__form"
@@ -189,7 +163,7 @@
           type="password"
           autocomplete="new-password"
           maxlength={PASSWORD_MAX}
-          hint={`Не короче ${PASSWORD_MIN} символов: длинная фраза надёжнее короткого набора.`}
+          hint={`Минимум ${PASSWORD_MIN} символов.`}
           placeholder="Длинный пароль, который не повторяется"
           bind:value={password}
           error={errors.password ?? ''}
@@ -234,12 +208,6 @@
         </Button>
       </div>
 
-      <p class="small muted auth__rooms">
-        После регистрации будут доступны рабочие разделы по вашему аккаунту.
-      </p>
-      <p class="micro muted auth__gate">
-        Экспертное право на разбор предложений по ответам выдаёт администратор сервиса.
-      </p>
     </form>
   </div>
 </div>
@@ -281,19 +249,6 @@
     max-width: var(--maxw-measure);
     padding-top: var(--s1);
     border-top: 1px solid var(--line);
-  }
-
-  .auth__rooms,
-  .auth__gate {
-    max-width: var(--maxw-measure);
-  }
-
-  /* Оговорка об экспертном праве звучит на экране одна: она стоит последней
-     строкой под действиями. */
-  .auth__gate {
-    padding-top: var(--s3);
-    border-top: 1px solid var(--line);
-    color: var(--ink-3);
   }
 
   .notice__actions {
