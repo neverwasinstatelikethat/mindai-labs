@@ -1085,7 +1085,7 @@ class AccessMiddleware:
 
 
 app = FastAPI(
-    title="Научный Клубок API",
+    title="StormIdea API",
     version=__version__,
     description="Evidence-centric Agentic GraphRAG API by MindAI",
     lifespan=lifespan,

@@ -9,7 +9,7 @@
   import { api, ApiError } from '$lib/api';
   import GraphMap from '$lib/GraphMap.svelte';
   import { navLabel } from '$lib/nav';
-  import { countOf, dateTime, num } from '$lib/format';
+  import { countOf, num } from '$lib/format';
   import { session } from '$lib/sessionStore.svelte';
   import {
     ASK_SOURCE,
@@ -60,7 +60,6 @@
   let status = $state<'idle' | 'loading' | 'ready' | 'error' | 'denied'>('idle');
   let graph = $state<GraphSnapshot>({ nodes: [], edges: [], communities: [] });
   let error = $state('');
-  let loadedAt = $state<Date | null>(null);
   let selected = $state<GraphNode | null>(null);
   // Выбранная связь живёт на экране: поле подсвечивает её, инспектор описывает
   // словами и ведёт к обеим записям.
@@ -372,7 +371,6 @@
       if (call !== requestSeq) return;
       graph = snapshot;
       pick(null);
-      loadedAt = new Date();
       status = 'ready';
     } catch (reason) {
       if (call !== requestSeq) return;
@@ -487,7 +485,6 @@
     });
   });
 
-  const loadedAtText = $derived(loadedAt ? dateTime(loadedAt, true) : '');
 
   /**
    * Числовые условия могут лежать и в самой записи (`metadata.observations`:
@@ -517,7 +514,7 @@
 </script>
 
 <svelte:head>
-  <title>Карта связей: Научный Клубок</title>
+  <title>Связи — StormIdea</title>
 </svelte:head>
 
 {#snippet nodeBody()}
@@ -838,30 +835,15 @@
 
 <div class="page map-page">
   <div class="wrap">
-    <!-- Узкий экран отдаёт вертикаль полю карты: подпись раздела на нём заменяет
-         заголовок. -->
     <SectionHead
       level="1"
-      eyebrow={narrow ? '' : 'Граф доказательств'}
-      title="Карта связей корпуса"
+      title="Связи"
+      lead="Изучите, как связаны факты, гипотезы и источники."
     >
       {#if status === 'ready'}
         <div class="map__head-tools">
-          <p class="micro muted map__meta">
-            <span>
-              записей <span class="num">{graph.nodes.length}</span>
-            </span>
-            <span>
-              связей <span class="num">{graph.edges.length}</span>
-            </span>
-            {#if loadedAt}
-              <span>
-                карта получена <time datetime={loadedAt.toISOString()}>{loadedAtText}</time>
-              </span>
-            {/if}
-          </p>
           <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
-            Обновить карту
+            Обновить
           </Button>
         </div>
       {/if}
@@ -895,18 +877,17 @@
         <div class="map__skeleton">
           <span class="skeleton map__skeleton-line"></span>
           <span class="skeleton map__skeleton-field"></span>
-          <p class="micro muted">Уточняем доступ к корпусу: карту заранее не читаем.</p>
+          <p class="micro muted">Загружаем связи…</p>
         </div>
       </Panel>
     {:else if access === 'denied' || status === 'denied'}
       <Panel tone="lav">
         <div class="panel__head">
-          <h2 class="h3">Карта связей корпуса закрыта</h2>
+          <h2 class="h3">Нет доступа к материалам</h2>
           <StatusPill status="off" label="нет доступа" />
         </div>
         <p class="lead small">
-          Карта связей и находки открываются при доступе к корпусу. Право выдаёт
-          администратор сервиса, на этом экране его не включить.
+          Попросите владельца пространства открыть доступ к материалам.
         </p>
         {#if error}<p class="micro muted">{error}</p>{/if}
         <div class="row">
@@ -917,7 +898,7 @@
       <Panel tone="sunk">
         <div class="map__skeleton">
           <p class="micro muted">
-            Собираем карту: записи, связи и области корпуса.
+            Загружаем карту связей…
           </p>
           <span class="skeleton map__skeleton-line"></span>
           <span class="skeleton map__skeleton-field"></span>
@@ -926,24 +907,24 @@
     {:else if status === 'error'}
       <Panel tone="coral">
         <div class="panel__head">
-          <h2 class="h3">Карта связей не загрузилась</h2>
+          <h2 class="h3">Не удалось загрузить связи</h2>
         </div>
         <Notice tone="error">{error}</Notice>
         <div class="row">
-          <Button variant="action" onclick={() => void load()}>Повторить запрос</Button>
-          <Button href="/research" variant="quiet">Задать вопрос по корпусу</Button>
+          <Button variant="action" onclick={() => void load()}>Повторить</Button>
+          <Button href="/research" variant="quiet">Вернуться в чат</Button>
         </div>
       </Panel>
     {:else if graph.nodes.length === 0}
       <Empty
         icon="graph"
-        title="Карта связей пуста"
-        body="Сервер вернул карту без записей: на ней появляются только те документы, из которых уже извлечены утверждения."
+        title="Связей пока нет"
+        body="Загрузите материалы или начните с вопроса — связанные факты появятся здесь."
       >
         {#snippet action()}
           <div class="row">
-            <Button href="/findings" variant="quiet">Загрузить документ в «Находках»</Button>
-            <Button href="/research" variant="ghost">Задать вопрос по корпусу</Button>
+            <Button href="/findings" variant="quiet">Добавить материалы</Button>
+            <Button href="/research" variant="ghost">Открыть чат</Button>
           </div>
         {/snippet}
       </Empty>
@@ -1193,15 +1174,6 @@
     padding-left: var(--s4);
   }
 
-  .map__meta {
-    margin: 0;
-    display: flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: var(--s1) var(--s4);
-    white-space: normal;
-  }
-
   /* Карточка выбранной связи живёт и без выбранной записи: связь остаётся
      прочитанной, когда человек снял выбор с поля. */
   .map__edge-note {
@@ -1417,11 +1389,6 @@
     .map__head-tools {
       align-items: flex-start;
       flex-wrap: nowrap;
-    }
-
-    .map__meta {
-      flex: 1 1 auto;
-      min-width: 0;
     }
 
     .map__head-tools :global(.btn) {

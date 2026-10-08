@@ -64,7 +64,7 @@
       if (railEl.scrollLeft < lo || railEl.scrollLeft > hi) {
         // Полоса останавливается на границе пункта, а не в середине слова:
         // обрезанный хвост прилипает к логотипу и читается как часть названия
-        // продукта («Научный Клубок» + «ос» от «Вопрос»).
+        // продукта (StormIdea + подпись активного раздела).
         const current = railEl.scrollLeft;
         const edges = [
           0,
@@ -185,7 +185,7 @@
         <circle cx="8" cy="8" r="3" /><circle cx="16" cy="15" r="3" /><path d="M10.2 10.2l3.6 3.2" />
       </svg>
     </span>
-    <span>Научный Клубок</span>
+    <span>StormIdea</span>
   </a>
 
   {#if links.length > 0}

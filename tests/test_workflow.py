@@ -5,6 +5,8 @@ import pytest
 from scientific_tangle.agents.workflow import (
     ACTION_SYSTEM,
     CONTROL_SYSTEM,
+    CRITIC_SYSTEM,
+    IMPROVER_SYSTEM,
     PLANNER_SYSTEM,
     PLANNING_SYSTEM,
     REASONER_SYSTEM,
@@ -24,7 +26,7 @@ from scientific_tangle.domain.contracts import (
     ReasoningResult,
     ToolAction,
 )
-from scientific_tangle.domain.models import NumericFilter, QueryPlan
+from scientific_tangle.domain.models import QueryPlan
 from scientific_tangle.services.evolution import EvolutionService
 from scientific_tangle.services.ingestion import IngestionService
 from scientific_tangle.services.knowledge import InMemoryKnowledgeBase
@@ -33,13 +35,10 @@ from tests.fakes import ScriptedProvider
 
 def query_plan() -> QueryPlan:
     return QueryPlan(
-        question="Какие методы обессоливания подходят для шахтной воды?",
+        question="Как сократить время обработки запросов?",
         language="ru",
         mode="hybrid",
-        entity_mentions=["шахтная вода", "обессоливание"],
-        numeric_filters=[
-            NumericFilter(property_name="dry_residue", operator="lte", value=1000, unit="mg/L")
-        ],
+        entity_mentions=["время обработки", "запросы"],
         max_hops=3,
     )
 
@@ -51,19 +50,19 @@ def action_plan() -> AgentActionPlan:
             ToolAction(
                 id="search-1",
                 tool="hybrid_search",
-                purpose="Найти evidence-backed методы",
-                query="шахтная вода обессоливание обратный осмос",
-                entities=["Шахтная вода", "Обратный осмос"],
-                relation_types=["TREATED_BY", "PRODUCES", "SUPPORTED_BY"],
+                purpose="Найти подтверждённые способы сократить время",
+                query="шаблон ответа время обработки запросов",
+                entities=["Шаблон ответа", "Время обработки"],
+                relation_types=["IMPROVED_BY", "PRODUCES", "SUPPORTED_BY"],
                 max_hops=3,
             ),
             ToolAction(
                 id="graph-1",
                 tool="graph_traverse",
                 purpose="Построить объяснимый путь",
-                query="связи воды с методами очистки",
-                entities=["Шахтная вода"],
-                relation_types=["TREATED_BY", "PRODUCES"],
+                query="связи обработки с временем ответа",
+                entities=["Обработка запросов"],
+                relation_types=["IMPROVED_BY", "PRODUCES"],
                 max_hops=3,
             ),
         ],
@@ -73,7 +72,9 @@ def action_plan() -> AgentActionPlan:
 
 def planning_bundle() -> PlanningBundle:
     return PlanningBundle(
-        intent=IntentClassification(primary="technology_comparison", entities=["шахтная вода"]),
+        intent=IntentClassification(
+            primary="gap_analysis", entities=["время обработки"]
+        ),
         query_plan=query_plan(),
         action_plan=action_plan(),
     )
@@ -88,7 +89,10 @@ async def test_llm_driven_workflow_reaches_grounded_answer() -> None:
             rationale="Собранных evidence paths достаточно.",
         ),
         ReasoningResult(
-            summary="Комбинированная схема использует обратный осмос после pretreatment.",
+            summary=(
+                "Общий шаблон ответа связан со снижением времени обработки запросов, "
+                "а пилотная группа требует отдельного сравнения."
+            ),
             finding_ids=["finding-ro", "finding-ro-pilot"],
             conflicts=["Энергозатраты требуют нормализации условий."],
             knowledge_gaps=["Мало пилотных данных для холодного климата."],
@@ -99,7 +103,7 @@ async def test_llm_driven_workflow_reaches_grounded_answer() -> None:
     workflow = ResearchWorkflow(provider=provider)
 
     answer = await workflow.run(
-        QueryRequest(question="Какие методы обессоливания подходят для шахтной воды?")
+        QueryRequest(question="Как сократить время обработки запросов?")
     )
 
     assert answer.model_mode == "scripted"
@@ -125,7 +129,9 @@ async def test_controller_autonomously_replans_missing_evidence() -> None:
     provider = ScriptedProvider(
         planning_bundle().model_copy(
             update={
-                "intent": IntentClassification(primary="gap_analysis", entities=["шахтная вода"])
+                "intent": IntentClassification(
+                    primary="gap_analysis", entities=["технологическая вода"]
+                )
             }
         ),
         AgentControlDecision(
@@ -209,7 +215,9 @@ async def test_intents_without_retrieval_exit_before_the_tool_loop(intent: str) 
     """Запросам вне action space не нужен ни retrieval, ни цикл критика."""
     provider = ScriptedProvider(
         planning_bundle().model_copy(
-            update={"intent": IntentClassification(primary=intent, entities=["шахтная вода"])}
+            update={
+                "intent": IntentClassification(primary=intent, entities=["технологическая вода"])
+            }
         )
     )
 
@@ -305,6 +313,23 @@ def test_planning_prompts_carry_the_injection_barrier() -> None:
     assert "ИСТОРИЯ ВЕТКИ" in flat(REASONER_SYSTEM) and "ВОПРОС" in flat(REASONER_SYSTEM)
 
 
+def test_agent_prompts_do_not_assume_a_specific_industry() -> None:
+    prompts = (
+        PLANNER_SYSTEM,
+        ACTION_SYSTEM,
+        PLANNING_SYSTEM,
+        CONTROL_SYSTEM,
+        REASONER_SYSTEM,
+        CRITIC_SYSTEM,
+        IMPROVER_SYSTEM,
+    )
+
+    for prompt in prompts:
+        normalized = flat(prompt).casefold()
+        assert "горно-металлург" not in normalized
+        assert "металлургическ" not in normalized
+
+
 @pytest.mark.asyncio
 async def test_planning_nodes_send_the_barrier_to_the_model() -> None:
     """Барьер обязан доходить до провайдера, а не оставаться в исходнике."""
@@ -394,3 +419,4 @@ async def test_untrusted_text_stays_in_the_data_channel() -> None:
     assert any(INJECTED in user for _, user in calls), (
         "вопрос обязан дойти до модели как данные, иначе проверка ничего не доказывает"
     )
+

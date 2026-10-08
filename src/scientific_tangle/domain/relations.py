@@ -1,9 +1,8 @@
 """Единый реестр отношений графа доказательств (подпись онтологии).
 
-Подпись графа жила в двух независимых местах: allowlist агента
-(``agents/tools.py``) и доменный сеятель (``services/graph_rebuilder.py``).
-Списки разошлись: из 29 отношений, которые граф реально создаёт, агенту были
-доступны 11, а ``_traverse`` с фильтром
+Реестр отношений задаёт общий словарь для извлечения, хранения и обхода графа.
+Ранее allowlist агента расходился с отношениями, которые граф реально создаёт;
+``_traverse`` с фильтром
 ``ALL(rel IN rels WHERE type(rel) IN $relations)`` молча отрезал все
 кросс-доменные рёбра (FEEDS, PRODUCED_FROM, USED_BY, PROCESSES, REMOVES, ...) —
 то есть ровно то, ради чего нужен GraphRAG. Обратная сторона расхождения:
@@ -11,8 +10,6 @@ CONTRADICTS состоял в allowlist, но не создаётся нигде
 считаются численно, а не рёбрами графа.
 
 Здесь один декларативный источник истины. Его потребляют:
-  * ``services/graph_rebuilder.py`` — проверка домена/диапазона перед записью
-    (:func:`spec_for`, :func:`validate_edge`);
   * ``agents/tools.py`` — обход по умолчанию и фильтр плана retrieval
     (:func:`resolve_relations`);
   * ``services/ontology.py`` — словарь предикатов для промпта и текста нарушения
@@ -63,9 +60,7 @@ EXPERT = NodeType.EXPERT
 
 ANY: frozenset[NodeType] = frozenset()
 
-# Файлы-создатели рёбер: декларация проверяется тестом по исходнику, чтобы
-# в реестре не оставалось отношений, которых в графе на самом деле нет.
-DOMAIN = "services/graph_rebuilder.py"
+# Хранилища принимают только отношения из этого реестра.
 MEMORY = "services/knowledge.py"
 NEO4J = "services/infrastructure.py"
 
@@ -91,7 +86,7 @@ class RelationSpec:
     target_types: frozenset[NodeType] = ANY
     # Может быть предикатом claim-узла: (claim)-[pred]->(object).
     claim_predicate: bool = False
-    created_by: tuple[str, ...] = (DOMAIN,)
+    created_by: tuple[str, ...] = (MEMORY, NEO4J)
 
 
 def _t(*types: NodeType) -> frozenset[NodeType]:
@@ -106,7 +101,7 @@ def _rel(
     src: frozenset[NodeType] = ANY,
     tgt: frozenset[NodeType] = ANY,
     claim: bool = False,
-    by: tuple[str, ...] = (DOMAIN,),
+    by: tuple[str, ...] = (MEMORY, NEO4J),
 ) -> RelationSpec:
     return RelationSpec(
         name=name,
@@ -122,14 +117,14 @@ def _rel(
 REGISTRY: tuple[RelationSpec, ...] = (
     # ── Состав, обработка и потоки вещества ──
     _rel("CONTAINS", "содержит компонент или условие", src=_t(MAT), tgt=_t(MAT, COND),
-         by=(DOMAIN, MEMORY)),
+         by=(MEMORY, NEO4J)),
     _rel("TREATED_BY", "обрабатывается технологией", src=_t(MAT), tgt=_t(PROC),
-         by=(DOMAIN, MEMORY)),
+         by=(MEMORY, NEO4J)),
     _rel("PROCESSES", "процесс обрабатывает материал", src=_t(PROC), tgt=_t(MAT), claim=True),
     _rel("PROCESSED_BY", "материал перерабатывается процессом", src=_t(MAT), tgt=_t(PROC),
          claim=True),
     _rel("PRODUCES", "процесс производит продукт", src=_t(PROC), tgt=_t(MAT), claim=True,
-         by=(DOMAIN, MEMORY)),
+         by=(MEMORY, NEO4J)),
     _rel("PRODUCED_FROM", "получено из сырья", src=_t(MAT), tgt=_t(MAT), claim=True),
     _rel("FEEDS", "питает следующую стадию", src=_t(MAT, PROC), tgt=_t(PROC)),
     _rel("REMOVES", "удаляет примесь", src=_t(PROC), tgt=_t(MAT), claim=True),
@@ -138,13 +133,13 @@ REGISTRY: tuple[RelationSpec, ...] = (
     _rel("DISSOLVED_BY", "растворяется реагентом", src=_t(MAT), tgt=_t(MAT)),
     # ── Оборудование, условия и режимы ──
     _rel("USES", "использует оборудование или реагент", src=_t(PROC), tgt=_t(EQ, MAT),
-         claim=True, by=(DOMAIN, MEMORY)),
+         claim=True, by=(MEMORY, NEO4J)),
     _rel("USED_BY", "применяется в процессе", src=_t(EQ), tgt=_t(PROC)),
     _rel("USED_IN", "используется на стадии", src=_t(EQ, MAT), tgt=_t(PROC)),
     _rel("USED_FOR", "назначено для материала или стадии", src=_t(EQ, PROC),
          tgt=_t(MAT, PROC), claim=True),
     _rel("REQUIRES", "требует условия", src=_t(PROC), tgt=_t(COND), claim=True,
-         by=(DOMAIN, MEMORY)),
+         by=(MEMORY, NEO4J)),
     _rel("REQUIRES_MIN_TEMPERATURE", "требует нижнюю температуру", src=_t(PROC),
          tgt=_t(COND), claim=True),
     _rel("OPERATES_AT", "работает при параметре", src=_t(PROC), tgt=_t(COND), claim=True),
@@ -165,17 +160,17 @@ REGISTRY: tuple[RelationSpec, ...] = (
     _rel("ALTERNATIVE_TO", "взаимозаменяемая технология", src=_t(MAT, PROC),
          tgt=_t(MAT, PROC)),
     _rel("EXPERT_IN", "экспертиза по процессу", src=_t(EXPERT), tgt=_t(PROC),
-         by=(DOMAIN, MEMORY)),
+         by=(MEMORY, NEO4J)),
     # Общий предикат извлечённого утверждения без специфичного отношения.
-    _rel("HAS_PROPERTY", "свойство без специфичного отношения", claim=True, by=(MEMORY,)),
+    _rel("HAS_PROPERTY", "свойство без специфичного отношения", claim=True),
     # ── Ярус PROVENANCE: включается только явным запросом ──
     _rel("ASSERTS", "сущность утверждает тезис", tier=RelationTier.PROVENANCE,
-         tgt=_t(CLAIM), by=(DOMAIN, MEMORY)),
+         tgt=_t(CLAIM), by=(MEMORY, NEO4J)),
     _rel("SUPPORTED_BY", "тезис поддержан источником", tier=RelationTier.PROVENANCE,
-         src=_t(CLAIM), tgt=_t(PUB), by=(DOMAIN, MEMORY)),
+         src=_t(CLAIM), tgt=_t(PUB), by=(MEMORY, NEO4J)),
     _rel("SUPERSEDES", "версия заменяет предыдущую", tier=RelationTier.PROVENANCE,
          src=_t(CLAIM), tgt=_t(CLAIM), by=(MEMORY, NEO4J)),
-    # Фрагменты происхождения создаёт и память (seed чанков), и Neo4j-индексация.
+    # Фрагменты происхождения создают память и Neo4j-индексация.
     _rel("HAS_CHUNK", "документ содержит фрагмент", tier=RelationTier.PROVENANCE,
          src=_t(PUB), tgt=_t(CHUNK), by=(NEO4J, MEMORY)),
 )
@@ -282,3 +277,4 @@ def relations_for_prompt(tier: RelationTier = RelationTier.SEMANTIC) -> str:
 def relations_for_extraction() -> str:
     """Словарь предикатов для промпта экстракции: только ярус semantic."""
     return ", ".join(SEMANTIC_RELATIONS)
+

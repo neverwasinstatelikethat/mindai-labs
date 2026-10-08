@@ -10,116 +10,6 @@ from scientific_tangle.domain.contracts import Finding, GraphEdge, GraphNode, No
 
 logger = logging.getLogger(__name__)
 
-# Имена сообществ по ключевым словам домена: порядок важен, первым выбирается
-# наиболее специфичное совпадение.
-COMMUNITY_KEYWORDS: list[tuple[str, list[str]]] = [
-    (
-        "Водоподготовка",
-        [
-            "вод",
-            "осмос",
-            "мембран",
-            "фильтрац",
-            "обессолив",
-            "ионн",
-            "выпарив",
-            "пермеат",
-            "рассол",
-            "сухой остаток",
-            "смола",
-        ],
-    ),
-    (
-        "Гидрометаллургия",
-        [
-            "выщелачивани",
-            "кучн",
-            "хлорн",
-            "цианидн",
-            "экстракц",
-            "продуктивн",
-            "руд",
-            "малахит",
-            "азурит",
-            "кислот",
-            "раствор",
-        ],
-    ),
-    (
-        "Пирометаллургия",
-        [
-            "плавк",
-            "конверт",
-            "обжиг",
-            "шлак",
-            "штейн",
-            "матт",
-            "возгон",
-            "печь",
-            "концентрат",
-            "so2",
-        ],
-    ),
-    (
-        "Электролиз",
-        [
-            "электролиз",
-            "электровыскан",
-            "электрорафинир",
-            "катод",
-            "анод",
-            "ток",
-            "напряжен",
-            "выпрям",
-            "шлам",
-            "плотность",
-        ],
-    ),
-    (
-        "Очистка растворов",
-        [
-            "осаждени",
-            "цементац",
-            "сорбц",
-            "очистк",
-            "желез",
-            "свинец",
-            "мышьяк",
-            "сурьма",
-            "цинк",
-            "гётит",
-            "ярозит",
-            "силикагел",
-        ],
-    ),
-    (
-        "Получение солей",
-        [
-            "сульфат",
-            "кобальт",
-            "литий",
-            "кристаллиз",
-            "сподумен",
-            "гидроксид",
-            "никель класс",
-            "карбонат",
-        ],
-    ),
-    (
-        "Переработка штейнов",
-        [
-            "файнштейн",
-            "хибинетт",
-            "cesl",
-            "никкельвер",
-            "niihama",
-            "sandouville",
-            "штейн",
-            "медно-никел",
-        ],
-    ),
-]
-
 TYPE_NAMES: dict[str, str] = {
     "material": "Материалы",
     "process": "Технологические процессы",
@@ -281,18 +171,15 @@ def name_community(
     types: list[str],
     used_names: set[str],
 ) -> str:
-    """Подбирает имя сообщества по ключевым словам меток или доминирующему типу."""
-    best_match: str | None = None
-    best_score = 0
-    for community_name, keywords in COMMUNITY_KEYWORDS:
-        if community_name in used_names:
-            continue
-        score = sum(1 for label in labels for keyword in keywords if keyword in label)
-        if score > best_score:
-            best_score = score
-            best_match = community_name
-    if best_match:
-        return best_match
+    """Даёт сообществу понятное имя из его меток, затем использует общий тип."""
+    label_counts = Counter(label.strip() for label in labels if label.strip())
+    ordered_labels = sorted(
+        label_counts,
+        key=lambda label: (-label_counts[label], -len(label), label.casefold()),
+    )
+    for label in ordered_labels:
+        if label not in used_names:
+            return label
     if types:
         dominant = Counter(types).most_common(1)[0][0]
         base_name = TYPE_NAMES.get(dominant, "Сообщество")

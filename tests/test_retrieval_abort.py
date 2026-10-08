@@ -42,7 +42,7 @@ def _plans() -> tuple[QueryPlan, RetrievalPlan]:
     retrieval_plan = RetrievalPlan(
         lexical_query="задержание солей",
         semantic_query="задержание солей мембраной",
-        entity_names=["шахтная вода"],
+        entity_names=["технологическая вода"],
         relation_types=["HAS_PROPERTY"],
         max_hops=4,
         use_global_context=True,
@@ -195,3 +195,4 @@ async def test_cancelling_a_run_signals_the_retrieval_thread() -> None:
 
     assert knowledge.abort_seen
     assert budget.aborted
+

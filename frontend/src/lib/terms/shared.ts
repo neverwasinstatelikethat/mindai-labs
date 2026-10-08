@@ -120,7 +120,7 @@ export const SCOPE_KEY_LABELS: Record<string, string> = {
 };
 
 export const SCOPE_VALUE_LABELS: Record<string, string> = {
-  mine_water: 'шахтная вода',
+  mine_water: 'вода',
   cold: 'холодный климат',
   temperate: 'умеренный климат',
   demo: 'учебный пример',
@@ -164,7 +164,7 @@ export function knownTerm(map: Record<string, string>, key: string | null | unde
   return map[key] ?? null;
 }
 
-/** Условия применения одной строкой: «тип воды: шахтная вода». */
+/** Условия применения одной строкой по локализованным названиям. */
 export function describeScope(scope: Record<string, string> | undefined | null): string[] {
   if (!scope) return [];
   return Object.entries(scope).map(
@@ -192,9 +192,8 @@ export function describeValue(observation: NumericObservation): string {
    Сервер приводит единицу к канону своим словарём (`agents/workflow.py`,
    `_UNIT_CANONICAL`), но исходная запись остаётся в поле `unit`, а из
    разбора приходит и «mg/L», и «ratio», и «70 процентов». Экран печатает
-   русское написание для единиц, которые действительно встречаются в домене
-   горно-металлургического корпуса. Для остального честного перевода нет:
-   единица остаётся как в источнике, и это сказано отдельно, а не молча. */
+   русское написание для известных единиц. Неизвестная единица остаётся как
+   в источнике, чтобы не менять смысл значения. */
 
 /** Каноническое написание по строчному ключу: регистр и алфавит — не другое измерение. */
 const UNIT_LABELS: Record<string, string> = {

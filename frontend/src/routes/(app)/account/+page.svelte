@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { ApiError, api } from '$lib/api';
-  import { dateTime, num } from '$lib/format';
+  import { dateTime } from '$lib/format';
   import { navLabel } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import {
@@ -11,7 +11,6 @@
     ACTIVITY_OUTCOME_LABELS,
     ACTIVITY_OUTCOME_UNKNOWN,
     DECISION_ACTION_LABELS,
-    EXPERT_RIGHT_LINE,
     JOURNAL_WINDOW_WORDS,
     MY_WORK,
     PROFILE,
@@ -28,7 +27,6 @@
   import Empty from '$lib/ui/Empty.svelte';
   import Field from '$lib/ui/Field.svelte';
   import Icon from '$lib/ui/Icon.svelte';
-  import InfoDot from '$lib/ui/InfoDot.svelte';
   import Notice from '$lib/ui/Notice.svelte';
   import Panel from '$lib/ui/Panel.svelte';
   import SectionHead from '$lib/ui/SectionHead.svelte';
@@ -40,8 +38,6 @@
 
   const PASSWORD_NOTE = 'Смена пароля закрывает прочие входы, этот остаётся.';
   const SIGNOUT_NOTE = 'Закрывает только этот вход: записи остаются.';
-  const EXPERT_DOT_TITLE = 'Экспертный признак';
-
   type RightRow = { capability: Capability; href: string };
 
   const RIGHTS: RightRow[] = [
@@ -52,8 +48,6 @@
     { capability: 'proposal:review', href: '/findings' },
     { capability: 'restricted:read', href: '/findings' },
   ];
-  const BASIC_COUNT = 4;
-
   let nameDraft = $state('');
   let namePrimed = $state(false);
   let nameEditing = $state(false);
@@ -110,17 +104,12 @@
   // Дело называется разделом, куда оно открывается: слово навигации, а не
   // служебный ключ права, чтобы список прав и полоса говорили одинаково.
   const workSections = $derived(
-    RIGHTS.map((item, index) => ({
+    RIGHTS.map((item) => ({
       ...item,
       label: navLabel(item.href),
-      basic: index < BASIC_COUNT,
       open: session.can(item.capability),
     })),
   );
-  const basicOpen = $derived(workSections.filter((item) => item.basic && item.open).length);
-  const basicTotal = $derived(workSections.filter((item) => item.basic).length);
-  const expertOpen = $derived(workSections.filter((item) => !item.basic && item.open).length);
-  const expertTotal = $derived(workSections.filter((item) => !item.basic).length);
 
   // Раздел называется один раз, даже если в него ведут три дела: список ссылок
   // не превращается в пояснение про каждое право.
@@ -131,10 +120,6 @@
     }
     return [...seen.entries()];
   });
-
-  const rightLabel = $derived(
-    session.account?.review_enabled ? 'экспертное право открыто' : 'экспертного права нет',
-  );
 
   type WorkRow = {
     key: string;
@@ -203,30 +188,11 @@
     return a ?? d;
   });
 
-  const svcRows = $derived.by(() => {
-    const account = session.account;
-    if (!account) return [];
-    // Три строки на поверхность (DESIGN.md, layout.technical-ids): поддержка
-    // ищет аккаунт по идентификатору, почте и дате регистрации. Ключи прав и
-    // классы данных экран уже показал человеческими числами и словом раздела.
-    return [
-      { label: 'Идентификатор аккаунта', value: account.id },
-      { label: 'Электронная почта', value: account.email },
-      { label: PROFILE.sinceTitle, value: ruDay(account.created_at) },
-    ];
-  });
-
   function messageOf(caught: unknown, fallback: string): string {
     if (caught instanceof ApiError && caught.status === 401) {
       return 'Вход больше не подтверждён: войдите заново и повторите действие.';
     }
     return fallback;
-  }
-
-  /** Дата служебного ряда, а не проза экрана: читается числом в моноширинном. */
-  function ruDay(iso: string): string {
-    const date = new Date(iso);
-    return Number.isNaN(date.getTime()) ? iso : date.toLocaleDateString('ru-RU');
   }
 
   function outcomeLabel(outcome: string): string {
@@ -398,22 +364,21 @@
 </script>
 
 <svelte:head>
-  <title>Профиль — Научный Клубок</title>
+  <title>Профиль — StormIdea</title>
   <meta
     name="description"
-    content="Кто вы в сервисе, какие дела открыты аккаунту, ваша лента действий и решений, расход модели и смена пароля."
+    content="Профиль, история решений и смена пароля в StormIdea."
   />
 </svelte:head>
 
 <div class="page account">
   <div class="wrap wrap--narrow stack" style="--gap: var(--s5)">
-    <SectionHead level="1" eyebrow="профиль" title="Профиль аккаунта">
+    <SectionHead level="1" title="Профиль">
       {#if view === 'ready' && session.account}
         {@const account = session.account}
         <div class="ac__id">
           <span class="avatar" aria-hidden="true">{session.initials}</span>
           <span class="grow small ac__id-name">{account.display_name}</span>
-          <StatusPill status={account.review_enabled ? 'consensus' : 'off'} label={rightLabel} />
         </div>
       {/if}
     </SectionHead>
@@ -441,40 +406,18 @@
 
       <!-- ── Кто вы и что открыто ───────────────────────────────────── -->
       <section class="ac__block" id="account-rights">
-        <SectionHead level="2" title={PROFILE.heading} />
+        <SectionHead level="2" title="Разделы пространства" />
 
         <Panel>
-          <!-- Сколько дела открыто — подписанные числа, а не предложение про
-               них: правило выдачи экспертного признака произносит один «i». -->
-          <dl class="kv ac__rights">
-            <dt>{PROFILE.basicTitle}</dt>
-            <dd><span class="num">{basicOpen} из {basicTotal}</span></dd>
-            <dt>
-              {PROFILE.expertTitle}
-              <InfoDot title={EXPERT_DOT_TITLE} body={EXPERT_RIGHT_LINE} />
-            </dt>
-            <dd><span class="num">{expertOpen} из {expertTotal}</span></dd>
-          </dl>
-
-          <div class="ac__links">
+          <nav class="ac__links" aria-label="Доступные разделы">
             {#if openLinks.length > 0}
-              <span class="micro muted">{PROFILE.goto}:</span>
               {#each openLinks as [href, label] (href)}
                 <a class="ac__link" href={href}>{label}</a>
               {/each}
             {:else}
-              <p class="small">Ни одно дело не открыто: разделы появятся, когда доступ подтвердят.</p>
+              <p class="small">Пока нет доступных разделов.</p>
             {/if}
-          </div>
-
-          <div class="ac__classes">
-            <span class="micro muted">{PROFILE.classesTitle}:</span>
-            {#if account.data_classes.length === 0}
-              <span class="micro">{PROFILE.classesEmpty}</span>
-            {:else}
-              <span class="micro">{account.data_classes.length}</span>
-            {/if}
-          </div>
+          </nav>
 
           <p class="small ac__name-row">
             <span class="muted">{PROFILE.nameTitle}:</span> {account.display_name}
@@ -736,28 +679,7 @@
     gap: var(--s3);
   }
 
-  /* Права — две подписанные строки с числами: способ выдачи экспертного
-     признака объясняет один «i», а не строка прозы под заголовком. */
-  .ac__rights {
-    margin: 0;
-  }
-
-  .ac__rights dt {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--s2);
-  }
-
-  /* Число со знаменателем читается одной строкой и на узком экране: в тесной
-     колонке «5 из 5» иначе разваливается вертикально и знаменатель перестаёт
-     относиться к числу. */
-  .ac__rights dd {
-    white-space: nowrap;
-  }
-
-  /* Куда права открываются: список ссылок вместо строки с пояснением на каждое
-     дело. Раздел назван словом навигации, поэтому имя совпадает с полосой. */
+  /* Доступные разделы остаются обычными ссылками, без сводных счётчиков прав. */
   .ac__links {
     display: flex;
     align-items: center;
@@ -770,14 +692,6 @@
     color: var(--action-ink);
     text-decoration: underline;
     text-underline-offset: 3px;
-  }
-
-  .ac__classes {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--s2) var(--s3);
-    margin-top: var(--s4);
   }
 
   .ac__name-row {

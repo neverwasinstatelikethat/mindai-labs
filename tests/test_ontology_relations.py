@@ -17,12 +17,11 @@ import pytest
 from pydantic import ValidationError
 
 from scientific_tangle.agents.tools import ResearchToolExecutor
-from scientific_tangle.domain.contracts import RetrievalPlan, ToolAction
+from scientific_tangle.domain.contracts import GraphNode, NodeType, RetrievalPlan, ToolAction
 from scientific_tangle.domain.models import QueryPlan
 from scientific_tangle.domain.relations import (
     ALL_RELATIONS,
     BY_NAME,
-    DOMAIN,
     MEMORY,
     NEO4J,
     PROVENANCE_RELATIONS,
@@ -34,14 +33,13 @@ from scientific_tangle.domain.relations import (
     spec_for,
     validate_edge,
 )
-from scientific_tangle.services.graph_rebuilder import CLAIMS, EDGES
 from scientific_tangle.services.knowledge import InMemoryKnowledgeBase
 
 SRC = Path(__file__).parents[1] / "src" / "scientific_tangle"
 
 # Файлы-создатели из реестра — они же относительные пути: имена берутся оттуда,
 # поэтому новый создатель, добавленный в RelationSpec, обязан существовать.
-CREATORS = (DOMAIN, MEMORY, NEO4J)
+CREATORS = (MEMORY, NEO4J)
 
 # Глубину обхода ограничивает схема (ToolAction/RetrievalPlan: le=4), а не реестр.
 HOP_CEILING = 4
@@ -84,35 +82,17 @@ def _declared_for(module: str) -> set[str]:
     return {spec.name for spec in BY_NAME.values() if module in spec.created_by}
 
 
-def _seed_relations() -> set[str]:
-    """Рёбра и предикаты утверждений доменного сеятеля — то, что пойдёт в Neo4j."""
-    return {edge.relation for edge in EDGES} | {claim.predicate for claim in CLAIMS}
-
-
 def _writes(module: str) -> set[str]:
-    """Рёбра, которые файл создаёт: литералы, доменный сеятель и динамический словарь."""
-    written = _written_literals(module) | _dynamic_vocabulary(module)
-    if module == DOMAIN:
-        written |= _seed_relations()
-    return written
+    """Отношения, которые хранилище может записать из проверенной подписи."""
+    return _written_literals(module) | _dynamic_vocabulary(module)
 
 
 def _literals_written(module: str) -> set[str]:
-    """Только то, что в файле стоит буквой: сеятель относится к доменному файлу."""
-    if module == DOMAIN:
-        return _written_literals(module) | _seed_relations()
+    """Только литеральные типы связей из исходника хранилища."""
     return _written_literals(module)
 
 
 # ── Инвариант «создаётся ⇔ достижимо» (п. 1) ───────────────────────────────
-
-
-def test_domain_seed_writes_exactly_the_declared_domain_relations() -> None:
-    created = _written_literals(DOMAIN) | _seed_relations()
-
-    # Симметрическая разница пуста: ни фантомов в реестре, ни немых рёбер в сеятеле.
-    assert created ^ _declared_for(DOMAIN) == set()
-    assert created, "сеятель не создаёт ни одного ребра — сверять нечего"
 
 
 @pytest.mark.parametrize("module", CREATORS)
@@ -154,24 +134,21 @@ def test_every_declared_relation_has_a_writer() -> None:
     assert set(ALL_RELATIONS) - created == set()
 
 
-def test_semantic_tier_is_seeded_or_memory_created() -> None:
-    """Новое semantic-имя без создателя падает здесь, а не пустым обходом."""
-    assert set(SEMANTIC_RELATIONS) - _declared_for(DOMAIN) <= _declared_for(MEMORY)
+def test_semantic_tier_is_created_by_workspace_stores() -> None:
+    """У отношений нет отдельного зашитого набора; их создаёт импорт источников."""
+    assert set(SEMANTIC_RELATIONS) <= _declared_for(MEMORY) | _declared_for(NEO4J)
 
 
-def test_domain_seed_relations_are_all_semantic() -> None:
-    """Сеятель заводит доменные тропы; provenance — служебные рёбра импорта."""
-    assert _seed_relations() & set(PROVENANCE_RELATIONS) == set()
-    # ASSERTS/SUPPORTED_BY пишет код утверждений сеятеля, а не список EDGES.
-    assert {"ASSERTS", "SUPPORTED_BY"} <= _written_literals(DOMAIN)
+def test_legacy_graph_node_types_remain_readable_without_migration() -> None:
+    material = GraphNode.model_validate(
+        {"id": "legacy-material", "label": "Материал", "type": "material"}
+    )
+    process = GraphNode.model_validate(
+        {"id": "legacy-process", "label": "Процесс", "type": "process"}
+    )
 
-
-def test_graph_seed_survives_the_registry_contract() -> None:
-    """Весь сеятель проходит домены/диапазоны реестра до первой записи в Neo4j."""
-    from scientific_tangle.services.graph_rebuilder import check_domain_seed
-
-    check_domain_seed()
-    assert EDGES and CLAIMS
+    assert material.model_dump()["type"] == NodeType.MATERIAL
+    assert validate_edge("TREATED_BY", material.type, process.type).name == "TREATED_BY"
 
 
 # ── Ярусы semantic / provenance (п. 2) ─────────────────────────────────────

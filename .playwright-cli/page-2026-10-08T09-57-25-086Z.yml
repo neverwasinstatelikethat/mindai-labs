@@ -1,0 +1,27 @@
+- generic [ref=f3e2]:
+  - link "Перейти к содержанию" [ref=f3e3] [cursor=pointer]:
+    - /url: "#main"
+  - main [ref=f3e4]:
+    - navigation "Основная навигация" [ref=f3e5]:
+      - link "StormIdea" [ref=f3e6] [cursor=pointer]:
+        - /url: /
+      - generic [ref=f3e14]:
+        - link "Чат" [ref=f3e15] [cursor=pointer]:
+          - /url: /research
+        - link "Гипотезы" [ref=f3e16] [cursor=pointer]:
+          - /url: /findings
+        - link "Сигналы" [ref=f3e17] [cursor=pointer]:
+          - /url: /numbers
+        - link "Связи" [ref=f3e18] [cursor=pointer]:
+          - /url: /graph
+      - generic [ref=f3e19]:
+        - button "Все разделы и что они делают" [ref=f3e20] [cursor=pointer]
+        - link "Войти" [ref=f3e23] [cursor=pointer]:
+          - /url: /login
+        - link "Создать аккаунт" [ref=f3e24] [cursor=pointer]:
+          - /url: /register
+    - generic [ref=f3e27]:
+      - generic [ref=f3e29]:
+        - heading "Связи" [level=1] [ref=f3e30]
+        - paragraph [ref=f3e31]: Изучите, как связаны факты, гипотезы и источники.
+      - paragraph [ref=f3e36]: Загружаем связи…

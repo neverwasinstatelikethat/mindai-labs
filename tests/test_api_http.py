@@ -93,7 +93,7 @@ from tests.auth_support import (
 from tests.fakes import ScriptedProvider
 from tests.test_workflow import planning_bundle
 
-QUESTION = "Какие методы обессоливания подходят для шахтной воды?"
+QUESTION = "Как сократить время обработки запросов?"
 BASE_EMAIL = "http-researcher@mindai.tech"
 EXPERT_EMAIL = "http-expert@mindai.tech"
 

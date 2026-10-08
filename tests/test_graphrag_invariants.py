@@ -51,6 +51,7 @@ from scientific_tangle.services.communities import (
     MIN_COMMUNITY_SIZE,
     community_briefs,
     detect_communities,
+    name_community,
 )
 from scientific_tangle.services.context_budget import (
     estimate_tokens,
@@ -198,6 +199,14 @@ def test_detect_communities_is_deterministic() -> None:
     ]
 
 
+def test_community_names_follow_the_actual_topic_labels() -> None:
+    sales = name_community(["Лиды", "Воронка продаж"], ["process"], set())
+    operations = name_community(["Нагрузка", "Время ответа"], ["process"], set())
+
+    assert sales == "Воронка продаж"
+    assert operations == "Время ответа"
+
+
 def test_isolated_nodes_get_a_single_fallback_community() -> None:
     nodes, _ = clique("lonely", 3)
 
@@ -212,6 +221,26 @@ def test_memory_backend_returns_computed_communities() -> None:
 
     assert graph.communities
     assert all(node.metadata.get("community") for node in graph.nodes)
+
+
+def test_memory_demo_sources_are_synthetic_and_industry_neutral() -> None:
+    knowledge = InMemoryKnowledgeBase()
+    graph = knowledge.full_graph()
+    findings = knowledge.all_findings()
+
+    assert findings
+    assert all(item.scope.get("origin") == "demo" for item in findings)
+    assert all(
+        item.evidence[0].source_title.startswith("Синтетический пример:") for item in findings
+    )
+    public_text = " ".join(
+        [*(node.label for node in graph.nodes), *(item.statement for item in findings)]
+    ).casefold()
+    assert not any(
+        term in public_text
+        for term in ("шахт", "вода", "осмос", "мембран", "ионный обмен", "выпарив")
+    )
+    assert all("mine_water" not in item.scope.values() for item in findings)
 
 
 def test_full_graph_is_a_fresh_container_over_shared_models() -> None:
@@ -490,13 +519,13 @@ def test_brief_cache_is_keyed_by_acl_slice() -> None:
     """
     knowledge = InMemoryKnowledgeBase()
     findings = knowledge.all_findings()
-    tokens = query_tokens("выпаривание энергия")
+    tokens = query_tokens("часы пик очередь")
 
     base = knowledge._community_briefs(PUBLIC_SCOPE, findings, tokens)
     expert = knowledge._community_briefs({*PUBLIC_SCOPE, DataClass.RESTRICTED}, findings, tokens)
 
-    assert not any("Энергия в 3–5 раз" in brief for brief in base)
-    assert any("Энергия в 3–5 раз" in brief for brief in expert)
+    assert not any("3–5" in brief for brief in base)
+    assert any("3–5" in brief for brief in expert)
     # Тот же запрос ещё раз: попадание в кэш не должно менять выдачу.
     assert knowledge._community_briefs(PUBLIC_SCOPE, findings, tokens) == base
 
@@ -618,8 +647,8 @@ def test_retrieval_reports_no_evidence_instead_of_seeding() -> None:
 
 def test_retrieval_returns_evidence_and_disables_the_flag() -> None:
     context = InMemoryKnowledgeBase().retrieve(
-        QueryPlan(question="обратный осмос", language="ru", mode="hybrid"),
-        plan("шахтная вода обратный осмос"),
+        QueryPlan(question="время обработки запросов", language="ru", mode="hybrid"),
+        plan("время обработки запросов"),
     )
 
     assert context.findings
@@ -667,7 +696,7 @@ def test_semantic_query_is_declared_unexecutable_in_memory() -> None:
 
     diverged = knowledge.retrieve(
         question,
-        plan("осмос шахтная вода", semantic_query="мембранное обессоливание рассола"),
+        plan("осмос технологическая вода", semantic_query="мембранное обессоливание рассола"),
     )
     identical = knowledge.retrieve(question, plan("обратный осмос"))
 
@@ -728,8 +757,8 @@ def test_data_class_propagates_from_document_to_findings_and_graph() -> None:
 def test_restricted_findings_are_cut_from_ranking() -> None:
     knowledge = InMemoryKnowledgeBase()
 
-    public = knowledge.rank_findings("обратный осмос", 5, "hybrid", {DataClass.PUBLIC})
-    everything = knowledge.rank_findings("обратный осмос", 5, "hybrid")
+    public = knowledge.rank_findings("обработка запросов проверка", 5, "hybrid", {DataClass.PUBLIC})
+    everything = knowledge.rank_findings("обработка запросов проверка", 5, "hybrid")
 
     assert public
     assert all(item.data_class is not DataClass.RESTRICTED for item in public)
@@ -745,7 +774,7 @@ def test_tool_plan_inherits_global_mode_and_hop_limit() -> None:
         question="Сравнение методов",
         language="ru",
         mode="global",
-        entity_mentions=["шахтная вода"],
+        entity_mentions=["технологическая вода"],
         max_hops=4,
     )
     action = ToolAction(
@@ -891,7 +920,7 @@ def test_select_relevant_prefers_match_over_arrival_order() -> None:
         make_finding("match", "Обратный осмос для шахтной воды", []),
     ]
 
-    selected = select_relevant(items, "шахтная вода обратный осмос", 1)
+    selected = select_relevant(items, "технологическая вода обратный осмос", 1)
 
     assert [item.id for item in selected] == ["match"]
 
@@ -1060,27 +1089,20 @@ def test_traversal_cypher_keeps_chunks_out_of_the_graph() -> None:
     assert EXPAND_CYPHER.index("ORDER BY") < EXPAND_CYPHER.index("[0..$cap]")
 
 
-def test_domain_seed_stats_report_actual_writes() -> None:
-    """preload печатал «создано 447 узлов» на каждом старте контейнера.
-
-    Счётчики снимаются с ответа Neo4j, поэтому повторная перестройка уже
-    заполненного графа возвращает нули, а не число попыток слияния.
-    """
+def test_preload_does_not_add_fixed_demo_graph_or_delete_workspace_data() -> None:
+    """Preload не должен добавлять отраслевой seed или удалять данные пользователя."""
     from scientific_tangle.services.graph_rebuilder import rebuild_semantic_graph
 
     driver = _Driver()
-    first = rebuild_semantic_graph(driver)  # type: ignore[arg-type]
-
-    # Каждый созданный узел учтён ровно одним счётчиком: узлы утверждений —
-    # в claims_created, остальные (сущности и публикации) — в nodes_created.
-    assert first["nodes_created"] + first["claims_created"] == len(driver.nodes) > 0
-    assert first["edges_created"] == len(driver.relationships) > 0
+    driver.nodes.add("workspace-source-1")
 
     assert rebuild_semantic_graph(driver) == {  # type: ignore[arg-type]
         "nodes_created": 0,
         "edges_created": 0,
         "claims_created": 0,
     }
+    assert driver.nodes == {"workspace-source-1"}
+    assert driver.relationships == set()
 
 def test_graph_snapshot_slices_by_connectivity_not_by_alphabet() -> None:
     """Полный снимок режется по степени связности, а рёбра берутся внутри среза.
@@ -1107,3 +1129,4 @@ def test_graph_snapshot_slices_by_connectivity_not_by_alphabet() -> None:
     # Потолок и полный счётчик — разные числа: раскрытие обязано называть корпус.
     assert 'count(rel) AS total' in source, "полное число рёбер корпуса больше не считается"
     assert "edges_total = _record_int(edges_total_record" in source
+

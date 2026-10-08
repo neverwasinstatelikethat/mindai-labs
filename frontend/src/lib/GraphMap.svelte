@@ -346,13 +346,6 @@
 
   const filtered = $derived(scopedNodes.length);
 
-  /** Что нашлось в области по запросу: считается до потолка поля. */
-  const hits = $derived.by(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return 0;
-    return areaNodes.filter((node) => searchHit(node, q)).length;
-  });
-
   const incident = $derived.by(() => {
     const ids = new Set<string>();
     if (!selectedNode) return ids;
@@ -495,7 +488,6 @@
     new Set(columns.flatMap((column) => column.rows.map((node) => node.id))),
   );
 
-  const shownCount = $derived(visibleIds.size);
   const restTotal = $derived(columns.reduce((sum, column) => sum + column.rest, 0));
 
   /**
@@ -528,10 +520,6 @@
     }
     return { drawn, other };
   });
-
-  const offFieldEdges = $derived(
-    scopeEdges.length - edgeSplit.drawn.length - edgeSplit.other.length,
-  );
 
   // ── Измерение поля ──────────────────────────────────────────────────────
   function labelFor(edge: GraphEdge): string {
@@ -803,11 +791,6 @@
   });
   const shownLinks = $derived(
     linksAll ? readEdges : readEdges.slice(0, LINK_PAGE),
-  );
-
-  /** Подписей на линиях меньше, чем самих линий: поле об этом говорит. */
-  const hiddenMarks = $derived(
-    narrow ? 0 : Math.max(0, edgeSplit.drawn.length - marks.length),
   );
 
   function rowOf(id: string): GraphNode | null {
@@ -1288,57 +1271,6 @@
       </div>
 
       <p class="sr-only" aria-live="polite" role="status">{announcement}</p>
-
-      <!-- «Сколько показано», а не как устроено поле: каждое число подписано
-           своим элементом и смотрит на ту область, что лежит на поле. -->
-      <dl class="map__stats">
-        <div>
-          <dt>Записей на поле</dt>
-          <dd class="num">{shownCount} из {filtered}</dd>
-        </div>
-        <div>
-          <dt>Связей в отборе</dt>
-          <dd class="num">{scopeEdges.length}</dd>
-        </div>
-        <div>
-          <!-- В вертикальной раскладке линий нет: отношения читаются под каждой
-               строкой, поэтому и счётчик обязан называть то, что человек видит, а
-               не то, что лежало бы на линиях в горизонтальной. -->
-          <dt>{narrow ? 'Связей под строками' : 'Связей на линиях'}</dt>
-          <dd class="num">
-            {narrow ? edgeSplit.drawn.length + edgeSplit.other.length : edgeSplit.drawn.length}
-          </dd>
-        </div>
-        {#if readEdges.length > 0}
-          <div>
-            <dt>Связей в списке ниже</dt>
-            <dd class="num">{readEdges.length}</dd>
-          </div>
-        {/if}
-        {#if query.trim() !== ''}
-          <div>
-            <dt>Совпадений поиска в области</dt>
-            <dd class="num">{hits}</dd>
-          </div>
-        {/if}
-        {#if offFieldEdges > 0}
-          <div>
-            <dt>Связей с записью вне поля</dt>
-            <dd class="num">{offFieldEdges}</dd>
-          </div>
-        {/if}
-      </dl>
-
-      {#if hiddenMarks > 0}
-        <p class="micro muted map__marknote">
-          Имен на линиях меньше, чем самих линий: {countOf(
-            hiddenMarks,
-            MAP_NOUN.link.one,
-            MAP_NOUN.link.few,
-            MAP_NOUN.link.many,
-          )} читаются в списке связей под полем.
-        </p>
-      {/if}
 
       <!-- Слой под полем живёт только ради своих действий: когда потолок
            отрисовки не упёрся и отбора нет, пустая полоса не раздвигает
@@ -1954,41 +1886,6 @@
     align-items: center;
     gap: var(--s3);
     flex-wrap: wrap;
-  }
-
-  /* «Сколько показано»: каждое число стоит со своей подписью, а не склеено
-     в одну строку. */
-  .map__stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
-    gap: var(--s2) var(--s5);
-    margin: 0;
-    padding: var(--s3) var(--s4);
-    border-radius: var(--r-md);
-    background: var(--surface-sunk);
-    font-size: var(--t-micro);
-  }
-
-  .map__stats div {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--s3);
-  }
-
-  .map__stats dt {
-    color: var(--ink-3);
-  }
-
-  .map__stats dd {
-    margin: 0;
-    color: var(--ink-2);
-    white-space: nowrap;
-  }
-
-  .map__marknote {
-    margin: 0;
-    max-width: 68ch;
   }
 
   .map__other-list {

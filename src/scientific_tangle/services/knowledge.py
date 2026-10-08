@@ -1717,120 +1717,115 @@ class InMemoryKnowledgeBase:
         )
 
     def _seed_findings(self) -> list[Finding]:
-        """Демонстрационный корпус memory-контура.
+        """Синтетический корпус memory-контура для локального запуска и тестов.
 
         Каждой находке проставляется ``origin=demo``: рабочий контур обязан
-        отличать фиктивные «источники» seed-адаптера от импортированных документов
-        и не ранжировать их как доказательства по горно-металлургическому корпусу.
+        отличать примеры от пользовательских документов и не выдавать их за
+        доказательства из рабочего пространства.
         """
         corpus = [
             Finding(
                 id="finding-ro",
                 statement=(
-                    "Обратный осмос обеспечивает удаление 95–99% растворённых солей и подходит "
-                    "для достижения сухого остатка ≤1000 мг/л после предварительной очистки."
+                    "Общий шаблон ответа сокращает среднее время обработки запроса до 18–22 минут."
                 ),
                 confidence=0.92,
                 evidence=[
                     self._evidence(
-                        "water-treatment-review",
-                        "Обзор методов обессоливания шахтных вод",
+                        "request-time-review",
+                        "Синтетический пример: время обработки запросов",
                         14,
-                        "Задержание растворённых солей мембраной обратного осмоса "
-                        "составляет 95–99%.",
+                        "После введения общего шаблона среднее время обработки запроса "
+                        "составило 18–22 минуты.",
                     )
                 ],
-                subject="reverse-osmosis",
-                predicate="HAS_SALT_REJECTION",
-                scope={"water_type": "mine_water"},
+                subject="request-template",
+                predicate="REDUCES_PROCESSING_TIME",
+                scope={"group": "general"},
                 observations=[
-                    self._range_obs("salt_rejection", 95, 99, "%", "95–99%"),
-                    self._point_obs("dry_residue", 1000, "mg/L", "сухой остаток ≤1000 мг/л"),
+                    self._range_obs("processing_time", 18, 22, "min", "18–22 минуты"),
                 ],
             ),
             Finding(
                 id="finding-ro-pilot",
                 statement=(
-                    "Пилотные испытания обратного осмоса показали задержание солей "
-                    "на уровне 80–85% при пониженном давлении."
+                    "В пилотной группе запросы обрабатывали за 24–29 минут при среднем "
+                    "времени 31 минута."
                 ),
                 confidence=0.70,
                 evidence=[
                     self._evidence(
-                        "ro-pilot-study",
-                        "Пилот обратного осмоса",
+                        "request-time-pilot",
+                        "Синтетический пример: пилотная группа",
                         5,
-                        "Задержание солей составило 80–85%.",
+                        "Среднее время обработки запроса составило 24–29 минут.",
                     )
                 ],
-                subject="reverse-osmosis",
-                predicate="HAS_SALT_REJECTION",
-                scope={"water_type": "mine_water"},
-                observations=[self._range_obs("salt_rejection", 80, 85, "%", "80–85%")],
+                subject="request-handling",
+                predicate="HAS_PROCESSING_TIME",
+                scope={"group": "pilot"},
+                observations=[
+                    self._range_obs("processing_time", 24, 29, "min", "24–29 минут")
+                ],
             ),
             Finding(
                 id="finding-ion",
                 statement=(
-                    "Ионный обмен целесообразен как селективная ступень для Ca и Mg, "
-                    "но регенерационные стоки ограничивают применение в одиночку."
+                    "Автоматическая проверка находит 82–91% записей с пропущенными полями."
                 ),
                 confidence=0.84,
                 evidence=[
                     self._evidence(
-                        "ion-exchange-protocol",
-                        "Протокол пилотных испытаний ионного обмена",
+                        "missing-fields-review",
+                        "Синтетический пример: проверка записей",
                         7,
-                        "Снижение Ca и Mg достигало 82–91%; требовалась регенерация смолы.",
+                        "Проверка выявила пропуски в 82–91% записей.",
                     )
                 ],
-                subject="ion-exchange",
-                predicate="HAS_REMOVAL_EFFICIENCY",
-                scope={"water_type": "mine_water"},
-                observations=[self._range_obs("ca_mg_removal", 82, 91, "%", "82–91%")],
+                subject="record-check",
+                predicate="FINDS_MISSING_FIELDS",
+                scope={},
+                observations=[self._range_obs("missing_records", 82, 91, "%", "82–91%")],
             ),
             Finding(
                 id="finding-thermal",
                 statement=(
-                    "Термическое выпаривание устойчиво к широкому составу воды, "
-                    "но требует в 3–5 раз больше энергии, чем мембранная схема."
+                    "В часы пик очередь задач вырастает в 3–5 раз относительно среднего потока."
                 ),
                 confidence=0.78,
                 status="disputed",
                 data_class=DataClass.RESTRICTED,
                 evidence=[
                     self._evidence(
-                        "thermal-comparison",
-                        "Сравнение технологий концентрирования",
+                        "peak-load-review",
+                        "Синтетический пример: нагрузка на очередь",
                         22,
-                        "Удельные энергозатраты выпаривания превышали мембранный "
-                        "вариант в 3–5 раз.",
+                        "В часы пик число ожидающих задач было в 3–5 раз выше среднего.",
                     )
                 ],
-                subject="evaporation",
-                predicate="HAS_ENERGY_RATIO",
-                scope={"water_type": "mine_water"},
-                observations=[self._range_obs("energy_ratio", 3, 5, "ratio", "3–5 раз")],
+                subject="task-queue",
+                predicate="HAS_PEAK_LOAD",
+                scope={},
+                observations=[self._range_obs("queue_growth", 3, 5, "ratio", "3–5 раз")],
             ),
             Finding(
                 id="finding-climate",
                 statement=(
-                    "Для холодного климата мембранный блок требует утепления и поддержания "
-                    "температуры сырья выше 8 °C."
+                    "Для дополнительной проверки одной заявки требуется не менее 8 минут."
                 ),
                 confidence=0.81,
                 evidence=[
                     self._evidence(
-                        "cold-climate-membranes",
-                        "Эксплуатация мембран в холодном климате",
+                        "high-load-review",
+                        "Синтетический пример: обработка при высокой нагрузке",
                         9,
-                        "Стабильная производительность наблюдалась при температуре "
-                        "питания выше 8 °C.",
+                        "При загрузке выше 80% дополнительная проверка занимала более 8 минут.",
                     )
                 ],
-                subject="reverse-osmosis",
-                predicate="REQUIRES_MIN_TEMPERATURE",
-                scope={"climate": "cold"},
-                observations=[self._point_obs("min_temperature", 8, "°C", "выше 8 °C")],
+                subject="extra-check",
+                predicate="HAS_MINIMUM_PROCESSING_TIME",
+                scope={"load": "high"},
+                observations=[self._point_obs("check_duration", 8, "min", "не менее 8 минут")],
             ),
         ]
         return [
@@ -1841,38 +1836,38 @@ class InMemoryKnowledgeBase:
     @staticmethod
     def _seed_graph() -> GraphSnapshot:
         nodes = [
-            GraphNode(id="water", label="Шахтная вода", type=NodeType.MATERIAL),
-            GraphNode(id="sulfates", label="Сульфаты 200–300 мг/л", type=NodeType.CONDITION),
-            GraphNode(id="chlorides", label="Хлориды 200–300 мг/л", type=NodeType.CONDITION),
-            GraphNode(id="reverse-osmosis", label="Обратный осмос", type=NodeType.PROCESS),
-            GraphNode(id="ion-exchange", label="Ионный обмен", type=NodeType.PROCESS),
-            GraphNode(id="evaporation", label="Выпаривание", type=NodeType.PROCESS),
+            GraphNode(id="water", label="Обработка запросов", type=NodeType.PROCESS),
+            GraphNode(id="sulfates", label="Входящий поток", type=NodeType.CONDITION),
+            GraphNode(id="chlorides", label="Очередь задач", type=NodeType.CONDITION),
+            GraphNode(id="reverse-osmosis", label="Общий шаблон ответа", type=NodeType.PROCESS),
+            GraphNode(id="ion-exchange", label="Автоматическая проверка", type=NodeType.PROCESS),
+            GraphNode(id="evaporation", label="Обработка в часы пик", type=NodeType.PROCESS),
             GraphNode(
                 id="claim-ro",
-                label="Сухой остаток ≤1000 мг/л",
+                label="18–22 минуты на запрос",
                 type=NodeType.CLAIM,
                 confidence=0.92,
             ),
             GraphNode(
                 id="claim-energy",
-                label="Энергия в 3–5 раз выше",
+                label="Очередь выросла в 3–5 раз",
                 type=NodeType.CLAIM,
                 confidence=0.78,
                 data_class=DataClass.RESTRICTED,
             ),
-            GraphNode(id="expert", label="Лаборатория водоподготовки", type=NodeType.EXPERT),
+            GraphNode(id="expert", label="Экспертная группа", type=NodeType.EXPERT),
         ]
         edges = [
-            GraphEdge(id="e1", source="water", target="sulfates", relation="CONTAINS"),
-            GraphEdge(id="e2", source="water", target="chlorides", relation="CONTAINS"),
-            GraphEdge(id="e3", source="water", target="reverse-osmosis", relation="TREATED_BY"),
-            GraphEdge(id="e4", source="water", target="ion-exchange", relation="TREATED_BY"),
+            GraphEdge(id="e1", source="water", target="sulfates", relation="HAS_INPUT"),
+            GraphEdge(id="e2", source="water", target="chlorides", relation="HAS_QUEUE"),
+            GraphEdge(id="e3", source="water", target="reverse-osmosis", relation="IMPROVED_BY"),
+            GraphEdge(id="e4", source="water", target="ion-exchange", relation="CHECKED_BY"),
             GraphEdge(id="e5", source="reverse-osmosis", target="claim-ro", relation="PRODUCES"),
             GraphEdge(
                 id="e6",
                 source="evaporation",
                 target="claim-energy",
-                relation="REQUIRES",
+                relation="HAS_PEAK_LOAD",
                 data_class=DataClass.RESTRICTED,
             ),
             GraphEdge(id="e7", source="expert", target="reverse-osmosis", relation="EXPERT_IN"),

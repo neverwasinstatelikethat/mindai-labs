@@ -48,6 +48,12 @@ API_CLIENT = FRONTEND_SRC / "lib" / "api.ts"
 PREFIX = "/api/v1"
 
 SERVICE_ONLY: dict[str, str] = {
+    f"{PREFIX}/audit": (
+        "операторский журнал с правом audit:read; пользовательской ленты аудита нет"
+    ),
+    f"{PREFIX}/corpus/stats": (
+        "сводка корпуса для внутренней диагностики состава, экран её не показывает"
+    ),
     f"{PREFIX}/demo": (
         "пошаговый прогон живого контура для замера и разбора: ни один экран его не зовёт "
         "(витрина объясняет это словом и не притворяется прогоном), доступ закрыт сессией и Origin"
@@ -70,6 +76,21 @@ SERVICE_ONLY: dict[str, str] = {
     ),
     f"{PREFIX}/evaluations/pipeline-benchmark": (
         "конвейерная оценка: тот же порядок вызова, что у retrieval-прогона"
+    ),
+    f"{PREFIX}/evaluations": "служебная история оценочных прогонов, пользовательского экрана нет",
+    f"{PREFIX}/evaluations/gold": "эталонные примеры читают оценочные прогоны, не интерфейс",
+    f"{PREFIX}/experiments": (
+        "служебные записи экспериментов политики агента, пользовательского экрана нет"
+    ),
+    f"{PREFIX}/proposals": "внутренние предложения самообучения не показываются пользователю",
+    f"{PREFIX}/proposals/{{proposal_id}}/experiment": (
+        "запуск сравнительного прогона доступен только внутреннему контуру"
+    ),
+    f"{PREFIX}/proposals/{{proposal_id}}/review": (
+        "решение по внутренним предложениям не является действием пользователя"
+    ),
+    f"{PREFIX}/me/usage": (
+        "сводка использования аккаунта не является поверхностью пользовательского интерфейса"
     ),
 }
 
@@ -291,7 +312,7 @@ def test_history_screen_names_every_recorded_decision_verb() -> None:
     Сверка двусторонняя: каждое значение, которое бэкенд правда умеет писать, обязано
     быть подписано, и ни одной подписи выдуманного значения быть не должно.
     """
-    terms = (FRONTEND_SRC / "lib" / "terms.ts").read_text(encoding="utf-8")
+    terms = (FRONTEND_SRC / "lib" / "terms" / "merges.ts").read_text(encoding="utf-8")
     body = _ts_object(terms, "DECISION_DETAILS")
     details = {
         action: _ts_keys(inner)
@@ -319,7 +340,10 @@ def test_history_screen_names_every_recorded_decision_verb() -> None:
             f"а сервис пишет {sorted(values)}"
         )
 
-    labelled = _ts_keys(_ts_object(terms, "DECISION_ACTION_LABELS"))
+    account_terms = (FRONTEND_SRC / "lib" / "terms" / "account.ts").read_text(
+        encoding="utf-8"
+    )
+    labelled = _ts_keys(_ts_object(account_terms, "DECISION_ACTION_LABELS"))
     actions = set(get_args(ExpertDecision.model_fields["action"].annotation))
     assert actions - labelled == set(), (
         f"действие попалось в истории без читаемого имени: {sorted(actions - labelled)}"
