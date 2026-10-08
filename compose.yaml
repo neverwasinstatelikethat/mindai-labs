@@ -32,7 +32,8 @@ services:
       # сервис с дефолтами config.py — «модель нет, бюджет другой», и видно это
       # было только по фактическим ответам. Значения совпадают с config.py.
       GIGACHAT_API_KEY: ${GIGACHAT_API_KEY:-}
-      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-GigaChat}
+      GIGACHAT_AGENT_MODEL: ${GIGACHAT_AGENT_MODEL:-GigaChat-3-Ultra}
+      GIGACHAT_GRAPHRAG_MODEL: ${GIGACHAT_GRAPHRAG_MODEL:-GigaChat-Pro}
       GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
       GIGACHAT_TRUSTED_ROOTS: ${GIGACHAT_TRUSTED_ROOTS:-certs/russian-trusted-root-ca.crt}
       GIGACHAT_MAX_CONCURRENT: ${GIGACHAT_MAX_CONCURRENT:-1}

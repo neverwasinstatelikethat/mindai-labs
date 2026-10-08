@@ -295,7 +295,10 @@ class AppDependencies:
         self.evolution: EvolutionService = EvolutionService(self.provider)
         self.resolution: EntityResolutionWorkbench = EntityResolutionWorkbench(self.settings)
         self.ingestion: IngestionService = IngestionService(
-            self.knowledge, self.provider, self.resolution
+            self.knowledge,
+            self.provider,
+            self.resolution,
+            model=self.settings.gigachat_graphrag_model,
         )
         self.comparison: ComparisonService = ComparisonService()
         self.exporter: ExportService = ExportService()
@@ -813,7 +816,7 @@ async def _record_cancelled_run(
             try:
                 await deps.state.record_llm_usage(
                     account_id=account.id,
-                    model=deps.settings.gigachat_model,
+                    model=deps.settings.gigachat_agent_model,
                     prompt_tokens=usage.prompt_tokens,
                     completion_tokens=usage.completion_tokens,
                     latency_ms=usage.latency_ms,
@@ -1684,7 +1687,7 @@ async def _record_llm_usage(
     try:
         await deps.state.record_llm_usage(
             account_id=account.id,
-            model=deps.settings.gigachat_model,
+            model=deps.settings.gigachat_agent_model,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             latency_ms=usage.latency_ms,

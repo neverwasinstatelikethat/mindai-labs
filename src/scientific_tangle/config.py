@@ -19,17 +19,15 @@ CHARS_PER_TOKEN_RU = 2.4
 # назвать точный лимит. Неизвестные имена не проверяются.
 _GIGACHAT_CONTEXT_WINDOWS: dict[str, int] = {
     "GigaChat": 8192,
-    "GigaChat-Pro": 8192,
+    "GigaChat-Pro": 128_000,
     "GigaChat-Max": 8192,
+    "GigaChat-3-Ultra": 128_000,
 }
 # Резерв под систему, JSON-схему structured output, историю ветки и вывод модели.
 _PROMPT_OVERHEAD_TOKENS = 3072
-# Бюджет по умолчанию выводится из тех же констант, что и предупреждение ниже:
-# GigaChat — единственный провайдер продукта, и базовая конфигурация не должна
-# стартовать значением, которое её же проверка называет недостижимым.
-_DEFAULT_CONTEXT_TOKEN_BUDGET = (
-    _GIGACHAT_CONTEXT_WINDOWS["GigaChat"] - _PROMPT_OVERHEAD_TOKENS
-)
+# Это бюджет доказательств, которые приложение включает в запрос, а не размер
+# окна модели: контекстное окно 128k не означает, что нужно отправлять все 128k.
+_DEFAULT_CONTEXT_TOKEN_BUDGET = 5120
 
 # Доверенные источники cookie-запросов (CSRF). Порты контура взяты из диапазона
 # 20000–49000 и выбраны нестандартно: 3000/8000/9090 на рабочих машинах обычно
@@ -53,7 +51,7 @@ DEFAULT_TRUSTED_ORIGINS = ",".join(
 # прогон тратит свой дедлайн на очередь чужих обращений.
 _ADMISSION_CALLS_PER_RUN = 8
 # Оценка одного structured-output обращения: консервативно, по бюджету вывода
-# 2048 токенов, а не по лучшему случаю.
+# 16384 токенов, а не по лучшему случаю.
 _ADMISSION_SECONDS_PER_CALL = 15.0
 
 
@@ -66,7 +64,9 @@ class Settings(BaseSettings):
     # GigaChat — единственный LLM-провайдер платформы.
     gigachat_api_key: str | None = Field(default=None, repr=False)
     gigachat_base_url: str = "https://gigachat.devices.sberbank.ru/api/v1"
-    gigachat_model: str = "GigaChat"
+    gigachat_agent_model: str = "GigaChat-3-Ultra"
+    gigachat_graphrag_model: str = "GigaChat-Pro"
+    # Legacy adapter retained for compatibility; production retrieval does not create it.
     gigachat_embeddings_model: str = "Embeddings"
     # TLS проверяется всегда: ключ провайдера не должен уходить в незащищённый канал.
     gigachat_verify_ssl_certs: bool = True
@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     # Бюджет вывода одного обращения. Без него остаётся дефолт провайдера: он
     # не документирован в контуре и режет structured output на середине JSON —
     # молча, без finish_reason в тексте отказа.
-    gigachat_max_output_tokens: int = Field(default=2048, ge=256)
+    gigachat_max_output_tokens: int = Field(default=16384, ge=256, le=16384)
     # Individual tier (GIGACHAT_API_PERS) — только 1 одновременный запрос.
     gigachat_max_concurrent: int = Field(default=1, ge=1)
     # Транспортные повторы внутри SDK; поверх — не больше двух попыток schema-repair.
@@ -229,14 +229,14 @@ class Settings(BaseSettings):
         промпт отклоняется самой моделью, и это выглядит как деградация LLM,
         а не как ошибка конфигурации. Предупреждение делает связь видимой.
         """
-        window = _GIGACHAT_CONTEXT_WINDOWS.get(self.gigachat_model)
+        window = _GIGACHAT_CONTEXT_WINDOWS.get(self.gigachat_agent_model)
         if window is not None and self.context_token_budget > window - _PROMPT_OVERHEAD_TOKENS:
             logger.warning(
                 "CONTEXT_TOKEN_BUDGET=%d превышает оценку окна модели %s (%d токенов): "
                 "промпты reasoner/critic будут отклонены моделью; уменьшите бюджет "
                 "или укажите модель с большим окном",
                 self.context_token_budget,
-                self.gigachat_model,
+                self.gigachat_agent_model,
                 window,
             )
         return self

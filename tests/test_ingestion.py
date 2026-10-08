@@ -66,6 +66,23 @@ async def test_ingestion_writes_extracted_claim_and_provenance_to_graph() -> Non
     assert any(finding.evidence[0].source_title == "Пилот" for finding in knowledge.all_findings())
 
 
+@pytest.mark.asyncio
+async def test_document_ingestion_uses_configured_graphrag_model() -> None:
+    provider = ScriptedProvider(IngestionBundle(extraction=extraction()))
+    service = IngestionService(
+        InMemoryKnowledgeBase(), provider, model="GigaChat-Pro"
+    )
+
+    await service.ingest(
+        DocumentRequest(
+            title="Пилот",
+            text="Обратный осмос применён для очистки шахтной воды.",
+        )
+    )
+
+    assert provider.models == ["GigaChat-Pro"]
+
+
 def test_json_and_xlsx_parsers_preserve_source_fragments() -> None:
     json_document = parse_document("sample.json", b'{"material":"ore","value":42}')
 
