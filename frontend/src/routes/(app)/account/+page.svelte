@@ -274,7 +274,10 @@
         {@const account = session.account}
         <div class="ac__id">
           <span class="avatar" aria-hidden="true">{session.initials}</span>
-          <span class="grow small ac__id-name">{account.display_name}</span>
+          <span class="ac__id-info">
+            <strong class="small ac__id-name">{account.display_name}</strong>
+            <span class="micro muted">{account.email}</span>
+          </span>
         </div>
       {/if}
     </SectionHead>
@@ -305,25 +308,44 @@
         <SectionHead level="2" title="Разделы пространства" />
 
         <Panel tone="sage">
-          <nav class="ac__links" aria-label="Доступные разделы">
+          <nav aria-label="Доступные разделы">
             {#if openLinks.length > 0}
-              {#each openLinks as [href, label] (href)}
-                <a class="ac__link" href={href}>{label}</a>
-              {/each}
+              <ul class="ac__links">
+                {#each openLinks as [href, label] (href)}
+                  <li>
+                    <a class="ac__link" href={href}>
+                      <span>{label}</span>
+                      <Icon name="arrowRight" size={18} />
+                    </a>
+                  </li>
+                {/each}
+              </ul>
             {:else}
-              <p class="small">Пока нет доступных разделов.</p>
+              <p class="small ac__no-links">Пока нет доступных разделов.</p>
             {/if}
           </nav>
+        </Panel>
+      </section>
 
-          <p class="small ac__name-row">
-            <span class="muted">{PROFILE.nameTitle}:</span> {account.display_name}
-            <Button variant="ghost" size="sm" onclick={() => (nameEditing = !nameEditing)}>
+      <section class="ac__block ac__identity" id="account-identity">
+        <SectionHead level="2" title="Данные аккаунта" />
+        <Panel>
+          <div class="ac__name-row">
+            <div>
+              <p class="micro muted">{PROFILE.nameTitle}</p>
+              <p class="small ac__identity-value">{account.display_name}</p>
+            </div>
+            <div>
+              <p class="micro muted">Электронная почта</p>
+              <p class="small ac__identity-value">{account.email}</p>
+            </div>
+            <Button variant="quiet" size="sm" icon="edit" onclick={() => (nameEditing = !nameEditing)}>
               {nameEditing ? 'Отменить' : PROFILE.editName}
             </Button>
-          </p>
+          </div>
 
           {#if nameEditing}
-            <form class="stack" style="--gap: var(--s3)" onsubmit={saveProfile}>
+            <form class="stack ac__profile-form" onsubmit={saveProfile}>
               <Field
                 label={PROFILE.nameTitle}
                 name="display_name"
@@ -407,81 +429,83 @@
         {/if}
       </section>
 
-      <!-- ── Смена пароля      <!-- ── Смена пароля ───────────────────────────────────────────── -->
+      <!-- ── Доступ к аккаунту ─────────────────────────────────────────── -->
       <section class="ac__block ac__security" id="account-password">
-        <SectionHead level="2" title={PROFILE.passwordTitle} lead={PASSWORD_NOTE} />
+        <SectionHead level="2" title="Безопасность" />
 
         <Panel tone="lav">
-          <form class="stack" style="--gap: var(--s4)" onsubmit={savePassword}>
-            <Field
-              label="Текущий пароль"
-              name="current_password"
-              type="password"
-              autocomplete="current-password"
-              error={pwdErrors.current ?? ''}
-              disabled={pwdBusy}
-              bind:value={currentPwd}
-            />
-            <Field
-              label="Новый пароль"
-              name="new_password"
-              type="password"
-              autocomplete="new-password"
-              hint={`Не короче ${PASSWORD_MIN} символов.`}
-              error={pwdErrors.next ?? ''}
-              disabled={pwdBusy}
-              bind:value={newPwd}
-            />
-            <Field
-              label="Повторите новый пароль"
-              name="confirm_password"
-              type="password"
-              autocomplete="new-password"
-              error={pwdErrors.confirm ?? ''}
-              disabled={pwdBusy}
-              bind:value={confirmPwd}
-            />
+          <div class="ac__security-grid">
+            <section class="ac__security-password" aria-labelledby="account-password-title">
+              <h3 id="account-password-title" class="h4">{PROFILE.passwordTitle}</h3>
+              <p class="micro muted">{PASSWORD_NOTE}</p>
+              <form class="stack" onsubmit={savePassword}>
+                <Field
+                  label="Текущий пароль"
+                  name="current_password"
+                  type="password"
+                  autocomplete="current-password"
+                  error={pwdErrors.current ?? ''}
+                  disabled={pwdBusy}
+                  bind:value={currentPwd}
+                />
+                <Field
+                  label="Новый пароль"
+                  name="new_password"
+                  type="password"
+                  autocomplete="new-password"
+                  hint={`Не короче ${PASSWORD_MIN} символов.`}
+                  error={pwdErrors.next ?? ''}
+                  disabled={pwdBusy}
+                  bind:value={newPwd}
+                />
+                <Field
+                  label="Повторите новый пароль"
+                  name="confirm_password"
+                  type="password"
+                  autocomplete="new-password"
+                  error={pwdErrors.confirm ?? ''}
+                  disabled={pwdBusy}
+                  bind:value={confirmPwd}
+                />
 
-            {#if pwdErrors.form}
-              <Notice tone="error" title={PROFILE.passwordTitle}>{pwdErrors.form}</Notice>
-            {/if}
-            {#if pwdConfirmed}
-              <Notice tone="ok" title={PROFILE.passwordSavedTitle}>{PROFILE.passwordSavedBody}</Notice>
-            {/if}
+                {#if pwdErrors.form}
+                  <Notice tone="error" title={PROFILE.passwordTitle}>{pwdErrors.form}</Notice>
+                {/if}
+                {#if pwdConfirmed}
+                  <Notice tone="ok" title={PROFILE.passwordSavedTitle}>{PROFILE.passwordSavedBody}</Notice>
+                {/if}
 
-            <div class="row">
-              <Button type="submit" variant="action" busy={pwdBusy} disabled={pwdBusy}>
-                {PROFILE.passwordSave}
+                <div class="row">
+                  <Button type="submit" variant="action" busy={pwdBusy} disabled={pwdBusy}>
+                    {PROFILE.passwordSave}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    disabled={pwdBusy}
+                    onclick={() => {
+                      currentPwd = '';
+                      newPwd = '';
+                      confirmPwd = '';
+                      pwdErrors = {};
+                      pwdConfirmed = false;
+                    }}
+                  >
+                    {PROFILE.passwordClear}
+                  </Button>
+                </div>
+              </form>
+            </section>
+
+            <section class="ac__security-signout" aria-labelledby="account-signout-title">
+              <h3 id="account-signout-title" class="h4">{PROFILE.signoutTitle}</h3>
+              <p class="micro muted">{SIGNOUT_NOTE}</p>
+              {#if outError}
+                <Notice tone="error" title={PROFILE.signoutTitle}>{outError}</Notice>
+              {/if}
+              <Button variant="ink" icon="logout" busy={outBusy !== ''} disabled={outBusy !== ''} onclick={() => void signOut()}>
+                {PROFILE.signoutAction}
               </Button>
-              <Button
-                variant="ghost"
-                disabled={pwdBusy}
-                onclick={() => {
-                  currentPwd = '';
-                  newPwd = '';
-                  confirmPwd = '';
-                  pwdErrors = {};
-                  pwdConfirmed = false;
-                }}
-              >
-                {PROFILE.passwordClear}
-              </Button>
-            </div>
-          </form>
-        </Panel>
-      </section>
-
-      <!-- ── Выход ──────────────────────────────────────────────────── -->
-      <section class="ac__block ac__signout" id="account-signout">
-        <SectionHead level="2" title={PROFILE.signoutTitle} lead={SIGNOUT_NOTE} />
-        <Panel tone="coral">
-          {#if outError}
-            <Notice tone="error" title={PROFILE.signoutTitle}>{outError}</Notice>
-          {/if}
-          <div class="row">
-            <Button variant="ink" icon="logout" busy={outBusy !== ''} disabled={outBusy !== ''} onclick={() => void signOut()}>
-              {PROFILE.signoutAction}
-            </Button>
+            </section>
           </div>
         </Panel>
       </section>
@@ -501,18 +525,18 @@
     grid-template-columns: minmax(18rem, 0.8fr) minmax(0, 1.35fr);
     grid-template-areas:
       "title title"
+      "identity work"
       "access work"
-      "security work"
-      "signout work";
+      "security security";
     align-items: start;
     gap: var(--s5);
   }
 
   .profile :global(.account__title) { grid-area: title; }
   .ac__access { grid-area: access; }
+  .ac__identity { grid-area: identity; }
   .ac__work { grid-area: work; }
   .ac__security { grid-area: security; }
-  .ac__signout { grid-area: signout; }
 
   .ac__block {
     display: flex;
@@ -539,6 +563,12 @@
     overflow-wrap: anywhere;
   }
 
+  .ac__id-info {
+    display: grid;
+    gap: var(--s1);
+    min-width: 0;
+  }
+
   .row.ac__loading {
     --gap: var(--s4);
     align-items: flex-start;
@@ -550,27 +580,87 @@
     gap: var(--s3);
   }
 
-  /* Доступные разделы остаются обычными ссылками, без сводных счётчиков прав. */
+  /* Каждая ссылка ведёт к самостоятельному разделу, поэтому список остаётся
+     навигацией, а не набором несвязанных чипов. */
   .ac__links {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--s2) var(--s3);
-    margin-top: var(--s4);
+    display: grid;
+    gap: 0;
+    list-style: none;
+    margin: 0;
+    padding: 0;
   }
 
   .ac__link {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+    padding-block: var(--s3);
+    border-top: 1px solid var(--line-soft);
     color: var(--action-ink);
-    text-decoration: underline;
-    text-underline-offset: 3px;
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .ac__link:hover {
+    color: var(--ink);
+  }
+
+  .ac__link:focus-visible {
+    border-radius: var(--r-xs);
+    outline: 2px solid var(--action-ink);
+    outline-offset: 3px;
+  }
+
+  .ac__no-links {
+    margin: 0;
   }
 
   .ac__name-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
     align-items: center;
-    flex-wrap: wrap;
+    gap: var(--s4);
+  }
+
+  .ac__name-row p {
+    margin: 0;
+  }
+
+  .ac__identity-value {
+    overflow-wrap: anywhere;
+  }
+
+  .ac__profile-form {
+    margin-top: var(--s4);
+  }
+
+  .ac__security-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(15rem, 0.6fr);
+    gap: var(--s6);
+  }
+
+  .ac__security-password,
+  .ac__security-signout {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
     gap: var(--s3);
-    margin: var(--s4) 0 0;
+    min-width: 0;
+  }
+
+  .ac__security-password h3,
+  .ac__security-password p,
+  .ac__security-signout h3,
+  .ac__security-signout p {
+    margin: 0;
+  }
+
+  .ac__security-signout {
+    align-self: stretch;
+    padding-inline-start: var(--s5);
+    border-inline-start: 1px solid var(--line-strong);
   }
 
   /* Лента своей работы: дата, дело и итог в одну строку. */
@@ -596,15 +686,15 @@
     margin-top: var(--s3);
   }
 
-  @media (max-width: 640px) {
+  @media (max-width: 760px) {
     .account__layout {
       grid-template-columns: minmax(0, 1fr);
       grid-template-areas:
         "title"
+        "identity"
         "access"
         "work"
-        "security"
-        "signout";
+        "security";
     }
 
     .ac__block {
@@ -613,6 +703,17 @@
 
     .ac__feed-row {
       grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .ac__name-row,
+    .ac__security-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .ac__security-signout {
+      padding: var(--s4) 0 0;
+      border-inline-start: 0;
+      border-top: 1px solid var(--line-strong);
     }
   }
 

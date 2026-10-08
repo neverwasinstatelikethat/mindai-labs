@@ -12,13 +12,13 @@
     type RunFailure,
     type SheetNotice,
   } from '$lib/ChatPanel.svelte';
-  import { num } from '$lib/format';
   import Notice from '$lib/ui/Notice.svelte';
   import { page } from '$app/state';
   import { session } from '$lib/sessionStore.svelte';
   import { FAILURE_WORDS, RUN_FAILURES } from '$lib/terms';
   import type { RunFailureKind } from '$lib/terms';
   import type { AnswerHistoryItem, AnswerPayload } from '$lib/types';
+  import { stageOfNode } from '$lib/terms/research';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
 
@@ -26,6 +26,7 @@
     type: string;
     question?: string;
     answer?: AnswerPayload;
+    step?: { agent?: string; status?: string };
     code?: string;
     message?: string;
   }
@@ -44,6 +45,10 @@
   let historyError = $state('');
   let historyOpen = $state(false);
   let historySelection = $state('');
+  let savingConversation = $state<string | null>(null);
+  let savedConversation = $state<string | null>(null);
+  let historySaveError = $state('');
+  let progressStages = $state<string[]>([]);
   let historyRequest = 0;
   let running = $state(false);
   // Прежний ответ остаётся доступен в серверной истории после нового вопроса.
@@ -53,7 +58,7 @@
   // канал — разные экраны, и «повторить» должно чинить именно канал.
   let openClaimId = $state<string | null>(null);
   let focusKey = $state<string | null>(null);
-  let busy = $state<'feedback' | 'export' | 'import' | null>(null);
+  let busy = $state<'feedback' | 'import' | null>(null);
   let notice = $state<SheetNotice | null>(null);
 
   let controller: AbortController | null = null;
@@ -117,6 +122,70 @@
       historyError = reasonText(reason, 'Этот ответ больше недоступен.');
     } finally {
       historyLoading = false;
+    }
+  }
+
+  function conversationMarkdown(item: AnswerHistoryItem, payload: AnswerPayload): string {
+    const sections = [
+      '# Диалог в StormIdea',
+      `\n${new Intl.DateTimeFormat('ru', { dateStyle: 'long', timeStyle: 'short' }).format(new Date(item.created_at))}`,
+      '\n## Вы',
+      `\n${payload.question}`,
+      '\n## StormIdea',
+      `\n${payload.summary}`,
+    ];
+
+    if (payload.findings.length) {
+      sections.push('\n### Выводы');
+      for (const finding of payload.findings) {
+        sections.push(`\n#### ${finding.statement}`);
+        for (const evidence of finding.evidence) {
+          const location = [
+            evidence.page != null ? `стр. ${evidence.page}` : '',
+            evidence.sheet ? `лист «${evidence.sheet}»` : '',
+            evidence.cell_range ? `ячейки ${evidence.cell_range}` : '',
+          ].filter(Boolean).join(', ');
+          sections.push(`\n- ${evidence.source_title}${location ? `, ${location}` : ''}: «${evidence.quote}»`);
+        }
+      }
+    }
+
+    const append = (title: string, values: string[]) => {
+      if (!values.length) return;
+      sections.push(`\n### ${title}`);
+      sections.push(...values.map((value) => `\n- ${value}`));
+    };
+    append('Расхождения', payload.conflicts);
+    append('Что ещё нужно выяснить', payload.knowledge_gaps);
+    append('Следующие шаги', payload.recommendations);
+    return `${sections.join('')}\n`;
+  }
+
+  async function saveConversation(item: AnswerHistoryItem): Promise<void> {
+    if (savingConversation) return;
+    savingConversation = item.query_id;
+    savedConversation = null;
+    historySaveError = '';
+    try {
+      // Ответ загружается с сервера: владелец записи и текущий доступ к каждому
+      // материалу проверяются до сборки файла.
+      const payload = await api.savedAnswer(item.query_id);
+      const blob = new Blob([conversationMarkdown(item, payload)], {
+        type: 'text/markdown;charset=utf-8',
+      });
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = `stormidea-dialog-${new Date(item.created_at).toISOString().slice(0, 10)}.md`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(href), 0);
+      savedConversation = item.query_id;
+    } catch (reason) {
+      historySaveError = reasonText(reason, 'Не удалось сохранить этот диалог.');
+    } finally {
+      savingConversation = null;
     }
   }
 
@@ -219,6 +288,7 @@
     if (running) return;
     question = asked;
     running = true;
+    progressStages = [];
     delivered = false;
     failure = null;
     notice = null;
@@ -281,6 +351,9 @@
             question = event.question;
           } else if (event.type === 'answer' && event.answer) {
             applyAnswer(event.answer);
+          } else if (event.type === 'step' && event.step?.agent) {
+            const label = stageOfNode(event.step.agent)?.label;
+            if (label && !progressStages.includes(label)) progressStages = [...progressStages, label];
           } else if (event.type === 'error') {
             failure = failureFromStream(event.code, event.message ?? '', asked);
           }
@@ -328,43 +401,6 @@
   }
 
   // ── Отзывы, выгрузка, импорт, версии ────────────────────────────────────
-
-  async function exportAnswer(format: 'markdown' | 'json-ld'): Promise<boolean> {
-    // В файл уходит серверная копия ответа по query_id: присланный клиентом
-    // AnswerPayload сервер не принимает — иначе фильтровались бы клиентские данные.
-    if (!answer) return false;
-    busy = 'export';
-    try {
-      const response = await api.export(answer.query_id, format);
-      const blob = await response.blob();
-      const href = URL.createObjectURL(blob);
-      // Идентификатор ответа живёт в имени файла, а не в строке на экране:
-      // Пользователь видит сообщение о результате, а не внутренние поля ответа.
-      const filename = `klubok-${answer.query_id || 'otvet'}.${format === 'markdown' ? 'md' : 'jsonld'}`;
-      const link = document.createElement('a');
-      link.href = href;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(href);
-      notice = {
-        kind: 'ok',
-        title: 'Файл выгружен',
-        detail: `${format === 'markdown' ? 'Markdown' : 'JSON-LD'}, ${num(Math.round(blob.size / 1024))} КиБ: тот же ответ, что на экране.`,
-      };
-      return true;
-    } catch (reason) {
-      notice = {
-        kind: 'error',
-        title: 'Выгрузка не получилась',
-        detail: `${reasonText(reason, 'Не удалось получить файл.')} Попробуйте отправить выгрузку ещё раз.`,
-      };
-      return false;
-    } finally {
-      busy = null;
-    }
-  }
 
   async function importDocument(file: File): Promise<boolean> {
     busy = 'import';
@@ -487,9 +523,12 @@
         {:else if history.length === 0}
           <Empty title="Здесь будут ваши вопросы" body="Новый вопрос появится в истории после ответа." />
         {:else}
+          {#if historySaveError}
+            <p class="small research__history-save-error" role="status">{historySaveError}</p>
+          {/if}
           <ul class="research__history-list">
             {#each history as item (item.query_id)}
-              <li>
+              <li class="research__history-row">
                 <button
                   type="button"
                   class={`research__history-item ${historySelection === item.query_id ? 'research__history-item--active' : ''}`}
@@ -497,11 +536,22 @@
                   disabled={historyLoading}
                   onclick={() => void openSavedAnswer(item)}
                 >
-                  <span>{item.question}</span>
+                  <span class="research__history-question">{item.question}</span>
                   <time datetime={item.created_at}>
                     {new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(item.created_at))}
                   </time>
                 </button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon={savedConversation === item.query_id ? 'checkCircle' : 'download'}
+                  title={savedConversation === item.query_id ? 'Диалог сохранён' : 'Сохранить диалог'}
+                  busy={savingConversation === item.query_id}
+                  disabled={savingConversation !== null}
+                  onclick={() => void saveConversation(item)}
+                >
+                  {savedConversation === item.query_id ? 'Сохранено' : 'Сохранить диалог'}
+                </Button>
               </li>
             {/each}
           </ul>
@@ -524,6 +574,7 @@
       {answer}
       {question}
       {running}
+      {progressStages}
       error={failure}
       {openClaimId}
       {focusKey}
@@ -535,7 +586,6 @@
       onstop={stop}
       onselect={(id) => (openClaimId = id)}
       onfocus={(key) => (focusKey = key)}
-      onexport={exportAnswer}
       onimport={importDocument}
       onnotice={(value) => (notice = value)}
       onhistory={loadHistory}
@@ -611,6 +661,14 @@
     padding: 0;
   }
 
+  .research__history-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--s1);
+    border-top: 1px solid var(--line-soft);
+  }
+
   .research__history-item {
     display: grid;
     width: 100%;
@@ -625,6 +683,14 @@
     cursor: pointer;
   }
 
+  .research__history-question {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+
   .research__history-item:hover,
   .research__history-item--active {
     background: var(--surface-raised);
@@ -636,11 +702,7 @@
   }
 
   .research__history-item span {
-    display: -webkit-box;
-    overflow: hidden;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
+    min-width: 0;
   }
 
   .research__history-item time {
@@ -654,6 +716,20 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+  }
+
+  .research__conversation :global(.ask__flow) {
+    align-items: center;
+  }
+
+  .research__conversation :global(.paper),
+  .research__conversation :global(.chat__pending) {
+    width: min(100%, var(--maxw-narrow));
+    align-self: center;
+  }
+
+  .research__history-save-error {
+    color: var(--disputed);
   }
 
   .research__conversation :global(.ask) {
@@ -676,6 +752,15 @@
       width: 100%;
       max-height: min(50dvh, 38rem);
       overflow: auto;
+    }
+
+    .research__history-row {
+      grid-template-columns: minmax(0, 1fr);
+      padding-block: var(--s1);
+    }
+
+    .research__history-row :global(.btn) {
+      justify-self: start;
     }
 
     .research__head {

@@ -16,7 +16,6 @@ import type {
   EvaluationRun,
   EvolutionExperiment,
   EvolutionProposal,
-  ExportFormat,
   ExpertDecision,
   FeedbackResult,
   FindingApiStatus,
@@ -74,16 +73,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) throw await failure(response);
   return response.json() as Promise<T>;
-}
-
-async function requestRaw(path: string, init?: RequestInit): Promise<Response> {
-  const response = await fetch(`${API_URL}${path}`, {
-    credentials: 'include',
-    ...init,
-    headers: headersFor(init?.headers as Record<string, string> | undefined),
-  });
-  if (!response.ok) throw await failure(response);
-  return response;
 }
 
 // Окно списочного маршрута: сами строки в теле, полное число подходящих записей
@@ -272,10 +261,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ question, entities, dimensions, language: 'ru' }),
     }),
-  // Экспортируется серверная копия ответа по query_id: присланный клиентом
-  // AnswerPayload из контракта убран (иначе ACL фильтровал бы клиентские данные).
-  export: (queryId: string, format: ExportFormat) =>
-    requestRaw('/api/v1/export', { method: 'POST', body: JSON.stringify({ query_id: queryId, format }) }),
   dashboard: () => request<DashboardData>('/api/v1/dashboard'),
   // Журнал собственного аккаунта для профиля: /audit требует audit:read и
   // отдаёт акты всех, а здесь actor_id определяет сервер по сессии. Лента

@@ -11,6 +11,7 @@
   import { navLabel } from '$lib/nav';
   import { boundsOf, gapBetween } from '$lib/numbers';
   import { session } from '$lib/sessionStore.svelte';
+  import { stageOfNode } from '$lib/terms/research';
   import {
     ANSWER_HEAD,
     ASK_ACTIONS,
@@ -97,6 +98,7 @@
     question: string;
     answer: AnswerPayload | null;
     running: boolean;
+    progressStages: string[];
     error: RunFailure | null;
     openClaimId: string | null;
     focusKey: string | null;
@@ -114,7 +116,6 @@
     onstop: () => void;
     onselect: (id: string | null) => void;
     onfocus: (key: string | null) => void;
-    onexport: (format: 'markdown' | 'json-ld') => Promise<boolean>;
     onimport: (file: File) => Promise<boolean>;
     onnotice: (notice: SheetNotice | null) => void;
     onhistory: (claimId: string) => Promise<HistoryResult>;
@@ -124,6 +125,7 @@
     question,
     answer,
     running,
+    progressStages,
     error,
     openClaimId,
     focusKey,
@@ -135,7 +137,6 @@
     onstop,
     onselect,
     onfocus,
-    onexport,
     onimport,
     onnotice,
     onhistory,
@@ -183,7 +184,6 @@
   let sheetClaimId = $state<string | null>(null);
 
   const canAsk = $derived(session.can('query:ask'));
-  const canExport = $derived(session.can('export:run'));
   const canSupersede = $derived(session.can('restricted:read'));
 
   // Пока новый ответ собирается, предыдущий остаётся на экране; после замены
@@ -194,6 +194,9 @@
   let staleDismissed = $state(false);
   // Бумага на экране: ответ есть и он либо свежий, либо его не убрали.
   const showPaper = $derived(!!answer && !(staleAnswer && staleDismissed));
+  const answerStages = $derived(
+    [...new Set((answer?.trace ?? []).map((event) => stageOfNode(event.agent)?.label).filter((label): label is string => !!label))],
+  );
 
   // Тезис, чей разбор открыт в шторке: ищется в текущем ответе, поэтому новый
   // ответ закрывает шторку сам — прежнего тезиса на экране больше нет.
@@ -759,10 +762,6 @@
       </div>
     {/if}
 
-    {#if running}
-      <p class="chat__loading" role="status">Ищу ответ в материалах…</p>
-    {/if}
-
     <!-- ── 3. ОТВЕТ = БУМАГА ─────────────────────────────────────────────── -->
     {#if showPaper && answer}
       {@const payload = answer}
@@ -784,22 +783,14 @@
           <div class="prose">
             <p class="summary">{payload.summary || ANSWER_HEAD.summaryMissing}</p>
           </div>
-          <div class="paper__bar">
-            {#if canExport}
-              <div class="paper__export">
-                <Button
-                  variant="quiet"
-                  size="sm"
-                  icon="download"
-                  busy={busy === 'export'}
-                  disabled={busy === 'export'}
-                  onclick={() => void onexport('markdown')}
-                >
-                  Скачать ответ
-                </Button>
-              </div>
-            {/if}
-          </div>
+          {#if answerStages.length}
+            <details class="chat__stages">
+              <summary>Этапы ответа · {answerStages.length}</summary>
+              <ol>
+                {#each answerStages as stage (stage)}<li>{stage}</li>{/each}
+              </ol>
+            </details>
+          {/if}
         </header>
 
         {#if payload.degradation_reasons.length}
@@ -882,6 +873,29 @@
           </details>
         {/if}
       </article>
+    {/if}
+
+    {#if question.trim() && (running || staleAnswer || error)}
+      <div class="chat__pending" aria-live="polite">
+        <p class="chat__question">{question}</p>
+        {#if running}
+          <div class="chat__waiting" role="status">
+            <Mascot size={32} label="StormIdea собирает ответ" />
+            <div>
+              <p>Собираю ответ по материалам</p>
+              {#if progressStages.length}
+                <details class="chat__stages">
+                  <summary>Этапы · {progressStages.length}</summary>
+                  <ol>
+                    {#each progressStages as stage (stage)}<li>{stage}</li>{/each}
+                  </ol>
+                </details>
+              {/if}
+            </div>
+            <Button variant="quiet" size="sm" onclick={onstop}>Остановить</Button>
+          </div>
+        {/if}
+      </div>
     {/if}
   </div>
 
@@ -1203,6 +1217,14 @@
     padding-inline: clamp(var(--s2), 1.5vw, var(--s4));
   }
 
+  .ask__flow > * {
+    width: min(100%, var(--maxw-narrow));
+  }
+
+  .ask__flow > .chat__welcome {
+    width: 100%;
+  }
+
   .chat__welcome {
     display: grid;
     flex: 1;
@@ -1354,6 +1376,9 @@
     display: flex;
     flex-direction: column;
     gap: var(--s4);
+    max-width: var(--maxw-narrow);
+    align-self: center;
+    width: 100%;
   }
 
   .paper__head {
@@ -1365,8 +1390,9 @@
   .summary {
     margin-top: var(--s2);
     max-width: var(--maxw-measure);
-    font-size: var(--t-lead);
-    line-height: 1.5;
+    font-size: var(--t-body);
+    font-weight: 400;
+    line-height: var(--lh-body);
     color: var(--ink-2);
     white-space: pre-line;
     text-wrap: pretty;
@@ -1380,6 +1406,51 @@
     border-radius: var(--r-lg);
     background: var(--coral-mist);
     color: var(--ink);
+    font-size: var(--t-body);
+    font-weight: 400;
+    line-height: var(--lh-body);
+    text-wrap: pretty;
+  }
+
+  .chat__pending {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--s3);
+  }
+
+  .chat__waiting {
+    display: flex;
+    align-items: center;
+    align-self: flex-start;
+    gap: var(--s3);
+    width: 100%;
+    padding-block: var(--s2);
+    color: var(--ink-2);
+  }
+
+  .chat__waiting p {
+    margin: 0;
+  }
+
+  .chat__stages {
+    color: var(--ink-2);
+  }
+
+  .chat__stages summary {
+    width: fit-content;
+    margin-top: var(--s1);
+    color: var(--action-ink);
+    font-size: var(--t-micro);
+    cursor: pointer;
+  }
+
+  .chat__stages ol {
+    display: grid;
+    gap: var(--s1);
+    margin: var(--s2) 0 0;
+    padding-inline-start: var(--s4);
+    font-size: var(--t-small);
   }
 
   .paper__guide {
@@ -1394,18 +1465,6 @@
     gap: var(--s2);
     margin: 0;
     padding-inline-start: var(--s4);
-  }
-
-  .paper__bar {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--s4);
-    flex-wrap: wrap;
-    padding: var(--s4);
-    border: 1px solid var(--line);
-    border-radius: var(--r-md);
-    background: var(--surface-raised);
   }
 
   .chat__more {
@@ -1427,14 +1486,6 @@
   .paper__kv {
     flex: 1 1 320px;
     min-width: 0;
-  }
-
-  .paper__export {
-    display: flex;
-    align-items: center;
-    gap: var(--s2);
-    flex-wrap: wrap;
-    flex: none;
   }
 
   .paper__degraded {
