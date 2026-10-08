@@ -33,7 +33,7 @@ from scientific_tangle.services.communities import (
     DEFAULT_PROFILE_LIMIT,
     detect_communities,
 )
-from scientific_tangle.services.embeddings import EmbeddingClient, GigaChatEmbeddingClient
+from scientific_tangle.services.embeddings import EmbeddingClient
 from scientific_tangle.services.governance import AccessPolicyEngine
 from scientific_tangle.services.knowledge import (
     CHUNK_MIN_CHARS,
@@ -233,11 +233,6 @@ class Neo4jElasticsearchKnowledgeBase:
         )
         self._search = Elasticsearch(settings.elasticsearch_url)
         self._embeddings: EmbeddingClient | None = None
-        if settings.use_gigachat:
-            try:
-                self._embeddings = GigaChatEmbeddingClient(settings)
-            except Exception as error:  # noqa: BLE001 - векторная ветка опциональна
-                logger.error("Эмбеддинги недоступны: %s", error)
         self._initialized = False
         # RLock: ``_ensure_ready`` вызывается из методов, которые уже держат замок
         # состояний (``all_findings`` → ``_ensure_ready`` → ``_restore_findings``),

@@ -116,12 +116,17 @@ def _provider(
     subject = GigaChatProvider(settings, metrics=metrics or RecordingRegistry())
     prompt_log: list[list[Any]] = []
     limits: list[int | None] = []
+    models: list[str | None] = []
     subject.request_limits = limits  # type: ignore[attr-defined]
+    subject.request_models = models  # type: ignore[attr-defined]
     pending = list(responses)
 
-    async def fake_request(messages: Any, *, max_tokens: int | None = None) -> Any:
+    async def fake_request(
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+    ) -> Any:
         prompt_log.append(list(messages))
         limits.append(max_tokens)
+        models.append(model)
         outcome = pending.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -173,17 +178,11 @@ async def test_repair_attempts_are_capped_and_failure_is_explicit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_truncated_output_retries_with_a_bigger_limit_and_no_dead_weight() -> None:
-    """Обрыв по длине чинится бюджетом вывода, а не дописыванием оборванного хвоста.
-
-    Прежний повтор слал ТОТ ЖЕ промпт плюс `previous[:4000]`: вход рос, лимит
-    вывода оставался тем же, и третья оплаченная попытка давала 503 гарантированно.
-    """
+async def test_default_output_limit_is_16k_and_truncation_does_not_exceed_it() -> None:
+    """Ответ ограничен 16k токенами: повтор не поднимает этот лимит выше."""
     subject, prompts = _provider(
         [
             _completion('{"summary": "обрезано', finish="length"),
-            _completion('{"summary": "обрезано', finish="length"),
-            _completion('{"summary": "было бы третьим", "finding_ids": []}'),
         ]
     )
 
@@ -191,13 +190,23 @@ async def test_truncated_output_retries_with_a_bigger_limit_and_no_dead_weight()
         await subject.complete_model("система", "вопрос про медь", Answer)
 
     limits = subject.request_limits  # type: ignore[attr-defined]
-    assert limits == [None, provider_module._OUTPUT_TOKENS_CEILING]
+    assert subject._settings.gigachat_max_output_tokens == 16384  # type: ignore[attr-defined]
+    assert subject.request_models == ["GigaChat-3-Ultra"]  # type: ignore[attr-defined]
+    assert limits == [None]
     assert "max_tokens" in str(error.value)
-    # Третья попытка не оплачивается: контракт деградации честнее второго платёжа.
-    assert len(prompts) == 2
-    # Оборванный хвост в промпт не попадает — он и есть причина повтора.
-    assert "обрезано" not in prompts[1][-1].content
-    assert "вопрос про медь" in prompts[1][-1].content
+    assert len(prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_model_override_is_used_for_graphrag_work() -> None:
+    subject, prompts = _provider(
+        [_completion('{"summary": "готово", "finding_ids": []}')]
+    )
+
+    await subject.complete_model("система", "вопрос", Answer, model="GigaChat-Pro")
+
+    assert subject.request_models == ["GigaChat-Pro"]  # type: ignore[attr-defined]
+    assert len(prompts) == 1
 
 
 @pytest.mark.asyncio
@@ -252,7 +261,7 @@ async def test_cancellation_after_repair_attempt_still_accounts_spent_tokens() -
     subject, _ = _provider([_completion("не json", tokens=(70, 7))])
     seen: list[int] = []
 
-    async def cancel_after_first(messages):
+    async def cancel_after_first(messages, *, model=None):
         seen.append(1)
         if len(seen) == 1:
             return _completion("не json", tokens=(70, 7))
@@ -282,7 +291,7 @@ async def test_cancellation_is_accounted_without_the_new_registry_parameter() ->
     registry = StrictRegistry()
     subject, _ = _provider([_completion("не json", tokens=(70, 7))], metrics=registry)
 
-    async def cancel_at_once(messages):
+    async def cancel_at_once(messages, *, model=None):
         raise asyncio.CancelledError
 
     subject._request = cancel_at_once  # type: ignore[method-assign]

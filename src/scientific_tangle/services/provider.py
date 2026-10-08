@@ -46,9 +46,8 @@ _SCHEMA_REPAIR_ATTEMPTS = 3
 # обрыве — третья оплата заведомо ничего не добавляет.
 _TRUNCATION_ATTEMPT_LIMIT = 2
 _OUTPUT_TOKENS_STEP = 2
-# 4096 = ×2 от рабочего GIGACHAT_MAX_OUTPUT_TOKENS (2048): выше — только счёт
-# провайдера растёт, а оборванный JSON это не спасает.
-_OUTPUT_TOKENS_CEILING = 4096
+# 16384 — фиксированный рабочий лимит ответа; повтор при обрезке не превышает его.
+_OUTPUT_TOKENS_CEILING = 16384
 
 
 class ModelUnavailableError(RuntimeError):
@@ -382,6 +381,8 @@ class ModelProvider(Protocol):
         system: str,
         user: str,
         schema: type[StructuredOutput],
+        *,
+        model: str | None = None,
     ) -> StructuredOutput: ...
 
 
@@ -393,6 +394,8 @@ class UnavailableProvider:
         system: str,
         user: str,
         schema: type[StructuredOutput],
+        *,
+        model: str | None = None,
     ) -> StructuredOutput:
         raise ModelUnavailableError("LLM не настроен. Укажите GIGACHAT_API_KEY.")
 
@@ -471,7 +474,7 @@ class GigaChatProvider:
                     self._client = GigaChat(
                         credentials=self._settings.gigachat_api_key,
                         base_url=self._settings.gigachat_base_url,
-                        model=self._settings.gigachat_model,
+                        model=self._settings.gigachat_agent_model,
                         verify_ssl_certs=self._settings.gigachat_verify_ssl_certs,
                         ssl_context=self._ssl_context,
                         scope=self._settings.gigachat_scope,
@@ -507,6 +510,8 @@ class GigaChatProvider:
         system: str,
         user: str,
         schema: type[StructuredOutput],
+        *,
+        model: str | None = None,
     ) -> StructuredOutput:
         """Один structured-output вызов с TTL-кэшем в пределах процесса.
 
@@ -519,16 +524,17 @@ class GigaChatProvider:
         где учёт токенов выполняется ровно один раз — включая отмену.
         Ошибки и schema-repair промежуточные ответы в кэш не попадают.
         """
+        selected_model = model or self._settings.gigachat_agent_model
         if self._cache_ttl_seconds <= 0:
             # Кэш выключен: путь выполнения идентичен до-кэшному, метрики
             # попаданий/промахов не вызываются вообще.
-            return await self._complete_model_uncached(system, user, schema)
-        key = _llm_cache_key(self._settings.gigachat_model, schema, system, user)
+            return await self._complete_model_uncached(system, user, schema, selected_model)
+        key = _llm_cache_key(selected_model, schema, system, user)
         cached = _llm_cache_take(key, schema)
         _report_llm_cache(self._metrics, hit=cached is not None)
         if cached is not None:
             return cached
-        result = await self._complete_model_uncached(system, user, schema)
+        result = await self._complete_model_uncached(system, user, schema, selected_model)
         self._cache_result(key, result)
         return result
 
@@ -555,6 +561,7 @@ class GigaChatProvider:
         system: str,
         user: str,
         schema: type[StructuredOutput],
+        model: str,
     ) -> StructuredOutput:
         instruction = build_instance_instruction(system, schema)
         messages: list[Messages] = [
@@ -581,9 +588,9 @@ class GigaChatProvider:
                     # Лимит передаём только когда он поднят: базовый вызов
                     # `_request` остаётся одноаргументным.
                     response = (
-                        await self._request(messages)
+                        await self._request(messages, model=model)
                         if output_limit == base_limit
-                        else await self._request(messages, max_tokens=output_limit)
+                        else await self._request(messages, max_tokens=output_limit, model=model)
                     )
                 except (GigaChatException, httpx.TransportError) as exc:
                     # Транспортная ошибка и таймаут обязаны попасть в отдельный
@@ -741,16 +748,20 @@ class GigaChatProvider:
             ) from None
 
     async def _request(
-        self, messages: Sequence[Messages], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Messages],
+        *,
+        max_tokens: int | None = None,
+        model: str | None = None,
     ) -> ChatCompletion:
         client = await self._get_client()
         request = Chat(
-            model=self._settings.gigachat_model,
+            model=model or self._settings.gigachat_agent_model,
             messages=list(messages),
             temperature=0.1,
             max_tokens=max_tokens or self._settings.gigachat_max_output_tokens,
         )
-        logger.debug("GigaChat: запрос к модели %s", self._settings.gigachat_model)
+        logger.debug("GigaChat: запрос к модели %s", model or self._settings.gigachat_agent_model)
         # Ожидание слота считается один раз на обращение: инкремент на каждое
         # обновление gauge давал бы 2+ счёт на одно ждущее обращение.
         will_wait = self._semaphore.locked()

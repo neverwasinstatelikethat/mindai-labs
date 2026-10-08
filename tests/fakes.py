@@ -16,6 +16,7 @@ class ScriptedProvider:
         for output in outputs:
             self._outputs[type(output)].append(output)
         self.calls: list[str] = []
+        self.models: list[str | None] = []
         # Промпт — часть контракта рабочего процесса: без него нельзя проверить,
         # что бюджет не выбросил обязательную секцию и что кириллица не сэкранирована.
         self.prompts: dict[str, list[tuple[str, str]]] = defaultdict(list)
@@ -25,8 +26,11 @@ class ScriptedProvider:
         system: str,
         user: str,
         schema: type[StructuredOutput],
+        *,
+        model: str | None = None,
     ) -> StructuredOutput:
         self.calls.append(schema.__name__)
+        self.models.append(model)
         self.prompts[schema.__name__].append((system, user))
         output = self._outputs[schema].popleft()
         return cast(StructuredOutput, output.model_copy(deep=True))

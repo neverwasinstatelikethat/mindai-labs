@@ -20,7 +20,9 @@ async def main() -> None:
     knowledge = build_knowledge_base(settings)
     provider = build_provider(settings)
     resolution = EntityResolutionWorkbench(settings)
-    ingestion = IngestionService(knowledge, provider, resolution)
+    ingestion = IngestionService(
+        knowledge, provider, resolution, model=settings.gigachat_graphrag_model
+    )
     source_root = Path(settings.source_root)
     structural = None
     if settings.preload_mode in {"full", "structural"}:

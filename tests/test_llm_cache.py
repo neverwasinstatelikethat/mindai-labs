@@ -121,7 +121,9 @@ def _echo_request(seen: list[str]):
     ключа различает записи по схеме, а не по удачному совпадению валидации.
     """
 
-    async def _request(messages: Any) -> SimpleNamespace:
+    async def _request(
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+    ) -> SimpleNamespace:
         user = messages[-1].content
         seen.append(user)
         return _completion(json.dumps({"text": user, "note": user}), prompt=3, completion=7)
@@ -258,7 +260,7 @@ async def test_key_is_sensitive_to_schema_prompt_and_model() -> None:
     assert len(seen) == 4
 
     # Смена модели — ответ провайдера другой, ключ обязан это заметить.
-    provider._settings.gigachat_model = "GigaChat-Max"
+    provider._settings.gigachat_agent_model = "GigaChat-Max"
     await provider.complete_model("система", "вопрос", Answer)
     assert len(seen) == 5
 
@@ -284,11 +286,13 @@ async def test_transport_error_is_not_cached() -> None:
 
     original = provider._request
 
-    async def _flaky(messages: Any) -> Any:
+    async def _flaky(
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+    ) -> Any:
         error = next(calls)
         if error is not None:
             raise error
-        return await original(messages)
+        return await original(messages, max_tokens=max_tokens, model=model)
 
     provider._request = _flaky
 
@@ -305,7 +309,9 @@ async def test_transport_error_is_not_cached() -> None:
 @pytest.mark.asyncio
 async def test_provider_error_payload_is_not_cached() -> None:
     """Ответ-ошибка провайдера (`{"error": ...}`) — отказ, а не контент для кэша."""
-    async def _error(messages: Any) -> SimpleNamespace:
+    async def _error(
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+    ) -> SimpleNamespace:
         return _completion(json.dumps({"error": "quota exceeded"}), prompt=2, completion=1)
 
     metrics = _FakeMetrics()
@@ -326,7 +332,9 @@ async def test_provider_error_payload_is_not_cached() -> None:
 @pytest.mark.asyncio
 async def test_unrepairable_response_is_not_cached() -> None:
     """Схема не пройдена после всех repair-попыток — записи в кэше нет."""
-    async def _garbage(messages: Any) -> SimpleNamespace:
+    async def _garbage(
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+    ) -> SimpleNamespace:
         return _completion(json.dumps({"нет такого поля": True}), prompt=4, completion=2)
 
     metrics = _FakeMetrics()
@@ -355,7 +363,9 @@ async def test_schema_repair_accumulates_tokens_and_caches_only_the_final_answer
     )
     seen: list[str] = []
 
-    async def _scripted(messages: Any) -> SimpleNamespace:
+    async def _scripted(
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+    ) -> SimpleNamespace:
         seen.append(messages[-1].content)
         return next(responses)
 
@@ -396,7 +406,9 @@ async def test_cancelled_call_closes_accounting_once() -> None:
         ]
     )
 
-    async def _cancel_midway(messages: Any) -> SimpleNamespace:
+    async def _cancel_midway(
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+    ) -> SimpleNamespace:
         item = next(responses, None)
         if item is None:
             raise asyncio.CancelledError()

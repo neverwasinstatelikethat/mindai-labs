@@ -45,11 +45,13 @@ class IngestionService:
         knowledge: KnowledgeBase,
         provider: ModelProvider,
         resolution: EntityResolutionWorkbench | None = None,
+        model: str | None = None,
     ) -> None:
         self._knowledge = knowledge
         self._provider = provider
         self._ontology = OntologyValidator()
         self._resolution = resolution
+        self._model = model
 
     async def ingest(self, document: DocumentRequest) -> DocumentReceipt:
         """Извлечение пакета — LLM, всё остальное убрано из event loop.
@@ -62,23 +64,18 @@ class IngestionService:
             f"Название: {document.title}\nЯзык: {document.language}\n"
             f"География: {document.geography}\nГод: {document.year}\n\n{document.text}"
         )
-        bundle = await self._provider.complete_model(
-            EXTRACTION_SYSTEM,
-            user_text,
-            IngestionBundle,
-        )
+        bundle = await self._complete(EXTRACTION_SYSTEM, user_text)
         extraction = self._apply_resolutions(bundle)
         try:
             await asyncio.to_thread(self._ontology.validate, extraction)
         except ValueError as error:
-            bundle = await self._provider.complete_model(
+            bundle = await self._complete(
                 EXTRACTION_REPAIR_SYSTEM,
                 (
                     f"DOCUMENT:\n{user_text}\n\n"
                     f"PREVIOUS RESULT:\n{bundle.model_dump_json()}\n\n"
                     f"VALIDATION ERROR:\n{error}"
                 ),
-                IngestionBundle,
             )
             extraction = self._apply_resolutions(bundle)
             await asyncio.to_thread(self._ontology.validate, extraction)
@@ -86,6 +83,15 @@ class IngestionService:
         if receipt.status == "created" and self._resolution:
             await asyncio.to_thread(self._resolution.register, bundle.resolutions)
         return receipt
+
+    async def _complete(self, system: str, user: str) -> IngestionBundle:
+        """Импорт документов наполняет GraphRAG выделенной моделью."""
+        if self._model is None:
+            return await self._provider.complete_model(system, user, IngestionBundle)
+        result = await self._provider.complete_model(
+            system, user, IngestionBundle, model=self._model
+        )
+        return IngestionBundle.model_validate(result)
 
     def _apply_resolutions(self, bundle: IngestionBundle) -> ExtractionResult:
         resolved = {
