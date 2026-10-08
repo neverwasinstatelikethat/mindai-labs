@@ -585,10 +585,6 @@
     background: var(--sage);
   }
 
-  .research__history[hidden] {
-    display: none;
-  }
-
   .research__history-head {
     display: flex;
     align-items: flex-start;
