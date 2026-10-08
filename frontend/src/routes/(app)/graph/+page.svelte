@@ -835,35 +835,32 @@
     >
       {#if status === 'ready'}
         <div class="map__head-tools">
+          {#if graph.nodes.length > 0}
+            <div class="map__modes" role="group" aria-label={MAP_MODES.group}>
+              <Button
+                variant={mode === 'search' ? 'action' : 'quiet'}
+                size="sm"
+                current={mode === 'search'}
+                onclick={() => setMode('search')}
+              >
+                {MAP_MODES.search}
+              </Button>
+              <Button
+                variant={mode === 'map' ? 'action' : 'quiet'}
+                size="sm"
+                current={mode === 'map'}
+                onclick={() => setMode('map')}
+              >
+                {MAP_MODES.analysis}
+              </Button>
+            </div>
+          {/if}
           <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
             Обновить
           </Button>
         </div>
       {/if}
     </SectionHead>
-
-    {#if status === 'ready' && graph.nodes.length > 0}
-      <!-- Переключатель сценариев стоит над содержимым: человек выбирает режим
-           до того, как увидел хоть одну стрелку. -->
-      <div class="map__modes" role="group" aria-label={MAP_MODES.group}>
-        <Button
-          variant={mode === 'search' ? 'action' : 'quiet'}
-          size="sm"
-          current={mode === 'search'}
-          onclick={() => setMode('search')}
-        >
-          {MAP_MODES.search}
-        </Button>
-        <Button
-          variant={mode === 'map' ? 'action' : 'quiet'}
-          size="sm"
-          current={mode === 'map'}
-          onclick={() => setMode('map')}
-        >
-          {MAP_MODES.analysis}
-        </Button>
-      </div>
-    {/if}
 
     {#if access === 'checking'}
       <Panel tone="sunk">
@@ -1399,7 +1396,7 @@
        на своей ширине, и поле карты поднимается к первому вьюпорту. */
     .map__head-tools {
       align-items: flex-start;
-      flex-wrap: nowrap;
+      flex-wrap: wrap;
     }
 
     .map__head-tools :global(.btn) {

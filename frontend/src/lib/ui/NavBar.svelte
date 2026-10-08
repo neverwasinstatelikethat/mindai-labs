@@ -179,7 +179,7 @@
 </script>
 
 <nav class="pill-nav" class:pill-nav--dock={dock} aria-label="Основная навигация" bind:this={nav}>
-  <a class="pill-nav__brand" href="/">
+  <a class="pill-nav__brand" href="/" aria-label="StormIdea — главная">
     <span class="brand-mark" aria-hidden="true">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
         <circle cx="8" cy="8" r="3" /><circle cx="16" cy="15" r="3" /><path d="M10.2 10.2l3.6 3.2" />
@@ -224,6 +224,7 @@
           class="account"
           type="button"
           bind:this={accountBtn}
+          aria-label={`Профиль ${session.name}`}
           aria-expanded={menuOpen}
           aria-controls={menuOpen ? 'account-menu' : undefined}
           onclick={() => (menuOpen = !menuOpen)}

@@ -319,7 +319,7 @@
 .app-body > .page {
   flex: 1;
   min-height: 100%;
-  padding-top: var(--s5);
+  padding-top: var(--s4);
   padding-bottom: clamp(var(--s7), 8vh, var(--s9));
 }
 
@@ -334,6 +334,10 @@
 
 .app-body .page .section-head .h1 {
   font-size: var(--t-h2);
+}
+
+.app-body .page .section-head__text {
+  gap: var(--s2);
 }
 
 /* «i» относится к заголовку, а не к краю строки: в шапке блока он идёт сразу за
@@ -1992,6 +1996,10 @@ html.motion-ok .site-foot a {
 
   .pill-nav__brand span:last-child {
     display: none;
+  }
+
+  .pill-nav .seg__item {
+    padding-inline: var(--s2);
   }
 
   .kv dd {

@@ -99,8 +99,7 @@
     {
       id: 'topics',
       label: 'Сходимость чисел',
-      lead:
-        'Один и тот же показатель в нескольких документах: полоса значений, размах и сверка с пределом из источника.',
+      lead: 'Сопоставьте один показатель в материалах, его разброс и предел из источника.',
     },
     { id: 'disputed', label: 'Где источники спорят', lead: DIVERGENCE_VIEW.lead },
     { id: 'gaps', label: 'Где источники молчат', lead: GAPS_VIEW.lead },
@@ -394,7 +393,6 @@
 <div class="page numbers">
   <header class="numbers__masthead">
     <SectionHead level="1" title={navLabel('/numbers')} lead={activeLead} />
-    <p class="numbers__masthead-note">Проверяйте не только сами значения, но и условия, источники и пробелы в данных.</p>
   </header>
 
   <nav class="numbers__facets" aria-label="Виды сигналов">
@@ -402,6 +400,7 @@
       <button
         type="button"
         class={`numbers__facet numbers__facet--${item.id} ${facet === item.id ? 'numbers__facet--active' : ''}`}
+        aria-label={`${item.label}. ${item.lead}`}
         aria-current={facet === item.id ? 'page' : undefined}
         aria-pressed={facet === item.id}
         onclick={() => chooseFacet(item.id)}
@@ -475,6 +474,8 @@
         <Button variant="link" size="sm" onclick={resetFilters}>{DIVERGENCE_VIEW.filterReset}</Button>
       </div>
     </div>
+
+    <p class="numbers__masthead-note micro">Проверяйте не только значения, но и условия, источники и пробелы в данных.</p>
 
     {#if windowNote !== ''}
       <Notice tone="warn">{windowNote}</Notice>
@@ -831,7 +832,7 @@
 <style>
   .numbers {
     display: grid;
-    gap: var(--s5);
+    gap: var(--s4);
     /* Гуттер экрана свой: без него правая колонка строки темы заканчивалась
        ровно на краю окна, и последнее слово причины («...знаменателя нет»)
        читалось обрезанным. */
@@ -870,11 +871,7 @@
   }
 
   .numbers__masthead {
-    display: grid;
-    grid-template-columns: minmax(0, 1.15fr) minmax(16rem, 0.85fr);
-    align-items: end;
-    gap: var(--s5);
-    padding: var(--s5) var(--s6);
+    padding: var(--s3) var(--s4);
     border-radius: var(--r-lg);
     background: var(--peach-wash);
   }
@@ -884,12 +881,8 @@
   }
 
   .numbers__masthead-note {
-    max-width: 40ch;
-    margin: 0 0 var(--s1);
-    color: var(--ink-2);
-    font-size: var(--t-lead);
-    line-height: var(--lh-body);
-    text-wrap: pretty;
+    max-width: 78ch;
+    margin: 0;
   }
 
   .numbers__facets {
@@ -902,10 +895,10 @@
 
   .numbers__facet {
     display: grid;
-    align-content: space-between;
-    gap: var(--s3);
-    min-height: 104px;
-    padding: var(--s4) var(--s5);
+    align-content: center;
+    gap: var(--s1);
+    min-height: 76px;
+    padding: var(--s2) var(--s4);
     border: 0;
     border-radius: 0;
     color: var(--ink-2);
@@ -935,14 +928,13 @@
   }
 
   .numbers__facet-title {
-    font-size: var(--t-h4);
+    font-size: var(--t-small);
     font-weight: 600;
   }
 
   .numbers__facet-note {
-    max-width: 34ch;
     color: inherit;
-    font-size: var(--t-small);
+    font-size: var(--t-micro);
     line-height: var(--lh-body);
   }
 
@@ -1225,24 +1217,19 @@
   }
 
   @media (max-width: 720px) {
-    .numbers__masthead {
-      grid-template-columns: minmax(0, 1fr);
-      padding: var(--s4);
-    }
-
     .numbers__facets {
-      grid-template-columns: minmax(0, 1fr);
+      grid-template-columns: repeat(3, minmax(0, 1fr));
     }
 
     .numbers__facet {
-      min-height: 0;
-      grid-template-columns: minmax(0, 1fr);
-      align-items: start;
+      align-content: start;
+      min-height: 92px;
+      padding-inline: var(--s2);
+      text-align: start;
     }
 
-    .numbers__facet + .numbers__facet {
-      border-inline-start: 0;
-      border-block-start: 1px solid var(--surface);
+    .numbers__facet-title {
+      font-size: var(--t-small);
     }
 
     .numbers__controls {

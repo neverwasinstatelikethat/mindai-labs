@@ -1078,10 +1078,10 @@
 </svelte:head>
 
 <div class="page findings">
-  <div class="wrap stack" style="--gap: var(--s5)">
+  <div class="wrap stack" style="--gap: var(--s4)">
     <SectionHead
       level="1"
-      eyebrow={pane === 'merges' ? 'Проверка названий' : 'Рабочее пространство'}
+      eyebrow={pane === 'merges' ? 'Проверка названий' : ''}
       title={pane === 'merges' ? 'Объединение названий' : 'Гипотезы'}
       lead={pane === 'merges'
         ? 'Проверьте, обозначают ли два названия одно и то же. Решение повлияет на будущие материалы.'

@@ -432,9 +432,10 @@
         size="sm"
         icon="clock"
         expanded={historyOpen}
+        controls="chat-history"
         onclick={() => (historyOpen = !historyOpen)}
       >
-        {historyOpen ? 'Скрыть историю' : 'История чатов'}
+        {historyOpen ? 'Скрыть историю' : 'Показать историю'}
       </Button>
     {/if}
 
@@ -459,11 +460,13 @@
     {/if}
   </div>
 
-  <div class="wrap wrap--bleed research__workspace">
+  <div class={`wrap wrap--bleed research__workspace ${historyOpen ? 'research__workspace--history-open' : ''}`}>
     {#if session.signedIn}
       <aside
-        class={`research__history ${historyOpen ? 'research__history--open' : ''}`}
+        id="chat-history"
+        class="research__history"
         aria-label="История чатов"
+        hidden={!historyOpen}
       >
         <div class="research__history-head">
           <div>
@@ -559,16 +562,20 @@
   }
 
   .research__history-toggle {
-    display: none;
+    display: inline-flex;
   }
 
   .research__workspace {
     display: grid;
     flex: 1;
     min-height: max(26rem, calc(100dvh - var(--topbar-h) - var(--s10) - var(--s6)));
-    grid-template-columns: minmax(15rem, 18rem) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--s5);
     align-items: stretch;
+  }
+
+  .research__workspace--history-open {
+    grid-template-columns: minmax(15rem, 18rem) minmax(0, 1fr);
   }
 
   .research__history {
@@ -576,6 +583,10 @@
     padding: var(--s4);
     border-radius: var(--r-md);
     background: var(--sage);
+  }
+
+  .research__history[hidden] {
+    display: none;
   }
 
   .research__history-head {
@@ -659,29 +670,16 @@
   }
 
   @media (max-width: 720px) {
-    .research__history-toggle {
-      display: inline-flex;
-    }
-
     .research__workspace {
       display: flex;
       flex-direction: column;
-      position: relative;
+      gap: var(--s3);
     }
 
     .research__history {
-      display: none;
-      position: absolute;
-      inset: 0 auto auto 0;
-      z-index: var(--z-dock);
-      width: min(22rem, calc(100vw - 2rem));
-      max-height: min(70dvh, 38rem);
+      width: 100%;
+      max-height: min(50dvh, 38rem);
       overflow: auto;
-      box-shadow: var(--shadow-lift);
-    }
-
-    .research__history--open {
-      display: block;
     }
 
     .research__head {
