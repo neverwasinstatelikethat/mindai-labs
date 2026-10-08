@@ -67,6 +67,64 @@ async def test_ingestion_writes_extracted_claim_and_provenance_to_graph() -> Non
 
 
 @pytest.mark.asyncio
+async def test_semantic_parts_share_document_id_and_resume_idempotently() -> None:
+    knowledge = InMemoryKnowledgeBase()
+    bundle = IngestionBundle(extraction=extraction())
+    provider = ScriptedProvider(bundle, bundle, bundle)
+    service = IngestionService(knowledge, provider)
+    first = DocumentRequest(
+        title="Пилот",
+        text="Обратный осмос применён для очистки шахтной воды. Часть первая.",
+        fragments=[{"text": "Обратный осмос применён для очистки шахтной воды.", "page": 3}],
+    )
+    second = DocumentRequest(
+        title="Пилот",
+        text="Обратный осмос применён для очистки шахтной воды. Часть вторая.",
+        fragments=[{"text": "Обратный осмос применён для очистки шахтной воды.", "page": 4}],
+    )
+    source_document = DocumentRequest(
+        title="Пилот",
+        text=f"{first.text}\n\n{second.text}",
+        fragments=[*first.fragments, *second.fragments],
+    )
+    source_document_id = knowledge.index_document(source_document, "book.txt").document_id
+
+    first_receipt = await service.ingest(
+        first,
+        source_document_id=source_document_id,
+        semantic_part_id="part-00001",
+        semantic_part_total=2,
+    )
+    assert await service.semantic_parts_completed(source_document_id, 2) == {"part-00001"}
+    second_receipt = await service.ingest(
+        second,
+        source_document_id=source_document_id,
+        semantic_part_id="part-00002",
+        semantic_part_total=2,
+    )
+    duplicate_receipt = await service.ingest(
+        second,
+        source_document_id=source_document_id,
+        semantic_part_id="part-00002",
+        semantic_part_total=2,
+    )
+
+    assert first_receipt.document_id == source_document_id
+    assert second_receipt.document_id == source_document_id
+    assert duplicate_receipt.status == "duplicate"
+    assert await service.semantic_parts_completed(source_document_id, 2) == {
+        "part-00001",
+        "part-00002",
+    }
+    evidence = [
+        item.evidence[0]
+        for item in knowledge.all_findings()
+        if item.evidence and item.evidence[0].document_id == source_document_id
+    ]
+    assert {item.page for item in evidence} == {3, 4}
+
+
+@pytest.mark.asyncio
 async def test_document_ingestion_uses_configured_graphrag_model() -> None:
     provider = ScriptedProvider(IngestionBundle(extraction=extraction()))
     service = IngestionService(

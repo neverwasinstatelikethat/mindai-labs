@@ -37,6 +37,7 @@
     type Evidence,
     type FindingApiStatus,
     type FindingListItem,
+    type HypothesisSignal,
     type NumericObservation,
   } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
@@ -51,6 +52,7 @@
   import { goto } from '$app/navigation';
   import InfoDot from '$lib/ui/InfoDot.svelte';
   import VerdictSheet from '$lib/ui/VerdictSheet.svelte';
+  import HypothesisCard from '$lib/ui/HypothesisCard.svelte';
   // Фасет склеек читает свой словарь: экран тот же, что и у находок, поэтому и
   // состояния, и доступ описываются словами очереди, а не второй копией.
   import {
@@ -76,6 +78,7 @@
   // в заголовке ответа, а не в длине массива.
   const PAGE_SIZE = 25;
   const SERVER_PAGE = 200;
+  const HYPOTHESES_PAGE = 50;
   // Список субъектов — тоже список: у него свой потолок и «Показать все».
   const SUBJECTS_CAP = 12;
 
@@ -87,6 +90,18 @@
   // Возврат после входа — на этот же экран, а не в раздел по умолчанию:
   // сессия прервалась посреди отбора, и сбрасывать его незачем.
   const LOGIN_HREF = $derived(`/login?next=${encodeURIComponent(page.url.pathname)}`);
+
+  const sourceRequest = $derived.by(() => {
+    const params = page.url.searchParams;
+    const signalId = params.get('hypothesis')?.trim() ?? '';
+    const rawEvidenceIndex = params.get('evidence');
+    if (!signalId && rawEvidenceIndex === null) return null;
+    const parsedIndex = rawEvidenceIndex === null ? Number.NaN : Number(rawEvidenceIndex);
+    return {
+      signalId,
+      evidenceIndex: Number.isInteger(parsedIndex) && parsedIndex >= 0 ? parsedIndex : null,
+    };
+  });
 
   type Failure = {
     kind: 'session' | 'forbidden' | 'model' | 'backend' | 'other';
@@ -262,6 +277,19 @@
   // чтобы отбор не оставлял себя без вариантов выбора.
   let index = $state<FindingListItem[]>([]);
   let rows = $state<FindingListItem[]>([]);
+  let hypotheses = $state<HypothesisSignal[]>([]);
+  let hypothesesTotal = $state<number | null>(null);
+  let hypothesesPhase = $state<'loading' | 'ready' | 'failed'>('loading');
+  let hypothesesFailure = $state('');
+  let hypothesesLoadingMore = $state(false);
+  let hypothesesMoreFailure = $state('');
+  let hypothesesServed = $state(0);
+  let hypothesesSeq = 0;
+  let sourceSignal = $state<HypothesisSignal | null>(null);
+  let sourceEvidenceIndex = $state<number | null>(null);
+  let sourcePhase = $state<'idle' | 'loading' | 'ready' | 'empty' | 'failed'>('idle');
+  let sourceFailure = $state('');
+  let sourceRequestSeq = 0;
   let indexTotal = $state<number | null>(null);
   let rowsTotal = $state<number | null>(null);
   // X-Window-Note: явная оговорка сервера о неполном списке. Пустая строка значит
@@ -311,6 +339,11 @@
       key,
       label: STATUS_SHORT[key],
     })),
+  );
+  const sourceEvidence = $derived(
+    sourceSignal && sourceEvidenceIndex !== null
+      ? (sourceSignal.evidence[sourceEvidenceIndex] ?? null)
+      : null,
   );
 
   const subjectIndex = $derived.by(() => {
@@ -623,6 +656,14 @@
     window.history.replaceState(window.history.state, '', url);
   }
 
+  function closeSourceView(): void {
+    const url = new URL(page.url);
+    for (const key of [...url.searchParams.keys()]) {
+      if (key === 'hypothesis' || key === 'evidence') url.searchParams.delete(key);
+    }
+    void goto(url, { replaceState: true, noScroll: true });
+  }
+
   function clearDocument(): void {
     appliedDocument = '';
     dropLinkParams();
@@ -633,6 +674,81 @@
   function mergePages(current: FindingListItem[], incoming: FindingListItem[]): FindingListItem[] {
     const seen = new Set(current.map((finding) => finding.id));
     return [...current, ...incoming.filter((finding) => !seen.has(finding.id))];
+  }
+
+  function mergeHypotheses(
+    current: HypothesisSignal[],
+    incoming: HypothesisSignal[],
+  ): HypothesisSignal[] {
+    const seen = new Set(current.map((signal) => signal.id));
+    return [...current, ...incoming.filter((signal) => !seen.has(signal.id))];
+  }
+
+  async function loadSourceCitation(signalId: string, evidenceIndex: number): Promise<void> {
+    const sequence = ++sourceRequestSeq;
+    sourcePhase = 'loading';
+    sourceFailure = '';
+    sourceSignal = null;
+    sourceEvidenceIndex = evidenceIndex;
+    try {
+      const signal = await api.hypothesis(signalId);
+      if (sequence !== sourceRequestSeq) return;
+      sourceSignal = signal;
+      sourcePhase = evidenceIndex < signal.evidence.length ? 'ready' : 'empty';
+    } catch (reason) {
+      if (sequence !== sourceRequestSeq) return;
+      sourceFailure = guidanceOf(classify(reason));
+      sourcePhase = 'failed';
+    }
+  }
+
+  function retrySourceCitation(): void {
+    const request = sourceRequest;
+    if (!request || !request.signalId || request.evidenceIndex === null) return;
+    void loadSourceCitation(request.signalId, request.evidenceIndex);
+  }
+
+  async function loadHypotheses(): Promise<void> {
+    const sequence = ++hypothesesSeq;
+    hypothesesPhase = 'loading';
+    hypothesesFailure = '';
+    hypothesesMoreFailure = '';
+    hypothesesLoadingMore = false;
+    hypothesesServed = 0;
+    try {
+      const result = await api.hypotheses(HYPOTHESES_PAGE, 0);
+      if (sequence !== hypothesesSeq) return;
+      hypotheses = mergeHypotheses([], result.items);
+      hypothesesTotal = result.total;
+      hypothesesServed = result.items.length;
+      hypothesesPhase = 'ready';
+    } catch (reason) {
+      if (sequence !== hypothesesSeq) return;
+      hypotheses = [];
+      hypothesesTotal = null;
+      hypothesesFailure = guidanceOf(classify(reason));
+      hypothesesPhase = 'failed';
+    }
+  }
+
+  async function loadMoreHypotheses(): Promise<void> {
+    if (hypothesesLoadingMore || hypothesesTotal === null || hypothesesServed >= hypothesesTotal) {
+      return;
+    }
+    const sequence = hypothesesSeq;
+    hypothesesLoadingMore = true;
+    hypothesesMoreFailure = '';
+    try {
+      const result = await api.hypotheses(HYPOTHESES_PAGE, hypothesesServed);
+      if (sequence !== hypothesesSeq) return;
+      hypotheses = mergeHypotheses(hypotheses, result.items);
+      hypothesesTotal = result.total;
+      hypothesesServed += result.items.length;
+    } catch (reason) {
+      if (sequence === hypothesesSeq) hypothesesMoreFailure = guidanceOf(classify(reason));
+    } finally {
+      if (sequence === hypothesesSeq) hypothesesLoadingMore = false;
+    }
   }
 
   // Приёмка документа не должна стирать отбор аналитика: при preserveFilters
@@ -858,7 +974,7 @@
       }
     }
     uploading = false;
-    if (accepted) await loadIndex(true);
+    if (accepted) await Promise.all([loadIndex(true), loadHypotheses()]);
   }
 
   function pickDocuments(event: Event): void {
@@ -874,6 +990,43 @@
     void ingest(Array.from(event.dataTransfer?.files ?? []));
   }
 
+  // URL передаёт только идентификатор и индекс. Подробности источника выводятся
+  // после ACL-проверки detail endpoint, а не из редактируемых query-параметров.
+  $effect(() => {
+    const request = sourceRequest;
+    const state = session.state;
+    const allowed = canRead;
+    if (!request) {
+      sourceRequestSeq += 1;
+      sourceSignal = null;
+      sourceEvidenceIndex = null;
+      sourceFailure = '';
+      sourcePhase = 'idle';
+      return;
+    }
+    if (state === 'unknown') {
+      sourceSignal = null;
+      sourcePhase = 'loading';
+      return;
+    }
+    if (state !== 'authenticated' || !allowed) {
+      sourceRequestSeq += 1;
+      sourceSignal = null;
+      sourceEvidenceIndex = null;
+      sourcePhase = 'idle';
+      return;
+    }
+    if (!request.signalId || request.evidenceIndex === null) {
+      sourceRequestSeq += 1;
+      sourceSignal = null;
+      sourceEvidenceIndex = null;
+      sourceFailure = 'Ссылка на источник неполная. Откройте цитату из карточки гипотезы.';
+      sourcePhase = 'failed';
+      return;
+    }
+    void loadSourceCitation(request.signalId, request.evidenceIndex);
+  });
+
   // Право и сам факт входа приходят с сервера: до /auth/me находки не
   // запрашиваем, иначе экран показал бы «пусто» там, где ещё нет сессии.
   $effect(() => {
@@ -882,12 +1035,18 @@
     if (state === 'unknown') return;
     if (state === 'authenticated' && allowed) {
       void loadIndex();
+      void loadHypotheses();
       return;
     }
     index = [];
     rows = [];
     indexTotal = null;
     rowsTotal = null;
+    hypothesesSeq += 1;
+    hypotheses = [];
+    hypothesesTotal = null;
+    hypothesesPhase = 'ready';
+    hypothesesFailure = '';
     serverNote = '';
     moreFailure = '';
     loadStalled = false;
@@ -1082,10 +1241,10 @@
     <SectionHead
       level="1"
       eyebrow={pane === 'merges' ? 'Проверка названий' : ''}
-      title={pane === 'merges' ? 'Объединение названий' : 'Гипотезы'}
+      title={pane === 'merges' ? 'Объединение названий' : 'Находки и гипотезы'}
       lead={pane === 'merges'
         ? 'Проверьте, обозначают ли два названия одно и то же. Решение повлияет на будущие материалы.'
-        : 'Просматривайте найденные гипотезы, проверяйте подтверждения и открывайте исходные материалы.'}
+        : 'Аналитические выводы опираются на документы и показываются отдельно от извлечённых утверждений.'}
     >
       <p class="micro findings__count" role="status" aria-live="polite">
         {pane === 'merges' ? mergeCountText : listNote}
@@ -1096,14 +1255,14 @@
          того, как человек начал читать список. Методика экрана за «i», а не
          абзацем под заголовком. -->
     <section class="row reveal" aria-label="Фасет экрана">
-      <div class="seg findings__filters" role="group" aria-label="Раздел гипотез">
+      <div class="seg findings__filters" role="group" aria-label="Раздел находок">
         <button
           class="seg__item"
           type="button"
           aria-pressed={pane === 'findings'}
           onclick={() => setPane('findings')}
         >
-          Гипотезы
+          Утверждения корпуса
         </button>
         <button
           class="seg__item"
@@ -1117,6 +1276,135 @@
       <!-- Пояснения стоят у того, что объясняют: у статусов, у счёта покрытия и
            у очереди пар, а не рядом с переключателем фасетов. -->
     </section>
+
+    {#if sourceRequest && session.state === 'authenticated' && canRead}
+      <section class="panel findings__source-view" aria-labelledby="source-view-title" aria-busy={sourcePhase === 'loading'}>
+        <div class="findings__source-view-head">
+          <h2 class="h4" id="source-view-title">Фрагмент источника</h2>
+          <Button variant="quiet" size="sm" onclick={closeSourceView}>Закрыть фрагмент</Button>
+        </div>
+        {#if sourcePhase === 'loading'}
+          <p class="small muted" role="status">Проверяем доступ и загружаем цитату…</p>
+          <span class="skeleton findings__skel"></span>
+        {:else if sourcePhase === 'failed'}
+          <Notice tone="warn" title="Цитату не удалось открыть">
+            {sourceFailure || 'Повторите запрос из карточки гипотезы.'}
+            {#if sourceRequest.signalId && sourceRequest.evidenceIndex !== null}
+              <div class="row">
+                <Button
+                  variant="quiet"
+                  size="sm"
+                  onclick={retrySourceCitation}
+                >
+                  Повторить
+                </Button>
+              </div>
+            {/if}
+          </Notice>
+        {:else if sourcePhase === 'empty'}
+          <Empty
+            icon="alert"
+            title="Цитата не найдена"
+            body="В гипотезе нет доказательства с таким номером. Откройте источник из карточки ещё раз."
+          />
+        {:else if sourcePhase === 'ready' && sourceEvidence}
+          <div class="findings__source-detail">
+            <p class="small"><strong>{sourceEvidence.source_title || 'Источник без названия'}</strong></p>
+            <div class="micro muted findings__source-location">
+              {#if sourceEvidence.page != null}<span>страница {sourceEvidence.page}</span>{/if}
+              {#if sourceEvidence.sheet}<span>лист {sourceEvidence.sheet}</span>{/if}
+              {#if sourceEvidence.cell_range}<span>ячейки {sourceEvidence.cell_range}</span>{/if}
+              {#if sourceEvidence.char_start != null || sourceEvidence.char_end != null}
+                <span>символы {sourceEvidence.char_start ?? '—'}–{sourceEvidence.char_end ?? '—'}</span>
+              {/if}
+            </div>
+            <blockquote class="findings__source-quote">{sourceEvidence.quote}</blockquote>
+          </div>
+        {/if}
+      </section>
+    {/if}
+
+    {#if pane === 'findings' && session.state === 'authenticated' && canRead}
+      <section
+        class="findings__hypotheses"
+        aria-labelledby="analytical-hypotheses-title"
+        aria-busy={hypothesesPhase === 'loading'}
+      >
+        <div class="findings__hypotheses-head">
+          <div>
+            <h2 class="h3" id="analytical-hypotheses-title">Аналитические гипотезы</h2>
+            <p class="micro muted">
+              Несостыковки, идеи и возможные узкие места с цитатами, на которых основан вывод.
+            </p>
+          </div>
+          <p class="micro findings__hypotheses-count" role="status" aria-live="polite">
+            {#if hypothesesTotal !== null}
+              {countOf(hypothesesTotal, 'гипотеза', 'гипотезы', 'гипотез')}
+            {:else if hypothesesPhase === 'ready'}
+              Показано {hypotheses.length}; общее число не получено
+            {/if}
+          </p>
+        </div>
+
+        {#if hypothesesPhase === 'loading'}
+          <Panel class="findings__state">
+            <p class="small muted">Загружаем аналитические гипотезы…</p>
+            <span class="skeleton findings__skel"></span>
+          </Panel>
+        {:else if hypothesesPhase === 'failed'}
+          <Panel class="findings__state">
+            <Notice tone="warn" title="Гипотезы не загрузились">
+              {hypothesesFailure || 'Повторите запрос.'}
+              <div class="row">
+                <Button variant="quiet" size="sm" onclick={() => void loadHypotheses()}>
+                  Повторить
+                </Button>
+              </div>
+            </Notice>
+          </Panel>
+        {:else if hypotheses.length === 0}
+          <Panel class="findings__state">
+            <Empty
+              icon="layers"
+              title="Аналитических гипотез пока нет"
+              body="Когда система найдёт обоснованный сигнал в документах, здесь появятся вывод и ссылки на подтверждения."
+            >
+              {#snippet action()}
+                <div class="row findings__hypotheses-actions">
+                  <Button href="/research" variant="action">Задать вопрос</Button>
+                  <Button variant="quiet" icon="upload" onclick={toggleImport}>
+                    Добавить материалы
+                  </Button>
+                </div>
+              {/snippet}
+            </Empty>
+          </Panel>
+        {:else}
+          <div class="findings__hypotheses-grid">
+            {#each hypotheses as signal (signal.id)}
+              <HypothesisCard {signal} />
+            {/each}
+          </div>
+          {#if hypothesesMoreFailure}
+            <p class="micro findings__morefail" role="alert">
+              Не удалось загрузить следующие гипотезы. {hypothesesMoreFailure}
+            </p>
+          {/if}
+          {#if hypothesesTotal !== null && hypothesesServed < hypothesesTotal}
+            <div class="row findings__more">
+              <Button
+                variant="quiet"
+                size="sm"
+                disabled={hypothesesLoadingMore}
+                onclick={() => void loadMoreHypotheses()}
+              >
+                {hypothesesLoadingMore ? 'Загружаем…' : 'Показать ещё гипотезы'}
+              </Button>
+            </div>
+          {/if}
+        {/if}
+      </section>
+    {/if}
 
     {#if linkNote}
       <!-- Глубокая ссылка не доехала до утверждения: об этом говорится сразу,
@@ -2024,6 +2312,81 @@
   .findings__count {
     color: var(--ink-3);
     font-variant-numeric: tabular-nums;
+  }
+
+  .findings__hypotheses {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    padding: var(--s5);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-lg);
+    background: var(--surface-raised);
+  }
+
+  .findings__hypotheses-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+  }
+
+  .findings__hypotheses-head .micro {
+    margin-top: var(--s1);
+  }
+
+  .findings__hypotheses-count {
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .findings__source-view {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    scroll-margin-top: calc(var(--topbar-h) + var(--s4));
+  }
+
+  .findings__source-view-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+  }
+
+  .findings__source-quote {
+    margin: 0;
+    padding: var(--s4);
+    border-left: 2px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface-sunk);
+    color: var(--ink-2);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .findings__source-location {
+    display: flex;
+    gap: var(--s3);
+    flex-wrap: wrap;
+  }
+
+  .findings__hypotheses-actions {
+    flex-wrap: wrap;
+  }
+
+  .findings__hypotheses-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr));
+    gap: var(--s4);
+  }
+
+  @media (max-width: 640px) {
+    .findings__hypotheses {
+      padding: var(--s4);
+    }
   }
 
   .findings__import {

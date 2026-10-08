@@ -1104,6 +1104,17 @@ def test_preload_does_not_add_fixed_demo_graph_or_delete_workspace_data() -> Non
     assert driver.nodes == {"workspace-source-1"}
     assert driver.relationships == set()
 
+
+def test_semantic_part_completion_is_durable_and_waits_for_every_part() -> None:
+    from inspect import getsource
+
+    from scientific_tangle.services.infrastructure import Neo4jElasticsearchKnowledgeBase
+
+    source = getsource(Neo4jElasticsearchKnowledgeBase._ingest_locked)
+    assert "d.semantic_parts_completed" in source
+    assert "d.semantic_part_total = $total" in source
+    assert "d.semantic_extracted = size(completed) >= $total" in source
+
 def test_graph_snapshot_slices_by_connectivity_not_by_alphabet() -> None:
     """Полный снимок режется по степени связности, а рёбра берутся внутри среза.
 

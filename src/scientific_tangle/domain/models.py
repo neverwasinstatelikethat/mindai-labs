@@ -117,7 +117,7 @@ class QueryPlan(BaseModel):
     @field_validator("year_from", "year_to", mode="before")
     @classmethod
     def _absent_year_is_no_filter(cls, value: object) -> object:
-        """Нулевой год у модели означает «фильтра нет», а не «год 0».
+        """Пустое значение года у модели означает отсутствие фильтра.
 
         Приёмка 4 октября на живом GigaChat: план приходил с `year_from: 0`,
         `ge=1800` читал это как испорченный год, ремонт вывода не помогал
@@ -125,7 +125,7 @@ class QueryPlan(BaseModel):
         `ModelUnavailableError`. Настояще негодное значение (1700) по-прежнему
         остаётся ошибкой: терпимость касается только явных пустых маркеров.
         """
-        return None if value in (0, -1, "0", "-1") else value
+        return None if value in (0, -1, "0", "-1", "") else value
 
     @field_validator("max_hops", mode="before")
     @classmethod

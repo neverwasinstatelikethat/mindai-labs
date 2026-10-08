@@ -27,6 +27,7 @@ from scientific_tangle.domain.contracts import (
     RetrievalPlan,
     StructuralDocumentReceipt,
 )
+from scientific_tangle.domain.hypotheses import HypothesisSignal, HypothesisWindow
 from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import NumericObservation, QueryPlan
 from scientific_tangle.services.communities import (
@@ -79,6 +80,7 @@ logger = logging.getLogger(__name__)
 
 FINDING_INDEX = "mindai-findings-v2"
 CHUNK_INDEX = "mindai-chunks-v2"
+HYPOTHESIS_INDEX = "mindai-hypotheses-v1"
 # Потолок одноразовой правки полей отсечения окна (см. _backfill_window_filters):
 # за один процесс чинится ограниченное число старых записей, остальное допишется
 # путём обычной записи в индекс.
@@ -273,6 +275,7 @@ class Neo4jElasticsearchKnowledgeBase:
                 return
             self._ensure_neo4j_schema()
             self._ensure_es_indices()
+            self._ensure_hypothesis_index()
             self._restore_findings()
             self._backfill_window_filters()
             # Демо-сеятель остаётся каталогом процесса (supersede, история версий):
@@ -412,6 +415,24 @@ class Neo4jElasticsearchKnowledgeBase:
             )
         else:
             self._extend_index_mapping(CHUNK_INDEX, chunk_mappings)
+
+    def _ensure_hypothesis_index(self) -> None:
+        if self._search.indices.exists(index=HYPOTHESIS_INDEX):
+            return
+        self._search.indices.create(
+            index=HYPOTHESIS_INDEX,
+            settings=RUS_ANALYSIS,
+            mappings={
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "kind": {"type": "keyword"},
+                    "statement": {"type": "text", "analyzer": "ru"},
+                    "statement_sort": {"type": "keyword", "ignore_above": 2048},
+                    "data_class": {"type": "keyword"},
+                    "signal_json": {"type": "keyword", "index": False},
+                }
+            },
+        )
 
     def _extend_index_mapping(self, index: str, mappings: dict[str, Any]) -> None:
         """Дописывает новые поля в уже созданный индекс.
@@ -603,10 +624,21 @@ class Neo4jElasticsearchKnowledgeBase:
                 )
         self._invalidate_graph_cache()
 
-    def ingest(self, document: DocumentRequest, extraction: ExtractionResult) -> DocumentReceipt:
+    def ingest(
+        self,
+        document: DocumentRequest,
+        extraction: ExtractionResult,
+        *,
+        source_document_id: UUID | None = None,
+        semantic_part_id: str | None = None,
+        semantic_part_total: int | None = None,
+    ) -> DocumentReceipt:
         self._ensure_ready()
         checksum = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
-        document_id = stable_uuid(checksum)
+        part_mode = source_document_id is not None
+        if part_mode != (semantic_part_id is not None and semantic_part_total is not None):
+            raise ValueError("Для частичного импорта нужны все идентификаторы semantic part")
+        document_id = source_document_id or stable_uuid(checksum)
         # TOCTOU дедупа закрывает замок на документ: проверка ``semantic_extracted``
         # и запись исполняются в одной критической секции. Второй аналитик,
         # загрузивший тот же файл, встаёт в ожидание и получает «duplicate» от уже
@@ -615,7 +647,30 @@ class Neo4jElasticsearchKnowledgeBase:
         # документа, а не весь контур — общий ``self._lock`` при этом держится
         # только на мутациях RAM-состояния.
         with self._document_lock(f"semantic:{document_id}"):
-            return self._ingest_locked(document, extraction, checksum, document_id)
+            return self._ingest_locked(
+                document,
+                extraction,
+                checksum,
+                document_id,
+                semantic_part_id=semantic_part_id,
+                semantic_part_total=semantic_part_total,
+            )
+
+    def semantic_parts_completed(self, source_document_id: UUID, part_total: int) -> set[str]:
+        self._ensure_ready()
+        with self._driver.session() as session:
+            record = session.run(
+                "MATCH (d:Entity {id: $id}) "
+                "RETURN d.semantic_part_total AS total, "
+                "d.semantic_parts_completed AS parts",
+                id=f"document-{source_document_id}",
+            ).single()
+        if not record:
+            return set()
+        stored_total = record.get("total")
+        if stored_total is not None and int(stored_total) != part_total:
+            raise ValueError("Состав semantic parts документа изменился между запусками")
+        return {str(item) for item in (record.get("parts") or [])}
 
     def _ingest_locked(
         self,
@@ -623,6 +678,9 @@ class Neo4jElasticsearchKnowledgeBase:
         extraction: ExtractionResult,
         checksum: str,
         document_id: UUID,
+        *,
+        semantic_part_id: str | None = None,
+        semantic_part_total: int | None = None,
     ) -> DocumentReceipt:
         with self._driver.session() as session:
             already = session.run(
@@ -630,13 +688,31 @@ class Neo4jElasticsearchKnowledgeBase:
                 "WHERE coalesce(d.semantic_extracted, false) RETURN d.id AS id",
                 id=f"document-{document_id}",
             ).single()
-        if already:
+        if already and semantic_part_id is None:
             return DocumentReceipt(
                 document_id=document_id,
                 checksum=checksum,
                 status="duplicate",
                 extracted_claims=0,
             )
+        if semantic_part_id is not None:
+            completed = self.semantic_parts_completed(document_id, semantic_part_total or 0)
+            if semantic_part_id in completed:
+                return DocumentReceipt(
+                    document_id=document_id,
+                    checksum=checksum,
+                    status="duplicate",
+                    extracted_claims=0,
+                )
+
+            # Убирает незавершённую попытку той же части и старый полный preload
+            # перед миграцией на part IDs. Это закрывает окно падения после записи
+            # графа, но до durable-маркера, а также повтор старой выборочной загрузки.
+            part_tx = f"ingest-{stable_uuid(f'{document_id}:semantic:{semantic_part_id}')}"
+            self._clear_ingest_attempt(part_tx)
+            if already and not completed:
+                legacy_tx = f"ingest-{stable_uuid(f'{document_id}:semantic:full')}"
+                self._clear_ingest_attempt(legacy_tx)
 
         # Один снимок каталога до записи вместо трёх проходов по графу:
         # ``full_graph()`` здесь использовался только ради множеств id, но он строит
@@ -648,9 +724,16 @@ class Neo4jElasticsearchKnowledgeBase:
         before_nodes, before_edges = graph_element_ids(state.nodes, state.edges)
         before_findings = set(state.findings)
         new_ids: list[str] = []
-        tx_id = f"ingest-{stable_uuid(f'{checksum}:semantic')}"
+        part_key = semantic_part_id or "full"
+        tx_id = f"ingest-{stable_uuid(f'{document_id}:semantic:{part_key}')}"
 
-        receipt = self._seed.ingest(document, extraction)
+        receipt = self._seed.ingest(
+            document,
+            extraction,
+            source_document_id=document_id if semantic_part_id is not None else None,
+            semantic_part_id=semantic_part_id,
+            semantic_part_total=semantic_part_total,
+        )
         if receipt.status == "duplicate":
             return receipt
 
@@ -671,12 +754,27 @@ class Neo4jElasticsearchKnowledgeBase:
                 ),
                 tx_id=tx_id,
             )
-            with self._driver.session() as session:
-                session.run(
-                    "MATCH (d:Entity {id: $id}) SET d.semantic_extracted = true",
-                    id=f"document-{receipt.document_id}",
-                )
             self._merge_findings([current[key] for key in new_ids])
+            if semantic_part_id is None:
+                with self._driver.session() as session:
+                    session.run(
+                        "MATCH (d:Entity {id: $id}) SET d.semantic_extracted = true",
+                        id=f"document-{receipt.document_id}",
+                    )
+            else:
+                with self._driver.session() as session:
+                    session.run(
+                        "MATCH (d:Entity {id: $id}) "
+                        "WITH d, coalesce(d.semantic_parts_completed, []) AS previous "
+                        "WITH d, CASE WHEN $part IN previous THEN previous "
+                        "ELSE previous + $part END AS completed "
+                        "SET d.semantic_parts_completed = completed, "
+                        "d.semantic_part_total = $total, "
+                        "d.semantic_extracted = size(completed) >= $total",
+                        id=f"document-{receipt.document_id}",
+                        part=semantic_part_id,
+                        total=semantic_part_total,
+                    )
         except Exception as error:
             # Атомарность импорта: прерванный импорт не вправе оставлять узлы графа,
             # находки каталога и половину ES-документов — иначе «есть ли у числа
@@ -684,10 +782,49 @@ class Neo4jElasticsearchKnowledgeBase:
             # Остаток, который этот контур не гарантирует: процесс, убитый между
             # записью ES и записью графа, оставит находки без узлов (трассировка к
             # документу сохраняется, обход графа их не увидит).
-            self._roll_back_ingest(receipt.document_id, state, new_ids, tx_id)
+            self._roll_back_ingest(
+                receipt.document_id,
+                state,
+                new_ids,
+                tx_id,
+                semantic_part_id=semantic_part_id,
+            )
             logger.error("Импорт %s откачен: %s", receipt.document_id, error)
             raise
         return receipt
+
+    def _clear_ingest_attempt(self, tx_id: str) -> None:
+        with self._driver.session() as session:
+            record = session.run(
+                "MATCH (n:Entity {created_by: $tx, type: 'claim'}) "
+                "RETURN collect(n.id) AS claim_ids",
+                tx=tx_id,
+            ).single()
+            raw_claim_ids = record.get("claim_ids") if record is not None else []
+            claim_ids = [str(item) for item in (raw_claim_ids or [])]
+            session.run(
+                "MATCH ()-[r]->() WHERE r.created_by = $tx DELETE r",
+                tx=tx_id,
+            )
+            session.run(
+                "MATCH (n:Entity) WHERE n.created_by = $tx DETACH DELETE n",
+                tx=tx_id,
+            )
+        if claim_ids:
+            finding_ids = [f"finding-{claim_id}" for claim_id in claim_ids]
+            helpers.bulk(
+                self._search,
+                [
+                    {"_index": FINDING_INDEX, "_id": item, "_op_type": "delete"}
+                    for item in finding_ids
+                ],
+                refresh=True,
+                raise_on_error=False,
+                raise_on_exception=False,
+            )
+            with self._lock:
+                for finding_id in finding_ids:
+                    self._findings.pop(finding_id, None)
 
     def _roll_back_ingest(
         self,
@@ -695,6 +832,8 @@ class Neo4jElasticsearchKnowledgeBase:
         state: KnowledgeState,
         new_ids: Sequence[str],
         tx_id: str,
+        *,
+        semantic_part_id: str | None = None,
     ) -> None:
         """Откатывает каталог, seed-состояние, находки ES и созданные элементы графа."""
         self._seed.restore_state(state)
@@ -719,10 +858,20 @@ class Neo4jElasticsearchKnowledgeBase:
             except Exception as error:  # noqa: BLE001 - вторичный сбой не перекрывает первый
                 logger.error("Очистка %d находок после отказа не удалась: %s", len(new_ids), error)
         with self._driver.session() as session:
-            session.run(
-                "MATCH (d:Entity {id: $id}) REMOVE d.semantic_extracted",
-                id=f"document-{document_id}",
-            )
+            if semantic_part_id is None:
+                session.run(
+                    "MATCH (d:Entity {id: $id}) REMOVE d.semantic_extracted",
+                    id=f"document-{document_id}",
+                )
+            else:
+                session.run(
+                    "MATCH (d:Entity {id: $id}) "
+                    "SET d.semantic_parts_completed = [part IN "
+                    "coalesce(d.semantic_parts_completed, []) WHERE part <> $part], "
+                    "d.semantic_extracted = false",
+                    id=f"document-{document_id}",
+                    part=semantic_part_id,
+                )
             # Только элементы этой записи: узлы, созданные прежними импортами,
             # остаются на месте вместе со своими ссылками.
             session.run(
@@ -1568,7 +1717,7 @@ class Neo4jElasticsearchKnowledgeBase:
         self._note_cache(False, age)
         return snapshot
 
-    def _load_graph_from_neo4j(self) -> GraphSnapshot:
+    def _load_graph_from_neo4j(self, *, complete: bool = False) -> GraphSnapshot:
         # Срез обязана быть backbone'ом, а не алфавитным префиксом. До этой правки
         # узлы резались `ORDER BY label`, а рёбра — независимо, по `rel.id`: на
         # живом замере (1501 узел) пересечение двух посторонних срезов оставляло
@@ -1578,7 +1727,17 @@ class Neo4jElasticsearchKnowledgeBase:
         # связности, а рёбра читаются только между уже выбранными узлами:
         # снимок становится настоящим подграфом, а не пересечением двух лимитов.
         with self._driver.session() as session:
-            node_record = session.run(
+            node_query = (
+                """
+                MATCH (node:Entity)
+                WHERE node.type <> 'chunk'
+                WITH node, COUNT { (node)--() } AS degree
+                ORDER BY degree DESC, coalesce(node.label, node.id), node.id
+                WITH collect(properties(node)) AS nodes, count(node) AS total
+                RETURN nodes, total
+                """
+                if complete
+                else
                 """
                 MATCH (node:Entity)
                 WHERE node.type <> 'chunk'
@@ -1586,36 +1745,64 @@ class Neo4jElasticsearchKnowledgeBase:
                 ORDER BY degree DESC, coalesce(node.label, node.id), node.id
                 WITH collect(properties(node)) AS nodes, count(node) AS total
                 RETURN nodes[0..$limit] AS nodes, total
-                """,
-                limit=GRAPH_NODE_LIMIT,
-            ).single()
+                """
+            )
+            node_record = (
+                session.run(node_query).single()
+                if complete
+                else session.run(node_query, limit=GRAPH_NODE_LIMIT).single()
+            )
             total = int((node_record["total"] if node_record else 0) or 0)
             raw_nodes = (node_record["nodes"] if node_record else []) or []
             selected = [
                 node["id"] for node in raw_nodes if isinstance(node.get("id"), str)
             ]
-            edge_record = (
-                session.run(
-                    """
-                    UNWIND $ids AS id
-                    MATCH (a:Entity {id: id})-[rel]->(b:Entity)
-                    WHERE a.type <> 'chunk' AND b.type <> 'chunk'
-                      AND type(rel) <> 'HAS_CHUNK' AND b.id IN $ids
-                    WITH a, rel, b
-                    ORDER BY rel.id, a.id, b.id
-                    WITH collect(DISTINCT {
-                        id: rel.id, source: a.id, target: b.id,
-                        relation: type(rel), confidence: rel.confidence,
-                        data_class: coalesce(rel.data_class, 'public')
-                    }) AS edges, count(*) AS shown
-                    RETURN edges[0..$limit] AS edges, shown
-                    """,
-                    ids=selected,
-                    limit=GRAPH_EDGE_LIMIT,
-                ).single()
-                if selected
-                else None
+            edge_query = (
+                """
+                UNWIND $ids AS id
+                MATCH (a:Entity {id: id})-[rel]->(b:Entity)
+                WHERE a.type <> 'chunk' AND b.type <> 'chunk'
+                  AND type(rel) <> 'HAS_CHUNK' AND b.id IN $ids
+                WITH a, rel, b
+                ORDER BY rel.id, a.id, b.id
+                WITH collect(DISTINCT {
+                    id: rel.id, source: a.id, target: b.id,
+                    relation: type(rel), confidence: rel.confidence,
+                    data_class: coalesce(rel.data_class, 'public')
+                }) AS edges, count(*) AS shown
+                RETURN edges, shown
+                """
+                if complete
+                else
+                """
+                UNWIND $ids AS id
+                MATCH (a:Entity {id: id})-[rel]->(b:Entity)
+                WHERE a.type <> 'chunk' AND b.type <> 'chunk'
+                  AND type(rel) <> 'HAS_CHUNK' AND b.id IN $ids
+                WITH a, rel, b
+                ORDER BY rel.id, a.id, b.id
+                WITH collect(DISTINCT {
+                    id: rel.id, source: a.id, target: b.id,
+                    relation: type(rel), confidence: rel.confidence,
+                    data_class: coalesce(rel.data_class, 'public')
+                }) AS edges, count(*) AS shown
+                RETURN edges[0..$limit] AS edges, shown
+                """
             )
+            if complete:
+                edge_record = (
+                    session.run(edge_query, ids=selected).single() if selected else None
+                )
+            else:
+                edge_record = (
+                    session.run(
+                        edge_query,
+                        ids=selected,
+                        limit=GRAPH_EDGE_LIMIT,
+                    ).single()
+                    if selected
+                    else None
+                )
             # Полное число рёбёр корпуса считается отдельно: ограничение сверху
             # (показано, всего) обязано называть весь корпус, а не подграф среза,
             # иначе «3000 из 3000» читалось бы как «потолка не было».
@@ -1650,9 +1837,10 @@ class Neo4jElasticsearchKnowledgeBase:
         # Числиться 600 значило бы недооценить потерю ровно в тот момент, когда
         # её надо назвать; на старом алфавитном порядке эта же потеря и была
         # причиной 120 узлов вместо 600 на замере 2 октября.
-        with self._lock:
-            self._graph_window = (len(keep), max(total, len(keep)))
-            self._graph_edge_window = (len(edges), max(edges_total, len(edges)))
+        if not complete:
+            with self._lock:
+                self._graph_window = (len(keep), max(total, len(keep)))
+                self._graph_edge_window = (len(edges), max(edges_total, len(edges)))
         communities = detect_communities(keep, edges)
         return GraphSnapshot(nodes=keep, edges=edges, communities=communities)
 
@@ -1765,6 +1953,106 @@ class Neo4jElasticsearchKnowledgeBase:
                 and (allowed is None or finding.data_class in allowed)
             ]
         return [finding.model_copy(deep=True) for finding in selected]
+
+    def semantic_findings(self) -> list[Finding]:
+        self._ensure_ready()
+        findings: list[Finding] = []
+        for hit in helpers.scan(
+            self._search,
+            index=FINDING_INDEX,
+            query={"query": {"match_all": {}}},
+            _source=["finding_json"],
+            size=1000,
+        ):
+            source = hit.get("_source", {})
+            raw = source.get("finding_json")
+            if not isinstance(raw, str):
+                continue
+            finding = Finding.model_validate_json(raw)
+            if finding.superseded_by is None and not is_demo_finding(finding):
+                findings.append(finding)
+        return findings
+
+    def semantic_graph(self) -> GraphSnapshot:
+        self._ensure_ready()
+        return self._load_graph_from_neo4j(complete=True)
+
+    def upsert_hypotheses(self, signals: Sequence[HypothesisSignal]) -> None:
+        self._ensure_ready()
+        if not signals:
+            return
+        actions = [
+            {
+                "_index": HYPOTHESIS_INDEX,
+                "_id": str(signal.id),
+                "_source": {
+                    "id": str(signal.id),
+                    "kind": signal.kind,
+                    "statement": signal.statement,
+                    "statement_sort": signal.statement,
+                    "data_class": signal.data_class.value,
+                    "signal_json": signal.model_dump_json(),
+                },
+            }
+            for signal in signals
+        ]
+        helpers.bulk(self._search, actions, refresh=True)
+
+    def hypotheses_window(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        allowed_data_classes: set[DataClass] | None = None,
+    ) -> HypothesisWindow:
+        self._ensure_ready()
+        filters: list[dict[str, object]] = []
+        if allowed_data_classes is not None:
+            filters.append(
+                {"terms": {"data_class": [item.value for item in allowed_data_classes]}}
+            )
+        response = self._search.search(
+            index=HYPOTHESIS_INDEX,
+            query={"bool": {"filter": filters}},
+            from_=offset,
+            size=limit,
+            sort=[{"kind": "asc"}, {"statement_sort": "asc"}, {"id": "asc"}],
+            track_total_hits=True,
+            source_includes=["signal_json"],
+        )
+        hits = response.get("hits", {})
+        total_data = hits.get("total", 0)
+        total = int(total_data.get("value", 0)) if isinstance(total_data, dict) else int(total_data)
+        signals = [
+            HypothesisSignal.model_validate_json(hit["_source"]["signal_json"])
+            for hit in hits.get("hits", [])
+        ]
+        return HypothesisWindow(
+            signals=signals,
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    def hypothesis_by_id(
+        self, signal_id: UUID, allowed_data_classes: set[DataClass] | None = None
+    ) -> HypothesisSignal | None:
+        self._ensure_ready()
+        filters: list[dict[str, object]] = [{"term": {"id": str(signal_id)}}]
+        if allowed_data_classes is not None:
+            filters.append(
+                {"terms": {"data_class": [item.value for item in allowed_data_classes]}}
+            )
+        response = self._search.search(
+            index=HYPOTHESIS_INDEX,
+            query={"bool": {"filter": filters}},
+            size=1,
+            source_includes=["signal_json"],
+        )
+        hits = response.get("hits", {}).get("hits", [])
+        if not hits:
+            return None
+        return HypothesisSignal.model_validate_json(hits[0]["_source"]["signal_json"])
 
     def findings_window(
         self,

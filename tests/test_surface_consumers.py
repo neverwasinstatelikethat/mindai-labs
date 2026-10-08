@@ -274,6 +274,36 @@ def test_routes_really_are_read_from_openapi() -> None:
     assert len(paths) > 25, f"OpenAPI подозрительно мал: {len(paths)} путей"
 
 
+def test_analytical_hypotheses_use_a_dedicated_api_and_evidence_surface() -> None:
+    """Гипотезы-аналитические сигналы не должны подменяться сырыми находками."""
+    types = (FRONTEND_SRC / "lib" / "types.ts").read_text(encoding="utf-8")
+    api = API_CLIENT.read_text(encoding="utf-8")
+    page = (FRONTEND_SRC / "routes" / "(app)" / "findings" / "+page.svelte").read_text(
+        encoding="utf-8"
+    )
+    card_path = FRONTEND_SRC / "lib" / "ui" / "HypothesisCard.svelte"
+    card = card_path.read_text(encoding="utf-8") if card_path.exists() else ""
+
+    assert "export interface HypothesisSignal" in types
+    assert "requestWithTotal<HypothesisSignal[]>" in api
+    assert "`/api/v1/hypotheses?limit=${limit}&offset=${offset}`" in api
+    assert "request<HypothesisSignal>(`/api/v1/hypotheses/${encodeURIComponent(id)}`)" in api
+    assert "api.hypotheses(" in page
+    assert "hypotheses = mergeHypotheses([], result.items)" in page
+    assert "{#each hypotheses as signal (signal.id)}" in page
+    assert "<HypothesisCard {signal} />" in page
+    assert "api.findings(" in page and "api.upload(file)" in page
+    assert "params.set('hypothesis', signal.id)" in card
+    assert "params.set('evidence', String(evidenceIndex))" in card
+    assert "params.set('source_quote'" not in card and "params.set('source_title'" not in card
+    assert "api.hypothesis(signalId)" in page
+    assert "sourceEvidence.quote" in page and "id=\"source-view-title\"" in page
+    assert "params.get('source_quote')" not in page
+    assert "sourcePhase === 'loading'" in page and "sourcePhase === 'failed'" in page
+    assert "sourcePhase === 'empty'" in page
+    assert "data_class" in card
+
+
 def _ts_object(text: str, name: str) -> str:
     """Тело литерала объекта по имени объявления, включая вложенные фигурные скобки."""
     anchor = text.index(f"const {name}")

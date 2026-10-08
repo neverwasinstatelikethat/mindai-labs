@@ -26,6 +26,7 @@ from scientific_tangle.domain.contracts import (
     RetrievalPlan,
     StructuralDocumentReceipt,
 )
+from scientific_tangle.domain.hypotheses import HypothesisSignal, HypothesisWindow
 from scientific_tangle.domain.intelligence import DataClass
 from scientific_tangle.domain.models import (
     EvidenceLocator,
@@ -676,8 +677,16 @@ class KnowledgeBase(Protocol):
     """
 
     def ingest(
-        self, document: DocumentRequest, extraction: ExtractionResult
+        self,
+        document: DocumentRequest,
+        extraction: ExtractionResult,
+        *,
+        source_document_id: UUID | None = None,
+        semantic_part_id: str | None = None,
+        semantic_part_total: int | None = None,
     ) -> DocumentReceipt: ...
+
+    def semantic_parts_completed(self, source_document_id: UUID, part_total: int) -> set[str]: ...
 
     def retrieve(
         self,
@@ -712,6 +721,24 @@ class KnowledgeBase(Protocol):
     def corpus_stats(self) -> CorpusStats: ...
 
     def all_findings(self, allowed_data_classes: set[DataClass] | None = None) -> list[Finding]: ...
+
+    def semantic_findings(self) -> list[Finding]: ...
+
+    def semantic_graph(self) -> GraphSnapshot: ...
+
+    def upsert_hypotheses(self, signals: Sequence[HypothesisSignal]) -> None: ...
+
+    def hypotheses_window(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        allowed_data_classes: set[DataClass] | None = None,
+    ) -> HypothesisWindow: ...
+
+    def hypothesis_by_id(
+        self, signal_id: UUID, allowed_data_classes: set[DataClass] | None = None
+    ) -> HypothesisSignal | None: ...
 
     def findings_window(
         self,
@@ -787,6 +814,7 @@ class InMemoryKnowledgeBase:
         self._findings: dict[str, Finding] = {
             finding.id: finding for finding in self._seed_findings()
         }
+        self._hypotheses: dict[UUID, HypothesisSignal] = {}
         self._graph = self._seed_graph()
         self._version_chains: dict[str, list[str]] = {}
         self._communities: list[str] | None = None
@@ -819,10 +847,31 @@ class InMemoryKnowledgeBase:
     # ── Ingestion ───────────────────────────────────────────────────────────
 
     @_synchronized
-    def ingest(self, document: DocumentRequest, extraction: ExtractionResult) -> DocumentReceipt:
+    def ingest(
+        self,
+        document: DocumentRequest,
+        extraction: ExtractionResult,
+        *,
+        source_document_id: UUID | None = None,
+        semantic_part_id: str | None = None,
+        semantic_part_total: int | None = None,
+    ) -> DocumentReceipt:
         checksum = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
-        document_id = stable_uuid(checksum)
-        if checksum in self._documents:
+        part_mode = source_document_id is not None
+        if part_mode != (semantic_part_id is not None and semantic_part_total is not None):
+            raise ValueError("Для частичного импорта нужны все идентификаторы semantic part")
+        document_id = source_document_id or stable_uuid(checksum)
+        if part_mode and semantic_part_id in self.semantic_parts_completed(
+            document_id, semantic_part_total or 0
+        ):
+            return DocumentReceipt(
+                document_id=document_id,
+                checksum=checksum,
+                status="duplicate",
+                extracted_claims=0,
+            )
+        document_key = f"{document_id}:{semantic_part_id}" if part_mode else checksum
+        if document_key in self._documents:
             return DocumentReceipt(
                 document_id=document_id,
                 checksum=checksum,
@@ -833,9 +882,15 @@ class InMemoryKnowledgeBase:
         # Снимок до записи: недоизвлечённый документ не должен оставлять половину
         # узлов, рёбер и находок — иначе «частичный импорт» выглядит как корпус.
         state = self.snapshot_state()
-        self._documents[checksum] = document
+        self._documents[document_key] = document
         try:
-            self._add_extraction(document, document_id, extraction)
+            self._add_extraction(
+                document, document_id, extraction, semantic_part_id=semantic_part_id
+            )
+            if part_mode:
+                self._mark_semantic_part(
+                    document_id, semantic_part_id or "", semantic_part_total or 0
+                )
         except Exception:
             self.restore_state(state)
             raise
@@ -846,6 +901,40 @@ class InMemoryKnowledgeBase:
             status="created",
             extracted_claims=len(extraction.claims),
         )
+
+    @_synchronized
+    def semantic_parts_completed(self, source_document_id: UUID, part_total: int) -> set[str]:
+        node = next(
+            (item for item in self._graph.nodes if item.id == f"document-{source_document_id}"),
+            None,
+        )
+        if node is None:
+            return set()
+        stored_total = node.metadata.get("semantic_part_total")
+        if stored_total is not None and stored_total != part_total:
+            raise ValueError("Состав semantic parts документа изменился между запусками")
+        parts_value = node.metadata.get("semantic_parts_completed", "[]")
+        if not isinstance(parts_value, str):
+            return set()
+        parts = json.loads(parts_value)
+        return {str(item) for item in parts} if isinstance(parts, list) else set()
+
+    @_synchronized
+    def _mark_semantic_part(self, document_id: UUID, part_id: str, part_total: int) -> None:
+        node_id = f"document-{document_id}"
+        for index, node in enumerate(self._graph.nodes):
+            if node.id != node_id:
+                continue
+            completed = self.semantic_parts_completed(document_id, part_total)
+            completed.add(part_id)
+            metadata = {
+                **node.metadata,
+                "semantic_parts_completed": json.dumps(sorted(completed)),
+                "semantic_part_total": part_total,
+                "semantic_extracted": len(completed) == part_total,
+            }
+            self._graph.nodes[index] = node.model_copy(update={"metadata": metadata})
+            return
 
     @_synchronized
     def snapshot_state(self) -> KnowledgeState:
@@ -893,6 +982,8 @@ class InMemoryKnowledgeBase:
         document: DocumentRequest,
         document_id: UUID,
         extraction: ExtractionResult,
+        *,
+        semantic_part_id: str | None = None,
     ) -> None:
         existing_nodes = {node.id for node in self._graph.nodes}
         document_node_id = f"document-{document_id}"
@@ -926,7 +1017,12 @@ class InMemoryKnowledgeBase:
                 existing_nodes.add(entity_id)
 
         for index, claim in enumerate(extraction.claims):
-            claim_id = f"claim-{stable_uuid(f'{document_id}:{index}:{claim.statement}')}"
+            claim_key = (
+                f"{document_id}:{semantic_part_id}:{index}"
+                if semantic_part_id is not None
+                else f"{document_id}:{index}:{claim.statement}"
+            )
+            claim_id = f"claim-{stable_uuid(claim_key)}"
             subject_id = entity_ids.get(claim.subject.lower())
             object_id = entity_ids.get(claim.object.lower())
             if not subject_id:
@@ -1059,8 +1155,8 @@ class InMemoryKnowledgeBase:
             page=fragment.page,
             sheet=fragment.sheet,
             cell_range=fragment.cell_range,
-            char_start=offsets[0] if offsets else None,
-            char_end=offsets[1] if offsets else None,
+            char_start=(fragment.source_char_start + offsets[0]) if offsets else None,
+            char_end=(fragment.source_char_start + offsets[1]) if offsets else None,
             quote=quote or document.title,
         )
 
@@ -1452,6 +1548,58 @@ class InMemoryKnowledgeBase:
             if finding.superseded_by is None
             and (allowed_data_classes is None or finding.data_class in allowed_data_classes)
         ]
+
+    @_synchronized
+    def semantic_findings(self) -> list[Finding]:
+        return [
+            finding.model_copy(deep=True)
+            for finding in self._findings.values()
+            if not finding.id.startswith("chunk-")
+            and finding.superseded_by is None
+        ]
+
+    @_synchronized
+    def semantic_graph(self) -> GraphSnapshot:
+        return GraphSnapshot(
+            nodes=list(self._graph.nodes),
+            edges=list(self._graph.edges),
+            communities=self._ensure_communities(),
+        )
+
+    @_synchronized
+    def upsert_hypotheses(self, signals: Sequence[HypothesisSignal]) -> None:
+        for signal in signals:
+            self._hypotheses[signal.id] = signal.model_copy(deep=True)
+
+    @_synchronized
+    def hypotheses_window(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        allowed_data_classes: set[DataClass] | None = None,
+    ) -> HypothesisWindow:
+        return HypothesisWindow.from_signals(
+            list(self._hypotheses.values()),
+            allowed_data_classes=(
+                set(DataClass)
+                if allowed_data_classes is None
+                else allowed_data_classes
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    @_synchronized
+    def hypothesis_by_id(
+        self, signal_id: UUID, allowed_data_classes: set[DataClass] | None = None
+    ) -> HypothesisSignal | None:
+        signal = self._hypotheses.get(signal_id)
+        if signal is None or (
+            allowed_data_classes is not None and signal.data_class not in allowed_data_classes
+        ):
+            return None
+        return signal.model_copy(deep=True)
 
     @_synchronized
     def finding_catalog(self) -> Mapping[str, Finding]:

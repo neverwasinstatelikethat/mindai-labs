@@ -752,6 +752,7 @@ class DocumentFragment(BaseModel):
     page: int | None = Field(default=None, ge=1)
     sheet: str | None = None
     cell_range: str | None = None
+    source_char_start: int = Field(default=0, ge=0)
 
 
 class DocumentReceipt(BaseModel):
@@ -782,6 +783,8 @@ class PreloadReport(BaseModel):
     failed: int
     claims: int
     documents: list[PreloadDocumentResult]
+    skipped_oversize: int = Field(default=0, ge=0)
+    ocr_required: int = Field(default=0, ge=0)
 
 
 class StructuralDocumentReceipt(BaseModel):

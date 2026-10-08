@@ -60,6 +60,7 @@ from scientific_tangle.domain.contracts import (
     PipelineVariantMetrics,
     ReasoningResult,
 )
+from scientific_tangle.domain.hypotheses import HypothesisSignal, HypothesisWindow
 from scientific_tangle.domain.intelligence import AuditEvent, DataClass
 from scientific_tangle.domain.models import QueryPlan
 from scientific_tangle.services import durable_state as state_module
@@ -1027,7 +1028,12 @@ async def test_ingestion_offloads_ontology_validation_and_graph_writes() -> None
             )
 
     class _Knowledge:
-        def ingest(self, document: object, extraction: ExtractionResult) -> DocumentReceipt:
+        def ingest(
+            self,
+            document: object,
+            extraction: ExtractionResult,
+            **kwargs: object,
+        ) -> DocumentReceipt:
             _inside_event_loop(seen)
             return DocumentReceipt(
                 document_id=UUID(int=4), checksum="sum", status="created", extracted_claims=0
@@ -2177,6 +2183,153 @@ def test_findings_and_conflicts_are_paginated_with_a_total_header(
     assert [item["status"] for item in conflicts.json()] == ["disputed"]
     assert beyond.json() == []
     assert beyond.headers["X-Total-Count"] == "5"
+
+
+def test_hypotheses_list_is_paginated(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals = [
+        HypothesisSignal(
+            id=UUID(int=index + 1),
+            kind="improvement_opportunity",
+            statement=f"Короткая гипотеза {index}",
+            proposal=None,
+            evidence=[
+                {
+                    "document_id": UUID(int=100 + index),
+                    "source_title": f"Источник {index}",
+                    "page": 1,
+                    "quote": f"Проверяемое свидетельство {index}",
+                }
+            ],
+            confidence=0.7,
+            data_class=DataClass.PUBLIC,
+        )
+        for index in range(3)
+    ]
+    calls: list[dict[str, object]] = []
+
+    def read_window(*, limit: int, offset: int, allowed_data_classes: set[DataClass]):
+        calls.append(
+            {"limit": limit, "offset": offset, "allowed_data_classes": allowed_data_classes}
+        )
+        return HypothesisWindow(
+            signals=signals[offset : offset + limit],
+            total=len(signals),
+            limit=limit,
+            offset=offset,
+        )
+
+    monkeypatch.setattr(deps.knowledge, "hypotheses_window", read_window, raising=False)
+
+    response = client.get(
+        "/api/v1/hypotheses", headers=base, params={"limit": 1, "offset": 1}
+    )
+
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+    assert response.json()[0]["statement"] == "Короткая гипотеза 1"
+    assert response.headers["X-Total-Count"] == "3"
+    assert calls == [
+        {"limit": 1, "offset": 1, "allowed_data_classes": {DataClass.PUBLIC, DataClass.INTERNAL}}
+    ]
+
+
+def test_hypotheses_list_respects_data_class_acl(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[set[DataClass]] = []
+
+    def read_window(*, limit: int, offset: int, allowed_data_classes: set[DataClass]):
+        calls.append(allowed_data_classes)
+        signals = [
+            HypothesisSignal(
+                id=UUID(int=201),
+                kind="bottleneck",
+                statement="Закрытый сигнал",
+                evidence=[
+                    {
+                        "document_id": UUID(int=202),
+                        "source_title": "Внутренний отчёт",
+                        "page": 1,
+                        "quote": "Ограничение требует проверки",
+                    }
+                ],
+                confidence=0.8,
+                data_class=DataClass.RESTRICTED,
+            )
+        ]
+        visible = [signal for signal in signals if signal.data_class in allowed_data_classes]
+        return HypothesisWindow(
+            signals=visible[offset : offset + limit],
+            total=len(visible),
+            limit=limit,
+            offset=offset,
+        )
+
+    monkeypatch.setattr(deps.knowledge, "hypotheses_window", read_window, raising=False)
+
+    response = client.get("/api/v1/hypotheses", headers=base)
+
+    assert response.status_code == 200
+    assert response.json() == []
+    assert response.headers["X-Total-Count"] == "0"
+    assert calls == [{DataClass.PUBLIC, DataClass.INTERNAL}]
+
+
+def test_hypotheses_list_requires_knowledge_read(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scientific_tangle.api import app as app_module
+
+    monkeypatch.setattr(
+        app_module.access_engine,
+        "has_permission",
+        lambda principal, permission: False,
+    )
+    monkeypatch.setattr(
+        deps.knowledge,
+        "hypotheses_window",
+        lambda **kwargs: pytest.fail("запрос к хранилищу выполнен до проверки права"),
+        raising=False,
+    )
+
+    response = client.get("/api/v1/hypotheses", headers=base)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Требуется разрешение: knowledge:read"
+
+
+def test_hypothesis_detail_hides_signals_outside_acl(
+    client: TestClient,
+    deps: AppDependencies,
+    base: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal_id = UUID(int=303)
+    calls: list[set[DataClass]] = []
+
+    def find_signal(requested_id: UUID, *, allowed_data_classes: set[DataClass]):
+        calls.append(allowed_data_classes)
+        assert requested_id == signal_id
+        return None
+
+    monkeypatch.setattr(deps.knowledge, "hypothesis_by_id", find_signal, raising=False)
+
+    response = client.get(f"/api/v1/hypotheses/{signal_id}", headers=base)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Гипотеза не найдена"
+    assert calls == [{DataClass.PUBLIC, DataClass.INTERNAL}]
 
 
 def test_findings_list_reads_the_window_from_the_store(

@@ -23,6 +23,7 @@ import type {
   FindingListItem,
   GoldCase,
   GraphSnapshot,
+  HypothesisSignal,
   LlmUsageSummary,
   MergeReviewAction,
   QueryResponse,
@@ -178,6 +179,12 @@ export const api = {
     const qs = params.toString();
     return requestWithTotal<FindingListItem[]>(`/api/v1/findings${qs ? `?${qs}` : ''}`);
   },
+  // Аналитические гипотезы — отдельные типизированные сигналы с источниками;
+  // они не читаются из списка извлечённых утверждений.
+  hypotheses: (limit = 50, offset = 0) =>
+    requestWithTotal<HypothesisSignal[]>(`/api/v1/hypotheses?limit=${limit}&offset=${offset}`),
+  hypothesis: (id: string) =>
+    request<HypothesisSignal>(`/api/v1/hypotheses/${encodeURIComponent(id)}`),
   // Расхождения (находки со статусом «оспаривается») тоже приходят окном: без
   // `limit` сервер отдал бы первые 200 и экран назвал бы их всеми, поэтому
   // полное число читается заголовком, а не длиной массива.

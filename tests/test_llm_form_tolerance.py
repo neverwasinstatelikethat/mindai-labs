@@ -381,6 +381,11 @@ def test_planner_zero_year_and_zero_hops_are_absent_values_not_errors() -> None:
     assert plan.year_from is None and plan.year_to is None
     assert plan.max_hops == 3, "нулевая глубина обязана вернуться к default, а не к 1"
 
+    empty_years = QueryPlan.model_validate(
+        {"question": "сравнение технологий", "year_from": "", "year_to": ""}
+    )
+    assert empty_years.year_from is None and empty_years.year_to is None
+
     with pytest.raises(ValidationError):
         QueryPlan.model_validate({"question": "сравнение технологий", "year_from": 1700})
 

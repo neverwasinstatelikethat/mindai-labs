@@ -63,7 +63,7 @@ class Settings(BaseSettings):
 
     # GigaChat — единственный LLM-провайдер платформы.
     gigachat_api_key: str | None = Field(default=None, repr=False)
-    gigachat_base_url: str = "https://gigachat.devices.sberbank.ru/api/v1"
+    gigachat_base_url: str = "https://api.giga.chat/v1"
     gigachat_agent_model: str = "GigaChat-3-Ultra"
     gigachat_graphrag_model: str = "GigaChat-Pro"
     # Legacy adapter retained for compatibility; production retrieval does not create it.

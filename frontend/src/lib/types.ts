@@ -21,6 +21,18 @@ export interface Evidence {
   quote: string;
 }
 
+// Аналитический сигнал — отдельный результат вывода, подкреплённый точными
+// фрагментами корпуса. Он не подменяет извлечённые Finding.
+export interface HypothesisSignal {
+  id: string;
+  kind: string;
+  statement: string;
+  proposal?: string | null;
+  evidence: Evidence[];
+  confidence: number;
+  data_class: DataClass;
+}
+
 export interface NumericObservation {
   property_name: string;
   operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte' | 'between';

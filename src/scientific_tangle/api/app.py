@@ -80,6 +80,7 @@ from scientific_tangle.domain.contracts import (
     ServiceState,
     SystemStatus,
 )
+from scientific_tangle.domain.hypotheses import HypothesisSignal
 from scientific_tangle.domain.intelligence import AuditEvent, DataClass, Principal
 from scientific_tangle.evaluation.harness import EvaluationHarness
 from scientific_tangle.services.accounts import (
@@ -2108,6 +2109,58 @@ async def get_findings(
         )
     _report_window(response, window, requested_limit=limit)
     return [finding.model_dump(mode="json") for finding in window.findings]
+
+
+@app.get(
+    "/api/v1/hypotheses",
+    tags=["knowledge"],
+    response_model=list[HypothesisSignal],
+)
+async def get_hypotheses(
+    request: Request,
+    response: Response,
+    _: None = Depends(require_permission("knowledge:read")),
+    limit: Annotated[int, Query(ge=1, le=AUDIT_LIMIT_MAX)] = AUDIT_LIMIT_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[HypothesisSignal]:
+    """Возвращает страницу аналитических гипотез с доказательствами.
+
+    Хранилище применяет ACL до пагинации, поэтому закрытые сигналы не влияют ни
+    на тело, ни на ``X-Total-Count``.
+    """
+    deps = dependencies(request)
+    async with _storage_or_unavailable(request, "Гипотезы"):
+        window = await asyncio.to_thread(
+            deps.knowledge.hypotheses_window,
+            limit=limit,
+            offset=offset,
+            allowed_data_classes=_allowed_classes(request),
+        )
+    response.headers["X-Total-Count"] = str(window.total)
+    return window.signals
+
+
+@app.get(
+    "/api/v1/hypotheses/{signal_id}",
+    tags=["knowledge"],
+    response_model=HypothesisSignal,
+)
+async def get_hypothesis(
+    request: Request,
+    signal_id: UUID,
+    _: None = Depends(require_permission("knowledge:read")),
+) -> HypothesisSignal:
+    """Возвращает один сигнал только после проверки его класса доступа."""
+    deps = dependencies(request)
+    async with _storage_or_unavailable(request, "Гипотеза"):
+        signal = await asyncio.to_thread(
+            deps.knowledge.hypothesis_by_id,
+            signal_id,
+            allowed_data_classes=_allowed_classes(request),
+        )
+    if signal is None:
+        raise HTTPException(status_code=404, detail="Гипотеза не найдена")
+    return signal
 
 
 @app.get("/api/v1/conflicts", tags=["knowledge"])

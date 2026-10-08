@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from uuid import UUID
 
 from scientific_tangle.domain.contracts import (
     DocumentReceipt,
@@ -53,13 +55,36 @@ class IngestionService:
         self._resolution = resolution
         self._model = model
 
-    async def ingest(self, document: DocumentRequest) -> DocumentReceipt:
+    async def ingest(
+        self,
+        document: DocumentRequest,
+        *,
+        source_document_id: UUID | None = None,
+        semantic_part_id: str | None = None,
+        semantic_part_total: int | None = None,
+    ) -> DocumentReceipt:
         """Извлечение пакета — LLM, всё остальное убрано из event loop.
 
         pyshacl-валидация строит RDF-граф и прогоняет shapes: на реальном
         документе это секунды чистого CPU, и держать ими цикл обработки событий
         нельзя (импорт идёт параллельно с запросами аналитиков).
         """
+        part_mode = source_document_id is not None
+        if part_mode != (semantic_part_id is not None and semantic_part_total is not None):
+            raise ValueError("Для частичного импорта нужны все идентификаторы semantic part")
+        if source_document_id is not None:
+            completed = await self.semantic_parts_completed(
+                source_document_id, semantic_part_total or 0
+            )
+        else:
+            completed = set()
+        if source_document_id is not None and semantic_part_id in completed:
+            return DocumentReceipt(
+                document_id=source_document_id,
+                checksum=hashlib.sha256(document.text.encode("utf-8")).hexdigest(),
+                status="duplicate",
+                extracted_claims=0,
+            )
         user_text = (
             f"Название: {document.title}\nЯзык: {document.language}\n"
             f"География: {document.geography}\nГод: {document.year}\n\n{document.text}"
@@ -79,10 +104,24 @@ class IngestionService:
             )
             extraction = self._apply_resolutions(bundle)
             await asyncio.to_thread(self._ontology.validate, extraction)
-        receipt = await asyncio.to_thread(self._knowledge.ingest, document, extraction)
+        receipt = await asyncio.to_thread(
+            self._knowledge.ingest,
+            document,
+            extraction,
+            source_document_id=source_document_id,
+            semantic_part_id=semantic_part_id,
+            semantic_part_total=semantic_part_total,
+        )
         if receipt.status == "created" and self._resolution:
             await asyncio.to_thread(self._resolution.register, bundle.resolutions)
         return receipt
+
+    async def semantic_parts_completed(
+        self, source_document_id: UUID, part_total: int
+    ) -> set[str]:
+        return await asyncio.to_thread(
+            self._knowledge.semantic_parts_completed, source_document_id, part_total
+        )
 
     async def _complete(self, system: str, user: str) -> IngestionBundle:
         """Импорт документов наполняет GraphRAG выделенной моделью."""
