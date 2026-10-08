@@ -3,6 +3,8 @@ import type {
   AccountInfo,
   ActivityEntry,
   AuditEntry,
+  AnswerHistoryPage,
+  AnswerPayload,
   ClaimHistory,
   ComparisonTable,
   ConflictCandidate,
@@ -213,6 +215,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ question, language: 'ru', mode: 'hybrid' }),
     }),
+  answerHistory: (limit = 30, offset = 0) =>
+    request<AnswerHistoryPage>(`/api/v1/answers?limit=${limit}&offset=${offset}`),
+  savedAnswer: (queryId: string) =>
+    request<AnswerPayload>(`/api/v1/answers/${encodeURIComponent(queryId)}`),
   // feedback возвращает FeedbackResult: решение эксперта сохраняется всегда, а
   // proposal генерирует модель — без живого LLM его нет, и это не ошибка.
   // supersede срабатывает только при verdict='correct' вместе с finding_id

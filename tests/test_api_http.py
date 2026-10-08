@@ -427,6 +427,27 @@ def test_export_of_another_account_answer_is_not_found(
     assert response.status_code == 404
 
 
+def test_answer_history_is_private_and_saved_answers_can_be_reopened(
+    client: TestClient, base: dict[str, str]
+) -> None:
+    query_id = _run_query(client, base)
+    stranger = cookie_header(signup(client, "http-history-stranger@mindai.tech"))
+
+    history = client.get("/api/v1/answers?limit=10&offset=0", headers=base)
+    saved = client.get(f"/api/v1/answers/{query_id}", headers=base)
+    stranger_history = client.get("/api/v1/answers?limit=10&offset=0", headers=stranger)
+    stranger_saved = client.get(f"/api/v1/answers/{query_id}", headers=stranger)
+
+    assert history.status_code == 200
+    assert history.json()["items"][0]["query_id"] == query_id
+    assert history.json()["has_more"] is False
+    assert saved.status_code == 200
+    assert saved.json()["query_id"] == query_id
+    assert stranger_history.status_code == 200
+    assert stranger_history.json()["items"] == []
+    assert stranger_saved.status_code == 404
+
+
 def test_export_forbids_when_rights_shrank_after_the_answer(
     client: TestClient, deps: AppDependencies, base: dict[str, str]
 ) -> None:

@@ -810,14 +810,7 @@
     {@const fromNode = nodeIndex.get(pickedEdge.source) ?? null}
     {@const toNode = nodeIndex.get(pickedEdge.target) ?? null}
     <div class="map__edge-card">
-      <div class="row row--between">
-        <p class="eyebrow">
-          <Icon name="link" size={16} />
-          выбранная связь
-        </p>
-        <Button variant="ghost" size="sm" onclick={() => pickEdge(null)}>Снять связь</Button>
-      </div>
-      <p class="small map__edge-line">
+      <p class="h3 map__edge-kind">
         <span>{mapRelationLabel(pickedEdge.relation)}</span>
       </p>
       <p class="small map__edge-line">
@@ -1006,12 +999,6 @@
         />
       {/if}
 
-      {#if pickedEdge && !selected}
-        <section class="map__edge-note" aria-label="Выбранная связь">
-          {@render edgeCard()}
-        </section>
-      {/if}
-
       {#if selected}
         <section id="evidence" class="map__inspector">
           {#if narrow}
@@ -1045,8 +1032,6 @@
                 </div>
               </div>
 
-              {@render edgeCard()}
-
               <div class="split map__split">
                 <div class="stack" style="--gap: var(--s5)">
                   {@render nodeBody()}
@@ -1058,6 +1043,18 @@
             </Panel>
           {/if}
         </section>
+      {/if}
+      {#if pickedEdge && (!narrow || !selected)}
+        <Sheet
+          title={`Связь: ${mapRelationLabel(pickedEdge.relation)}`}
+          onclose={() => pickEdge(null)}
+          width="640px"
+        >
+          {@render edgeCard()}
+          <div class="row map__edge-actions">
+            <Button variant="quiet" size="sm" onclick={() => pickEdge(null)}>Закрыть</Button>
+          </div>
+        </Sheet>
       {/if}
     {/if}
   </div>
@@ -1174,18 +1171,7 @@
     padding-left: var(--s4);
   }
 
-  /* Карточка выбранной связи живёт и без выбранной записи: связь остаётся
-     прочитанной, когда человек снял выбор с поля. */
-  .map__edge-note {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .map__edge-note .map__edge-card {
-    margin-block: 0;
-  }
-
-  /* Карточка выбранной связи: та же трасса, что у строки на поле, но словами. */
+  /* Связь раскрывается отдельно: человек сохраняет контекст карты за модалкой. */
   .map__edge-card {
     display: flex;
     flex-direction: column;
@@ -1201,15 +1187,19 @@
     margin: 0;
   }
 
+  .map__edge-card .map__edge-kind {
+    margin-block-end: var(--s3);
+  }
+
+  .map__edge-actions {
+    margin-top: var(--s3);
+  }
+
   .map__edge-line {
     display: flex;
     align-items: baseline;
     gap: var(--s2);
     flex-wrap: wrap;
-  }
-
-  .map__edge-card .kv {
-    width: 100%;
   }
 
   /* Субъект, отношение и версия находки — три подписанных элемента, а не одна
@@ -1218,6 +1208,27 @@
     flex-wrap: wrap;
     row-gap: var(--s1);
     min-width: 0;
+    font-weight: 400;
+  }
+
+  .map__claim-tags > span {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    padding-inline: var(--s3);
+    border-radius: var(--r-pill);
+    color: var(--ink);
+    font-size: var(--t-micro);
+  }
+
+  .map__claim-tags > span:nth-child(1) { background: var(--sage); }
+  .map__claim-tags > span:nth-child(2) { background: var(--lavender); }
+  .map__claim-tags > span:nth-child(3) { background: var(--surface-sunk); }
+
+  .map__claim-tags .num {
+    padding: 0;
+    background: transparent;
+    color: inherit;
   }
 
   .map__claim-tags span {
@@ -1341,7 +1352,7 @@
     text-align: left;
     cursor: pointer;
     min-width: 0;
-    /* Метки узлов — часто одно длинное слово (имя файла, «руда_медногорского_…»):
+    /* Метки узлов — часто одно длинное слово (например, имя материала или файла):
        без переноса оно распирает колонку и уходит за край шторки. */
     overflow-wrap: anywhere;
   }

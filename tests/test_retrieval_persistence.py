@@ -1593,6 +1593,17 @@ def test_in_memory_answer_ceiling_is_per_account(monkeypatch: pytest.MonkeyPatch
     assert len(state._answers) == 4  # noqa: SLF001 - проверка размера журнала
 
 
+@pytest.mark.anyio
+async def test_recent_answers_are_paged_and_scoped_to_owner() -> None:
+    state = state_module.InMemoryDurableState()
+    for index, owner in enumerate(("analyst-a", "analyst-b", "analyst-a")):
+        await state.put_answer(stored_answer(index), owner_id=owner)
+
+    page = await state.recent_answers(owner_id="analyst-a", limit=1, offset=1)
+
+    assert [item.answer.question for item in page] == ["Вопрос номер 0"]
+
+
 def test_in_memory_total_ceiling_still_bounds_the_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
