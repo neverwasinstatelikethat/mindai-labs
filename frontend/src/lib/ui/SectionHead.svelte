@@ -25,9 +25,9 @@
 
 <header class="section-head {className}">
   <div class="section-head__text">
-    {#if eyebrow}<p class="eyebrow reveal">{eyebrow}</p>{/if}
-    <svelte:element this={Tag} {id} class="{cls} reveal">{title}</svelte:element>
-    {#if lead}<p class="lead reveal" style="--reveal-delay: 90ms">{lead}</p>{/if}
+    {#if eyebrow}<p class="eyebrow">{eyebrow}</p>{/if}
+    <svelte:element this={Tag} {id} class={cls}>{title}</svelte:element>
+    {#if lead}<p class="lead">{lead}</p>{/if}
   </div>
   {@render children?.()}
 </header>

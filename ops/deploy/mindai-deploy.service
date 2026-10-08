@@ -1,0 +1,8 @@
+[Unit]
+Description=Deploy mindai-labs from public GitHub main
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mindai-deploy

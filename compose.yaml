@@ -21,7 +21,7 @@ services:
       DATABASE_URL: postgresql://mindai:${POSTGRES_RUNTIME_PASSWORD:-mindai-postgres-local}@postgres:5432/mindai
       SOURCE_ROOT: /data/sources
       # Доступ: учётные записи в postgres (контур аналитиков), cookie Secure только
-      # при APP_ENV=production, CSRF-источники — под локальный прокси :43119.
+      # при APP_ENV=production, CSRF-источники — под публичным HTTPS-прокси.
       APP_ENV: ${APP_ENV:-development}
       ACCOUNTS_BACKEND: ${ACCOUNTS_BACKEND:-postgres}
       SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-14}
@@ -53,11 +53,11 @@ services:
       METRICS_TOKEN: ${METRICS_TOKEN:-}
     volumes:
       - ./Источники информации:/data/sources:ro
-    ports: ["${BACKEND_PORT:-46617}:8000"]
+    ports: ["127.0.0.1:${BACKEND_PORT:-46617}:8000"]
     depends_on:
       # Только те хранилища, к которым приложение действительно обращается:
-      # redis и minio подняты, но кодом не используются, и ждать их здоровья
-      # на старте — значит плодить отказы запуска без причины.
+      # redis кодом не используется, и ждать его здоровья на старте — значит
+      # плодить отказы запуска без причины.
       neo4j: { condition: service_healthy }
       elasticsearch: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -103,7 +103,7 @@ services:
       context: ./frontend
     environment:
       INTERNAL_API_URL: http://backend:8000
-    ports: ["${FRONTEND_PORT:-43119}:3000"]
+    ports: ["127.0.0.1:${FRONTEND_PORT:-43119}:3000"]
     depends_on:
       backend: { condition: service_healthy }
     deploy:
@@ -165,23 +165,6 @@ services:
       timeout: 5s
       retries: 10
 
-  minio:
-    <<: *service-defaults
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-mindai}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-mindai-local-secret}
-    # Хранилище объектов поднято, но приложением не используется (см. .env.example);
-    # Console с полным доступом к томам наружу не публикуется.
-    ports: ["127.0.0.1:48417:9000", "127.0.0.1:48909:9001"]
-    volumes: ["minio_data:/data"]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 20s
-      timeout: 10s
-      retries: 10
-
   postgres:
     <<: *service-defaults
     image: postgres:17.5-alpine
@@ -240,7 +223,6 @@ volumes:
   neo4j_data:
   elastic_data:
   redis_data:
-  minio_data:
   postgres_data:
   prometheus_data:
   grafana_data:

@@ -116,7 +116,7 @@
 
   .m-mascot__face {
     transform: translate(calc(var(--mx) * 4px), calc(var(--my) * 3px));
-    transition: transform 420ms var(--ease-soft);
+    transition: transform var(--dur-follow) var(--ease-soft);
   }
 
   .m-mascot__eyes {

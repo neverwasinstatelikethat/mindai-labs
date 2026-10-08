@@ -10,6 +10,7 @@
   import {
     FINDINGS_ACTION,
     FINDINGS_EMPTY,
+    FINDINGS_LINK_MISS,
     FINDINGS_STATE,
     FINDINGS_TERM_NAMES,
     OPERATOR_SYMBOL,
@@ -20,7 +21,6 @@
     SUBJECT_LABELS,
     describeScope,
     describeValue,
-    findingsLinkMiss,
     findingsNotLoadedBody,
     findingsPartialNote,
     findingsScaleGapNote,
@@ -28,6 +28,7 @@
     findingsShownOf,
     findingsTerm,
     headingTerm,
+    unitKey,
   } from '$lib/terms';
   import {
     DATA_CLASS_LABELS,
@@ -39,7 +40,6 @@
     type NumericObservation,
   } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
-  import Chip from '$lib/ui/Chip.svelte';
   import Empty from '$lib/ui/Empty.svelte';
   import Field from '$lib/ui/Field.svelte';
   import Icon from '$lib/ui/Icon.svelte';
@@ -48,6 +48,27 @@
   import SectionHead from '$lib/ui/SectionHead.svelte';
   import Sheet from '$lib/ui/Sheet.svelte';
   import StatusPill from '$lib/ui/StatusPill.svelte';
+  import { goto } from '$app/navigation';
+  import InfoDot from '$lib/ui/InfoDot.svelte';
+  import VerdictSheet from '$lib/ui/VerdictSheet.svelte';
+  // Фасет склеек читает свой словарь: экран тот же, что и у находок, поэтому и
+  // состояния, и доступ описываются словами очереди, а не второй копией.
+  import {
+    mergeNotLoadedBody,
+    mergeOutcome,
+    mergeWaiting,
+    MERGE_PAIR_NOUNS,
+    MERGE_STATUS_LABELS,
+    MERGE_STATUS_TONE,
+    RESOLUTION_ACTION,
+    RESOLUTION_FAILURE,
+    RESOLUTION_GATE,
+    RESOLUTION_HINTS,
+    RESOLUTION_PAGE,
+    RESOLUTION_WORDS,
+    shownSentenceOf,
+  } from '$lib/terms';
+  import type { EntityMergeProposal, FeedbackResult, MergeReviewAction } from '$lib/types';
 
   // ── Находки: отбор, список, импорт
   // PAGE_SIZE раскрывает список по частям на экране, SERVER_PAGE — сколько находок
@@ -138,21 +159,21 @@
 
   // Имя ключа онтологии: сначала словарь, потом человекочитимая заглушка. Сырой
   // ключ заголовком не становится: он выходит в «Служебных данных» (поле `code`).
-  function subjectTerm(key: string | null | undefined): { label: string; code: string | null } {
+  function subjectTerm(key: string | null | undefined): { label: string } {
     return findingsTerm(SUBJECT_LABELS, key, {
       absent: FINDINGS_TERM_NAMES.noSubject,
       unknown: FINDINGS_TERM_NAMES.subject,
     });
   }
 
-  function predicateTerm(key: string | null | undefined): { label: string; code: string | null } {
+  function predicateTerm(key: string | null | undefined): { label: string } {
     return findingsTerm(PREDICATE_LABELS, key, {
       absent: FINDINGS_TERM_NAMES.noPredicate,
       unknown: FINDINGS_TERM_NAMES.predicate,
     });
   }
 
-  function propertyTerm(key: string | null | undefined): { label: string; code: string | null } {
+  function propertyTerm(key: string | null | undefined): { label: string } {
     return findingsTerm(PROPERTY_LABELS, key, {
       absent: FINDINGS_TERM_NAMES.property,
       unknown: FINDINGS_TERM_NAMES.property,
@@ -207,17 +228,23 @@
   // Место в источнике называется словами и отдельными подписями: страница, лист
   // или диапазон ячеек. Без номера страницы остаётся только название источника,
   // прочерк вместо места не печатается. Символовые оффсеты уходят под раскрытие
-  // «Служебные данные».
+  // человекочитаемое имя для отображения.
   function locatorParts(ev: Evidence): string[] {
     const parts: string[] = [];
+    // Источник уже может называть лист своими словами («Лист 12» в таблице
+    // приёмки): подпись не ставится второй раз, иначе читается «лист Лист 12».
+    const labelled = (label: string, value: string) =>
+      value.trim().toLowerCase().startsWith(label) ? value.trim() : `${label} ${value}`;
     if (ev.page != null) parts.push(`страница ${num(ev.page)}`);
-    if (ev.sheet) parts.push(`лист ${ev.sheet}`);
-    if (ev.cell_range) parts.push(`ячейки ${ev.cell_range}`);
+    if (ev.sheet) parts.push(labelled('лист', ev.sheet));
+    if (ev.cell_range) parts.push(labelled('ячейки', ev.cell_range));
     return parts;
   }
 
   function scaleKey(property: string, unit: string): string {
-    return `${property} || ${unit}`;
+    // «mg/L» и «мг/л» — одна шкала: ключ строится по свёрнутой единице, иначе
+    // показатель расходится на две полосы с одинаковыми числами.
+    return `${property} || ${unitKey(unit)}`;
   }
 
   const canRead = $derived(session.can('knowledge:read'));
@@ -231,7 +258,7 @@
   // Список живёт страницами сервера: `index` несёт страницу корпуса без отбора,
   // `rows` — страницу применённого отбора. Полное число подходящих находок приходит
   // заголовком ответа, и пока оно больше загруженного, список не читается как
-  // «все находки корпуса». По `index` считают чипы статуса и список субъектов,
+  // «все находки корпуса». По `index` считают фильтры статуса и список субъектов,
   // чтобы отбор не оставлял себя без вариантов выбора.
   let index = $state<FindingListItem[]>([]);
   let rows = $state<FindingListItem[]>([]);
@@ -279,13 +306,10 @@
   let uploads = $state<UploadItem[]>([]);
   let dragDepth = $state(0);
 
-  // Числа у чипов статуса берутся из списка без отбора и подписаны так же, как
-  // список субъектов: они относятся к показанным находкам, а не ко всему корпусу.
   const facets = $derived(
     STATUS_ORDER.map((key) => ({
       key,
       label: STATUS_SHORT[key],
-      count: index.filter((finding) => finding.status === key).length,
     })),
   );
 
@@ -414,15 +438,11 @@
     }));
   }
 
-  // Применённое условие: именем остаётся человекочитимое название (или заглушка),
-  // а служебное имя уходит под раскрытие «Служебные данные отбора»: в строке
-  // отбора сырой ключ онтологии и код источника не становятся именем условия.
+  // Активный отбор остаётся рядом со списком, чтобы его можно было снять.
   type AppliedPart = {
     key: string;
     name: string;
     value: string;
-    tech: string | null;
-    techName: string;
     clear: () => void;
   };
 
@@ -434,8 +454,6 @@
         key: 'subject',
         name: 'субъект',
         value: subject.label,
-        tech: subject.code,
-        techName: 'служебное имя субъекта',
         clear: clearSubject,
       });
     }
@@ -444,8 +462,6 @@
         key: 'status',
         name: 'статус',
         value: STATUS_SHORT[appliedStatus],
-        tech: null,
-        techName: '',
         clear: clearStatus,
       });
     }
@@ -454,19 +470,11 @@
         key: 'document',
         name: 'источник',
         value: documentName,
-        tech: appliedDocument,
-        techName: 'код источника',
         clear: clearDocument,
       });
     }
     return parts;
   });
-
-  // Служебные имена применённых условий: чем отсеян список, читает тот, кто
-  // сверяет запись с сервером, а не тот, кто смотрит на отбор.
-  const appliedTechRows = $derived(
-    appliedParts.filter((part): part is AppliedPart & { tech: string } => Boolean(part.tech)),
-  );
 
   function measureOf(obs: NumericObservation): Measure {
     const scale = scales.get(scaleKey(obs.property_name, obs.normalized_unit)) ?? null;
@@ -599,8 +607,9 @@
       openSource(claim);
     } else {
       // Ссылка из устаревшего ответа, из закрытого доступа либо вне загруженной
-      // части списка: причина называется словами, а не молчаливой пустотой.
-      linkNote = findingsLinkMiss();
+      // части списка: факт называется заголовком, причины — строкой, а молчаливой
+      // пустоты здесь нет.
+      linkNote = FINDINGS_LINK_MISS.reasons;
     }
   }
 
@@ -703,7 +712,7 @@
       serverNote = next.windowNote;
       servedCount = next.items.length;
       // Без отбора список несёт страницу корпуса: строки и полное число одни на
-      // весь экран, иначе чипы статуса и счётчик разошлись бы.
+      // весь экран, иначе фильтр статуса и счётчик разошлись бы.
       if (!nextSubject && !nextStatus) {
         index = items;
         indexTotal = next.total;
@@ -778,7 +787,7 @@
     void runQuery(appliedSubject, appliedStatus);
   }
 
-  // Поле субъекта отправляет набранное, статус задают только чипы: второго
+  // Поле субъекта отправляет набранное, статус задают кнопки: второго
   // контрола над тем же условием на экране нет.
   function submitFilters(event: SubmitEvent): void {
     event.preventDefault();
@@ -886,10 +895,166 @@
     phase = 'ready';
   });
 
+  // ── Фасет «Склейки имён» ─────────────────────────────────────────────────
+  // Очередь склеек была отдельным разделом: человек уходил из списка, терял
+  // отбор и возвращался к тому же утверждению. Теперь это фасет этого экрана, и
+  // он читается из адреса (`?facet=merges`), поэтому редирект со старого адреса
+  // и ссылка из ответа приводят ровно в нужный фасет со всем отбором.
+  const MERGE_WINDOW = 30;
+  const MERGE_STEP = 6;
+
+  const pane = $derived(page.url.searchParams.get('facet') === 'merges' ? 'merges' : 'findings');
+  const canReview = $derived(session.can('proposal:review'));
+
+  function setPane(next: 'findings' | 'merges'): void {
+    if (next === pane) return;
+    const url = new URL(page.url);
+    if (next === 'merges') url.searchParams.set('facet', 'merges');
+    else url.searchParams.delete('facet');
+    void goto(url, { replaceState: true, noScroll: true });
+  }
+
+  let mergeItems = $state<EntityMergeProposal[]>([]);
+  let mergeTotal = $state<number | null>(null);
+  let mergePhase = $state<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+  let mergeFailure = $state<{ title: string; body: string } | null>(null);
+  let mergePending = $state<Record<string, MergeReviewAction>>({});
+  let mergeNote = $state<{ id: string; tone: 'ok' | 'warn' | 'error'; text: string } | null>(null);
+  // Сколько строк раскрыто: решение принимают по одной паре, а не пролистывая
+  // всю очередь.
+  let mergeShown = $state(MERGE_STEP);
+  let mergeSeq = 0;
+
+  const mergeVisible = $derived(mergeItems.slice(0, mergeShown));
+  const mergeLeft = $derived(mergeTotal === null ? 0 : Math.max(mergeTotal - mergeItems.length, 0));
+  const mergeCountText = $derived(shownSentenceOf(mergeVisible.length, mergeTotal, MERGE_PAIR_NOUNS));
+  const mergeWaitingText = $derived(
+    mergeWaiting(
+      mergeItems.filter((row) => row.status === 'proposed' || row.status === 'reverted').length,
+    ),
+  );
+
+  function nameOr(value: string): string {
+    return value.trim().length > 0 ? value.trim() : RESOLUTION_WORDS.nameAbsent;
+  }
+
+  function rationaleOf(proposal: EntityMergeProposal): string {
+    const text = proposal.rationale.trim();
+    return text.length > 0 ? text : RESOLUTION_WORDS.noRationale;
+  }
+
+  // Действия берутся из статуса пары: у принятой склейки остаётся откат, у
+  // отклонённого решения действий нет, и кнопка «принять» не может висеть там,
+  // где склейка уже записана.
+  function actionsOf(proposal: EntityMergeProposal): MergeReviewAction[] {
+    if (proposal.status === 'proposed') return ['accept', 'reject'];
+    if (proposal.status === 'reverted') return ['accept'];
+    if (proposal.status === 'accepted') return ['revert'];
+    return [];
+  }
+
+  function mergeFailureOf(reason: unknown): { title: string; body: string } {
+    const failure = classify(reason);
+    if (failure.kind === 'forbidden') {
+      return { title: RESOLUTION_GATE.title, body: RESOLUTION_FAILURE.deniedBody };
+    }
+    if (failure.kind === 'session') {
+      return { title: RESOLUTION_GATE.anonymousTitle, body: RESOLUTION_GATE.anonymousBody };
+    }
+    if (failure.kind === 'backend') {
+      return { title: RESOLUTION_FAILURE.storageTitle, body: RESOLUTION_FAILURE.storageBody };
+    }
+    return { title: RESOLUTION_FAILURE.transportTitle, body: RESOLUTION_FAILURE.transportBody };
+  }
+
+  /** Окно очереди: показанное при сбое дозагрузки остаётся на экране, иначе
+   *  прочитанное выглядело бы пустой очередью. */
+  async function loadMerges(append = false): Promise<void> {
+    const call = ++mergeSeq;
+    if (append) mergeNote = null;
+    else mergePhase = 'loading';
+    try {
+      const result = await api.mergeProposals(MERGE_WINDOW, append ? mergeItems.length : 0);
+      if (call !== mergeSeq) return;
+      const seen = new Set(mergeItems.map((row) => row.id));
+      mergeItems = append
+        ? [...mergeItems, ...result.items.filter((row) => !seen.has(row.id))]
+        : result.items;
+      mergeTotal = result.total;
+      mergePhase = 'ready';
+      if (append) mergeShown += MERGE_STEP;
+    } catch (reason) {
+      if (call !== mergeSeq) return;
+      if (append) {
+        mergeNote = { id: '', tone: 'warn', text: RESOLUTION_FAILURE.more };
+      } else {
+        mergeFailure = mergeFailureOf(reason);
+        mergePhase = 'failed';
+      }
+    }
+  }
+
+  /** Решение по паре заменяется тем, что вернул сервис, а не догадкой экрана. */
+  async function decideMerge(
+    proposal: EntityMergeProposal,
+    action: MergeReviewAction,
+  ): Promise<void> {
+    if (!canReview || mergePending[proposal.id] !== undefined) return;
+    mergePending = { ...mergePending, [proposal.id]: action };
+    mergeNote = null;
+    try {
+      const updated = await api.mergeReview(proposal.id, action);
+      mergeItems = mergeItems.map((row) => (row.id === updated.id ? updated : row));
+      mergeNote = { id: updated.id, tone: 'ok', text: mergeOutcome(updated.status) };
+    } catch (reason) {
+      const failure = classify(reason);
+      const text =
+        failure.kind === 'forbidden'
+          ? RESOLUTION_FAILURE.reviewDenied
+          : failure.kind === 'backend'
+            ? RESOLUTION_FAILURE.reviewStorage
+            : RESOLUTION_FAILURE.reviewTransport;
+      mergeNote = { id: proposal.id, tone: 'error', text };
+    } finally {
+      const next = { ...mergePending };
+      delete next[proposal.id];
+      mergePending = next;
+    }
+  }
+
+  // Очередь запрашивается только у аккаунта с правом: запрос без права дал бы
+  // отказ там, где экран обязан объяснить доступ до списка.
+  $effect(() => {
+    if (pane !== 'merges' || session.state === 'unknown' || !canReview) return;
+    if (mergePhase !== 'idle') return;
+    void loadMerges();
+  });
+
+  // ── Вердикт по находке ───────────────────────────────────────────────────
+  // Отдельного раздела для отзыва нет: правка оформляется там, где человек видит
+  // доказательство. Шторка трассы при этом закрывается: две шторки в одном слое
+  // спорят за фокус, а строка списка остаётся на месте и открывается снова.
+  let verdictFor = $state<FindingListItem | null>(null);
+  let verdictNote = $state('');
+
+  function openVerdict(finding: FindingListItem): void {
+    verdictFor = finding;
+    verdictNote = '';
+    active = null;
+  }
+
+  function verdictSent(_result: FeedbackResult): void {
+    const finding = verdictFor;
+    verdictNote = 'Вердикт записан сервисом.';
+    verdictFor = null;
+    if (finding) active = finding.id;
+  }
+
   // Блоки, которые появляются после ответа сервера, тоже нуждаются в
   // reveal-наблюдателе: без повторного скана они остались бы невидимыми.
   $effect(() => {
     void phase;
+    void pane;
     void subjectsOpen;
     void importOpen;
     void blocked;
@@ -913,21 +1078,51 @@
 </svelte:head>
 
 <div class="page findings">
-  <div class="wrap">
+  <div class="wrap stack" style="--gap: var(--s5)">
     <SectionHead
       level="1"
-      eyebrow="Корпус"
-      title="Находки корпуса"
-      lead="Найдите число в документе и откройте доказательство: страницу, лист или диапазон ячеек."
+      eyebrow={pane === 'merges' ? 'Фасет «Находок»' : 'Корпус'}
+      title={pane === 'merges' ? 'Склейки имён' : 'Находки корпуса'}
+      lead={pane === 'merges'
+        ? 'Решение по паре имён записывает сервис: оно остаётся после перезапуска и меняет разбор следующих документов.'
+        : 'Найдите число в документе и откройте доказательство: страницу, лист или диапазон ячеек.'}
     >
-      <p class="micro findings__count" role="status" aria-live="polite">{listNote}</p>
+      <p class="micro findings__count" role="status" aria-live="polite">
+        {pane === 'merges' ? mergeCountText : listNote}
+      </p>
     </SectionHead>
+
+    <!-- Переключатель фасетов стоит над содержимым: сменить предмет нужно до
+         того, как человек начал читать список. Методика экрана за «i», а не
+         абзацем под заголовком. -->
+    <section class="row reveal" aria-label="Фасет экрана">
+      <div class="seg" role="group" aria-label="Что смотреть в корпусе">
+        <button
+          class="seg__item"
+          type="button"
+          aria-pressed={pane === 'findings'}
+          onclick={() => setPane('findings')}
+        >
+          Находки
+        </button>
+        <button
+          class="seg__item"
+          type="button"
+          aria-pressed={pane === 'merges'}
+          onclick={() => setPane('merges')}
+        >
+          Склейки имён
+        </button>
+      </div>
+      <!-- Пояснения стоят у того, что объясняют: у статусов, у счёта покрытия и
+           у очереди пар, а не рядом с переключателем фасетов. -->
+    </section>
 
     {#if linkNote}
       <!-- Глубокая ссылка не доехала до утверждения: об этом говорится сразу,
-           а не оставляется пользователю догадываться по пустому экрану. -->
+           заголовок называет проверенный факт, а строка перечисляет причины. -->
       <Panel class="findings__state">
-        <Notice tone="warn" title="Ссылка ведёт на недоступное утверждение">
+        <Notice tone="warn" title={FINDINGS_LINK_MISS.title}>
           {linkNote}
           <div class="row">
             <Button variant="quiet" size="sm" onclick={() => (linkNote = '')}>К списку находок</Button>
@@ -936,118 +1131,144 @@
       </Panel>
     {/if}
 
-    {#if importOpen}
-      <Panel tone="sunk" class="findings__import">
-        <div>
-          <div class="panel__head">
-            <div class="grow">
-              <h2 class="h4">Новый источник</h2>
-              <p class="micro">Пришлите документ, и его находки появятся в этом же списке.</p>
+    {#if pane === 'merges'}
+      <!-- Фасет склеек объясняет доступ до списка и различает состояния чтения
+           словами: пустая очередь, пустое окно при подтверждённом числе и отказ
+           сервиса выглядят по-разному. -->
+      {#if session.state === 'anonymous'}
+        <Panel class="findings__state">
+          <Notice tone="warn" title={RESOLUTION_GATE.anonymousTitle}>
+            {RESOLUTION_GATE.anonymousBody}
+            <div class="row">
+              <Button href={LOGIN_HREF} variant="action">{RESOLUTION_GATE.anonymousAction}</Button>
             </div>
+          </Notice>
+        </Panel>
+      {:else if !canReview}
+        <Panel class="findings__state">
+          <Notice tone="warn" title={RESOLUTION_GATE.title}>
+            {RESOLUTION_GATE.body}
+            <div class="row">
+              <Button href="/account" variant="quiet">{RESOLUTION_GATE.checkAction}</Button>
+            </div>
+          </Notice>
+        </Panel>
+      {:else if mergePhase === 'loading'}
+        <Panel class="findings__state">
+          <div class="row" role="status" aria-label={RESOLUTION_PAGE.loadingAria}>
+            <span class="spinner"></span>
+            <p class="small">{RESOLUTION_PAGE.loading}</p>
           </div>
-
-          <div
-            class="dropzone"
-            role="group"
-            aria-label="Перетащите документы сюда или выберите файлы"
-            data-over={dragDepth > 0 ? 'true' : undefined}
-            ondragenter={() => (dragDepth += 1)}
-            ondragleave={() => (dragDepth = Math.max(0, dragDepth - 1))}
-            ondragover={(event) => event.preventDefault()}
-            ondrop={onDrop}
-          >
-            <input
-              id="findings-file"
-              class="dropzone__input"
-              type="file"
-              accept={ACCEPT_ATTR}
-              multiple
-              disabled={uploading}
-              onchange={pickDocuments}
+        </Panel>
+      {:else if mergePhase === 'failed' && mergeFailure}
+        <Panel class="findings__state">
+          <Notice tone="error" title={mergeFailure.title}>{mergeFailure.body}</Notice>
+          <div class="row">
+            <Button variant="action" onclick={() => void loadMerges()}>{RESOLUTION_ACTION.readAgain}</Button>
+          </div>
+        </Panel>
+      {:else if mergeItems.length === 0 && mergeTotal !== null}
+        <Panel class="findings__state">
+          {#if mergeTotal > 0}
+            <!-- Пустое окно при подтверждённом числе пар это сбой чтения, а не
+                 «склеек нет». -->
+            <Notice tone="error" title={RESOLUTION_PAGE.notLoadedTitle}>
+              {mergeNotLoadedBody(mergeTotal)}
+            </Notice>
+            <div class="row">
+              <Button variant="action" onclick={() => void loadMerges()}>{RESOLUTION_ACTION.readAgain}</Button>
+            </div>
+          {:else}
+            <Empty title={RESOLUTION_PAGE.emptyTitle} body={RESOLUTION_PAGE.emptyBody} />
+          {/if}
+        </Panel>
+      {:else if mergeItems.length === 0}
+        <Panel class="findings__state">
+          <Notice tone="error" title={RESOLUTION_PAGE.notLoadedUnknownTitle}>
+            {RESOLUTION_PAGE.notLoadedUnknownBody}
+          </Notice>
+          <div class="row">
+            <Button variant="action" onclick={() => void loadMerges()}>{RESOLUTION_ACTION.readAgain}</Button>
+          </div>
+        </Panel>
+      {:else}
+        <div class="stack findings__list" style="--gap: var(--s4)">
+          {#if mergeNote && mergeNote.id === ''}
+            <p class="micro" role="status">{mergeNote.text}</p>
+          {/if}
+          {#if mergeTotal === null}
+            <p class="micro muted">{RESOLUTION_PAGE.unknownTotal}</p>
+          {/if}
+          <div class="row">
+            <p class="micro muted">{mergeWaitingText}</p>
+            <!-- Один «i» на строку: он объясняет и цену решения, и число
+                 уверенности в подписи карточки. Два кружка рядом читались как
+                 второй слой техники, а не как ответ на вопрос. -->
+            <InfoDot
+              title="Что меняет решение по паре"
+              body={`${RESOLUTION_HINTS.accept} ${RESOLUTION_HINTS.reject} ${RESOLUTION_HINTS.revert} ${RESOLUTION_WORDS.confidenceHint}`}
             />
-            <label class="dropzone__face" for="findings-file">
-              <strong class="h4">
-                {uploading ? 'Загружаем документы в корпус…' : 'Перетащите документы сюда или выберите файлы'}
-              </strong>
-              <span class="micro">{ACCEPT_NOTE}</span>
-            </label>
           </div>
-
-          {#if uploads.length > 0}
-            <ul class="uploads" aria-label="Загруженные документы">
-              {#each uploads as item (item.key)}
-                <li class="upload" data-state={item.state}>
-                  <span class="upload__mark" aria-hidden="true">
-                    {#if item.state === 'queued' || item.state === 'uploading'}
-                      <span class="spinner spinner--quiet"></span>
-                    {:else if item.state === 'done'}
-                      <Icon name="checkCircle" size={19} />
-                    {:else}
-                      <Icon name="alert" size={19} />
-                    {/if}
-                  </span>
-                  <div class="grow">
-                    <p class="small"><strong>{item.name}</strong></p>
-                    <p class="micro muted">размер {bytesLabel(item.size)}</p>
-                    {#if item.state === 'queued'}
-                      <p class="micro">Документ в очереди, ждёт своей загрузки.</p>
-                    {:else if item.state === 'uploading'}
-                      <p class="micro">Отправляем документ в корпус…</p>
-                    {:else if item.receipt}
-                      <p class="micro upload__ok">
-                        {item.receipt.status === 'duplicate'
-                          ? 'Дубликат: документ уже в корпусе'
-                          : 'Документ принят'}
-                      </p>
-                      <p class="micro upload__ok">
-                        Извлечено{' '}
-                        {countOf(item.receipt.extracted_claims, 'утверждение', 'утверждения', 'утверждений')}
-                      </p>
-                      <details class="svc">
-                        <summary class="micro">Служебные данные</summary>
-                        <p class="micro svc__row">
-                          код документа <code class="code">{item.receipt.document_id}</code>
-                        </p>
-                        <p class="micro svc__row">
-                          контрольная сумма <code class="code">{item.receipt.checksum}</code>
-                        </p>
-                        {#if item.receipt.prompt_truncated}
-                          <p class="micro svc__row">
-                            не разобрано символов: <span class="num">{num(item.receipt.omitted_characters)}</span>
-                          </p>
-                        {/if}
-                      </details>
-                      {#if item.receipt.prompt_truncated}
-                        <!-- Хвост документа за бюджетом разбора не означает «в
-                             корпусе такого нет»: число утверждений из неполного
-                             разбора обязано быть помечено. -->
-                        <p class="micro">Разбор дошёл не до конца: часть текста источника осталась без внимания.</p>
-                      {/if}
-                    {:else if item.failure}
-                      <p class="micro upload__err">
-                        {#if item.failure.kind === 'session'}
-                          Вход не подтверждён: войдите заново и повторите загрузку.
-                        {:else if item.failure.kind === 'forbidden'}
-                          Документ не принят: доступ к корпусу этому аккаунту не открыт. Право
-                          выдаёт администратор сервиса.
-                        {:else}
-                          Документ не принят. Проверьте соединение и повторите загрузку.
-                        {/if}
-                      </p>
-                    {/if}
-                  </div>
-                  <Button variant="link" onclick={() => dismissUpload(item.key)}>
-                    Убрать из списка
+          {#each mergeVisible as proposal (proposal.id)}
+            <article class="card-note finding">
+              <p class="micro finding__subject">
+                {RESOLUTION_WORDS.canonicalMark}
+                <StatusPill
+                  status={MERGE_STATUS_TONE[proposal.status]}
+                  label={MERGE_STATUS_LABELS[proposal.status]}
+                />
+              </p>
+              <h3 class="h4 finding__title">{nameOr(proposal.target)}</h3>
+              <p class="small">
+                {RESOLUTION_WORDS.aliasMark}: <b>{nameOr(proposal.source)}</b>
+              </p>
+              <p class="micro muted">{RESOLUTION_WORDS.directionNote}</p>
+              <div class="row">
+                <InfoDot title={RESOLUTION_WORDS.rationaleTitle} body={rationaleOf(proposal)} />
+                {#if proposal.source_id === null || proposal.target_id === null}
+                  <span class="micro">{RESOLUTION_WORDS.idsAbsent}</span>
+                  <Button href="/graph" variant="link" size="sm">{navLabel('/graph')}</Button>
+                {/if}
+              </div>
+              {#if mergeNote && mergeNote.id === proposal.id}
+                <p class="micro" role="status">{mergeNote.text}</p>
+              {/if}
+              <div class="row">
+                {#each actionsOf(proposal) as action (action)}
+                  <Button
+                    variant={action === 'accept' ? 'action' : action === 'reject' ? 'quiet' : 'ink'}
+                    size="sm"
+                    busy={mergePending[proposal.id] === action}
+                    disabled={mergePending[proposal.id] !== undefined}
+                    onclick={() => void decideMerge(proposal, action)}
+                  >
+                    {mergePending[proposal.id] === action
+                      ? RESOLUTION_ACTION.pending
+                      : RESOLUTION_ACTION[action]}
                   </Button>
-                </li>
-              {/each}
-            </ul>
+                {:else}
+                  <span class="micro muted">{RESOLUTION_WORDS.decided}</span>
+                {/each}
+              </div>
+            </article>
+          {/each}
+
+          {#if mergeVisible.length < mergeItems.length}
+            <div class="row findings__more">
+              <Button variant="quiet" size="sm" onclick={() => (mergeShown += MERGE_STEP)}>
+                {FINDINGS_STATE.showMore}
+              </Button>
+            </div>
+          {:else if mergeLeft > 0}
+            <div class="row findings__more">
+              <Button variant="quiet" size="sm" onclick={() => void loadMerges(true)}>
+                {RESOLUTION_ACTION.showMore}
+              </Button>
+            </div>
           {/if}
         </div>
-      </Panel>
-    {/if}
-
-    {#if blocked === 'session'}
+      {/if}
+    {:else if blocked === 'session'}
       <Panel class="findings__state">
         <Empty
           icon="lock"
@@ -1132,7 +1353,6 @@
               name="subject"
               type="search"
               placeholder="часть имени субъекта"
-              hint="Готовые имена даёт кнопка «Субъекты корпуса»."
               bind:value={subjectDraft}
               disabled={querying}
             />
@@ -1150,19 +1370,23 @@
           </form>
 
           <div class="findings__statuses" role="group" aria-label="Статус находок">
-            <p class="micro findings__status-label">
-              Статус: <b>{appliedStatus ? STATUS_SHORT[appliedStatus] : FINDINGS_ACTION.anyStatus}</b>
-            </p>
+            <p class="micro findings__status-label">Статус</p>
+            <InfoDot
+              title="Что значат статусы"
+              body="Согласуется: несколько источников называют одно число в сопоставимых условиях. Гипотеза: число стоит на одном источнике либо на условиях, которые ни с чем не сопоставлены. Оспаривается: источники по одному субъекту дают разные числа, и расхождение видно в доказательствах. Заменено: прежнюю версию утверждения вытеснила экспертная правка, она в истории версий."
+              align="start"
+            />
             {#each facets as facet (facet.key)}
-              <Chip
-                pressed={appliedStatus === facet.key}
+              <Button
+                size="sm"
+                variant={appliedStatus === facet.key ? 'ink' : 'quiet'}
+                current={appliedStatus === facet.key}
                 disabled={querying}
                 onclick={() => pickFacet(facet.key)}
               >
-                {facet.label} <span class="num">{num(facet.count)}</span>
-              </Chip>
+                {facet.label}
+              </Button>
             {/each}
-            <p class="micro muted">{FINDINGS_STATE.countedOver}</p>
           </div>
 
           {#if appliedParts.length > 0}
@@ -1175,18 +1399,6 @@
                 </span>
               {/each}
             </div>
-            {#if appliedTechRows.length > 0}
-              <!-- В строке отбора остаётся человекочитимое название условия, а
-                   сырой ключ онтологии и код источника читают под раскрытием. -->
-              <details class="svc findings__applied-svc">
-                <summary class="micro">Служебные данные отбора</summary>
-                {#each appliedTechRows as part (part.key)}
-                  <p class="micro svc__row">
-                    {part.techName} <code class="code">{part.tech}</code>
-                  </p>
-                {/each}
-              </details>
-            {/if}
           {/if}
         </section>
 
@@ -1205,7 +1417,6 @@
                     {countOf(subjectIndex.length, 'субъект', 'субъекта', 'субъектов')}
                   </p>
                 </div>
-                <p class="micro muted">{FINDINGS_STATE.countedOver}</p>
               </div>
             </div>
 
@@ -1230,12 +1441,6 @@
                   >
                     <span class="grow">
                       <span class="subject__label">{headingTerm(subject.label)}</span>
-                      <!-- Именем строки служебный ключ не становится: он подписью
-                           под человеческим названием, чтобы субъекты без имени в
-                           словаре различались между собой. -->
-                      {#if subject.code}
-                        <span class="micro tech">служебное имя: {subject.code}</span>
-                      {/if}
                       <span class="micro muted">
                         {countOf(group.length, 'находка', 'находки', 'находок')}
                       </span>
@@ -1374,10 +1579,6 @@
               <Notice tone="warn" title={FINDINGS_STATE.incomplete}>
                 <div class="stack" style="--gap: var(--s2)">
                   <p class="micro">{FINDINGS_STATE.incompleteBody}</p>
-                  <details class="svc">
-                    <summary class="micro">Служебные данные списка</summary>
-                    <p class="micro svc__row">оговорка сервиса: {serverNote}</p>
-                  </details>
                 </div>
               </Notice>
             </div>
@@ -1427,16 +1628,6 @@
                 </span>
               {/each}
             </div>
-            {#if appliedTechRows.length > 0}
-              <details class="svc findings__applied-svc">
-                <summary class="micro">Служебные данные отбора</summary>
-                {#each appliedTechRows as part (part.key)}
-                  <p class="micro svc__row">
-                    {part.techName} <code class="code">{part.tech}</code>
-                  </p>
-                {/each}
-              </details>
-            {/if}
           {/if}
         {:else if filtered}
           <Empty
@@ -1482,8 +1673,120 @@
         {/if}
       {/if}
     {/if}
+
+    {#if importOpen}
+      <Panel tone="sunk" class="findings__import">
+        <div>
+          <div class="panel__head">
+            <div class="grow">
+              <h2 class="h4">Новый источник</h2>
+              <p class="micro">Пришлите документ, и его находки появятся в этом же списке.</p>
+            </div>
+          </div>
+
+          <div
+            class="dropzone"
+            role="group"
+            aria-label="Перетащите документы сюда или выберите файлы"
+            data-over={dragDepth > 0 ? 'true' : undefined}
+            ondragenter={() => (dragDepth += 1)}
+            ondragleave={() => (dragDepth = Math.max(0, dragDepth - 1))}
+            ondragover={(event) => event.preventDefault()}
+            ondrop={onDrop}
+          >
+            <input
+              id="findings-file"
+              class="dropzone__input"
+              type="file"
+              accept={ACCEPT_ATTR}
+              multiple
+              disabled={uploading}
+              onchange={pickDocuments}
+            />
+            <label class="dropzone__face" for="findings-file">
+              <strong class="h4">
+                {uploading ? 'Загружаем документы в корпус…' : 'Перетащите документы сюда или выберите файлы'}
+              </strong>
+              <span class="micro">{ACCEPT_NOTE}</span>
+            </label>
+          </div>
+
+          {#if uploads.length > 0}
+            <ul class="uploads" aria-label="Загруженные документы">
+              {#each uploads as item (item.key)}
+                <li class="upload" data-state={item.state}>
+                  <span class="upload__mark" aria-hidden="true">
+                    {#if item.state === 'queued' || item.state === 'uploading'}
+                      <span class="spinner spinner--quiet"></span>
+                    {:else if item.state === 'done'}
+                      <Icon name="checkCircle" size={19} />
+                    {:else}
+                      <Icon name="alert" size={19} />
+                    {/if}
+                  </span>
+                  <div class="grow">
+                    <p class="small"><strong>{item.name}</strong></p>
+                    <p class="micro muted">размер {bytesLabel(item.size)}</p>
+                    {#if item.state === 'queued'}
+                      <p class="micro">Документ в очереди, ждёт своей загрузки.</p>
+                    {:else if item.state === 'uploading'}
+                      <p class="micro">Отправляем документ в корпус…</p>
+                    {:else if item.receipt}
+                      <p class="micro upload__ok">
+                        {item.receipt.status === 'duplicate'
+                          ? 'Дубликат: документ уже в корпусе'
+                          : 'Документ принят'}
+                      </p>
+                      <p class="micro upload__ok">
+                        Извлечено{' '}
+                        {countOf(item.receipt.extracted_claims, 'утверждение', 'утверждения', 'утверждений')}
+                      </p>
+                      {#if item.receipt.prompt_truncated}
+                        <!-- Хвост документа за бюджетом разбора не означает «в
+                             корпусе такого нет»: число утверждений из неполного
+                             разбора обязано быть помечено. -->
+                        <p class="micro">Разбор дошёл не до конца: часть текста источника осталась без внимания.</p>
+                      {/if}
+                    {:else if item.failure}
+                      <p class="micro upload__err">
+                        {#if item.failure.kind === 'session'}
+                          Вход не подтверждён: войдите заново и повторите загрузку.
+                        {:else if item.failure.kind === 'forbidden'}
+                          Документ не принят: доступ к корпусу этому аккаунту не открыт. Право
+                          выдаёт администратор сервиса.
+                        {:else}
+                          Документ не принят. Проверьте соединение и повторите загрузку.
+                        {/if}
+                      </p>
+                    {/if}
+                  </div>
+                  <Button variant="link" onclick={() => dismissUpload(item.key)}>
+                    Убрать из списка
+                  </Button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      </Panel>
+    {/if}
   </div>
 </div>
+
+{#if verdictFor}
+  <!-- Вердикт открывается над списком, а шторка трассы в этот момент закрыта:
+       две шторки в одном слое спорят за фокус, и Tab переставал ходить по
+       диалогу. После записи трасса открывается той же строкой списка. -->
+  <VerdictSheet
+    subject={headingTerm(subjectTerm(verdictFor?.subject).label)}
+    subjectNote={verdictFor?.statement ?? ''}
+    findingId={verdictFor?.id ?? null}
+    candidates={listed.slice(0, 20)}
+    gate={canRead ? '' : FINDINGS_STATE.deniedBody}
+    onclose={() => (verdictFor = null)}
+    onsent={verdictSent}
+  />
+{/if}
 
 {#snippet interval(finding: FindingListItem)}
   {@const history = stateOf(finding.id)}
@@ -1504,22 +1807,10 @@
     <dd>{DATA_CLASS_LABELS[finding.data_class]}</dd>
   </dl>
 
-  <!-- Версия извлечения, сырая уверенность и идентификаторы нужны, когда сверяешь
-       запись с сервером: они под раскрытием, человеческие имена на виду. -->
-  <details class="svc">
-    <summary class="micro">Служебные данные</summary>
-    <p class="micro svc__row">версия <span class="num">{num(finding.version)}</span></p>
-    <p class="micro svc__row">
-      уверенность извлечения <span class="num">{pct(finding.confidence)}</span>
-    </p>
-    <p class="micro svc__row">код утверждения <code class="code">{finding.id}</code></p>
-    {#if subject.code}
-      <p class="micro svc__row">служебное имя субъекта <code class="code">{subject.code}</code></p>
-    {/if}
-    {#if predicate.code}
-      <p class="micro svc__row">служебное имя связи <code class="code">{predicate.code}</code></p>
-    {/if}
-  </details>
+  <!-- Версия извлечения и код утверждения нужны, когда сверяешь запись с
+       сервером: они под раскрытием, человеческие имена на виду. Дробная
+       уверенность модели и сырые ключи онтологии обращению в поддержку не
+       помогают, поэтому в текст интерфейса не выходят. -->
 
   {#if describeScope(finding.scope).length > 0}
     <section class="interval__block">
@@ -1572,22 +1863,10 @@
           {:else}
             <p class="micro measure__note">{m.note}</p>
           {/if}
-          <!-- Сырой текст источника и служебное имя показателя относятся к записи,
-               а не к решению: их читают под раскрытием. -->
-          <details class="svc">
-            <summary class="micro">Служебные данные наблюдения</summary>
-            {#if property.code}
-              <p class="micro svc__row">
-                служебное имя показателя <code class="code">{property.code}</code>
-              </p>
-            {/if}
-            <!-- Приведённая единица та, по которой построена шкала; исходная
-                 остаётся для сверки с документом. -->
-            {#if obs.unit && obs.unit !== obs.normalized_unit}
-              <p class="micro svc__row">единица в источнике <code class="code">{obs.unit}</code></p>
-            {/if}
-            <p class="micro svc__row">в источнике записано <code class="code">{obs.raw_text}</code></p>
-          </details>
+          <!-- Приведённая единица та, по которой построена шкала, а единица и
+               исходная формулировка из источника остаются для сверки с
+               документом под раскрытием. Сырое имя показателя из онтологии в
+               поддержке не называют, поэтому оно в ответе сервиса. -->
         </div>
       {/each}
     {:else}
@@ -1596,7 +1875,20 @@
   </section>
 
   <section class="interval__block">
-    <p class="field__label">Доказательства: где именно в источнике</p>
+    <div class="history__head">
+      <p class="field__label">Доказательства: где именно в источнике</p>
+      <!-- Правка оформляется на месте: отдельного раздела для отзыва нет, а
+           уходить за действием значит потерять находку, по которой решение
+           принимается. -->
+      <Button variant="quiet" size="sm" onclick={() => openVerdict(finding)}>
+        Записать вердикт по находке
+      </Button>
+    </div>
+
+    {#if verdictNote}
+      <p class="micro" role="status">{verdictNote}</p>
+    {/if}
+
     {#if finding.evidence.length > 0}
       {#each finding.evidence as ev, position (`${finding.id}-ev-${position}`)}
         <figure class="evidence">
@@ -1609,25 +1901,13 @@
           </figcaption>
         </figure>
       {/each}
-      <!-- Коды источников и позиции в тексте остаются доступными для сверки, но
-           не спорят с доказательством: они под одним раскрытием. -->
-      <details class="svc">
-        <summary class="micro">Служебные данные доказательств</summary>
-        {#each finding.evidence as ev, position (`${finding.id}-svc-${position}`)}
-          <p class="micro svc__row">код источника <code class="code">{ev.document_id}</code></p>
-          {#if ev.char_start != null && ev.char_end != null}
-            <p class="micro svc__row">
-              позиция в тексте: от <span class="num">{num(ev.char_start)}</span> до{' '}
-              <span class="num">{num(ev.char_end)}</span> символов
-            </p>
-          {/if}
-        {/each}
-      </details>
+      <!-- Коды источников нужны для сверки с сервисом: они в служебном блоке,
+           а не в подписи доказательства. Символьные позиции фрагмента в
+           поддержке не называют, поэтому они остаются в ответе сервиса. -->
     {:else}
       <Notice tone="warn" title="Доказательств нет">
         Утверждение не трассируется до источника, поэтому как подтверждённое число оно не
-        считается. Оформите правку в разделе «{navLabel('/feedback')}» или дополните корпус
-        документом, где этот показатель есть.
+        считается.
       </Notice>
     {/if}
   </section>
@@ -1710,28 +1990,8 @@
           </tbody>
         </table>
       </div>
-      <details class="svc">
-        <summary class="micro">Служебные данные версий</summary>
-        <p class="micro svc__row">код исходного утверждения <code class="code">{chain.claim_id}</code></p>
-        {#each chain.versions as version (version.finding_id)}
-          <p class="micro svc__row">
-            версия <span class="num">{num(version.version)}</span>
-          </p>
-          <p class="micro svc__row">
-            код утверждения <code class="code">{version.finding_id}</code>
-          </p>
-          {#if version.reviewer_id}
-            <p class="micro svc__row">
-              проверил <code class="code">{version.reviewer_id}</code>
-            </p>
-          {/if}
-          {#if version.superseded_by}
-            <p class="micro svc__row">
-              заменено на <code class="code">{version.superseded_by}</code>
-            </p>
-          {/if}
-        {/each}
-      </details>
+      <!-- В обращении в поддержку называют цепочку и текущую версию: коды
+       заменённых версий и ссылки на замену остаются в ответе сервиса. -->
     {/if}
   </section>
 {/snippet}
@@ -1763,7 +2023,9 @@
   }
 
   .findings__import {
-    margin-bottom: var(--s6);
+    /* Панель лежит под своим переключателем в самом низу листа: разделять
+       нужно сверху, снизу достаточно поля страницы. */
+    margin-top: var(--s5);
   }
 
   .findings__state {
@@ -1890,7 +2152,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--s4);
-    margin-bottom: var(--s5);
     padding: var(--s4) var(--s5);
     border: 1px solid var(--line-soft);
     border-radius: var(--r-lg);
@@ -1922,11 +2183,6 @@
 
   .findings__status-label {
     color: var(--ink-3);
-    font-weight: 600;
-  }
-
-  .findings__status-label b {
-    color: var(--ink);
     font-weight: 600;
   }
 
@@ -1998,6 +2254,12 @@
   .findings__more {
     justify-content: flex-start;
     margin-top: var(--s2);
+  }
+
+  /* В плоском списке ряд «ещё» придвигает себя сам, а на рабочей колонке шаг
+     уже объявлен родителем: там те же 8px ложились бы сверху 24px шага. */
+  .wrap.stack > .findings__more {
+    margin-top: 0;
   }
 
   /* Список субъектов растёт вместе с панелью: единственным скроллом остаётся
@@ -2296,40 +2558,10 @@
     flex-wrap: wrap;
   }
 
-  /* Служебные данные: код утверждения, код документа и контрольную сумму
-     печатаем целиком — перенос вместо обрезки, иначе полное значение негде
-     прочесть. */
-  .svc .code,
+  /* Коды и значения из источника печатаем целиком: перенос вместо обрезки,
+     иначе полное значение негде прочесть. */
   .kv dd {
     overflow-wrap: anywhere;
-  }
-
-  /* Коды не спорят с содержимым находки: они под раскрытием и подписью, а не
-     заголовком строки. */
-  .svc {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s2);
-    padding: var(--s3) var(--s4);
-    border: 1px dashed var(--line);
-    border-radius: var(--r-md);
-    background: var(--surface-sunk);
-  }
-
-  .svc summary {
-    color: var(--ink-3);
-    font-weight: 500;
-    cursor: pointer;
-  }
-
-  /* Код различает моноширинный шрифт, а не третий план цвета: на тексте 13px
-     `--ink-4` даёт 3.54:1 вместо нормы 4.5:1. */
-  .svc .code {
-    color: var(--ink-3);
-  }
-
-  .svc__row {
-    color: var(--ink-3);
   }
 
   .history__head {
@@ -2344,17 +2576,9 @@
     background: var(--superseded-wash);
   }
 
-  @media (pointer: coarse), (max-width: 640px) {
-    /* «Служебные данные» трогают пальцем: одна строка микротекста была бы целью
-       ниже 44px, поэтому раскрытию добавлен запас по вертикали. */
-    .svc summary {
-      padding-block: var(--s4);
-    }
-  }
-
   @media (max-width: 640px) {
     /* На мобильном строка отбора и применённые условия встают в столбик: поле
-       поиска, чипы статуса и действия не толкаются друг с другом. */
+       поиска, фильтры и действия не толкаются друг с другом. */
     .findings__bar,
     .findings__applied {
       align-items: flex-start;

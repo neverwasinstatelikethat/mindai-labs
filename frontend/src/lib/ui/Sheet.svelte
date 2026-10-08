@@ -1,3 +1,10 @@
+<script module lang="ts">
+  // Счётчик общий для всех шторок документа: заголовок идентификатором быть не
+  // может, две шторки «Источник находки» (в списке и в карте) давали один id, и
+  // aria-labelledby первой вёл на вторую.
+  let serial = 0;
+</script>
+
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import Icon from './Icon.svelte';
@@ -18,7 +25,7 @@
     footer?: Snippet;
   } = $props();
 
-  const id = $derived(`sheet-${title.replace(/\s+/g, '-').toLowerCase()}`);
+  const uid = `sheet-${++serial}`;
   let panel = $state<HTMLDivElement | null>(null);
 
   // Ловушка фокуса: под шторкой остаётся рабочий экран, и Tab не имеет права
@@ -82,8 +89,8 @@
     class="sheet"
     role="dialog"
     aria-modal="true"
-    aria-labelledby={`${id}-title`}
-    aria-describedby={description ? `${id}-desc` : undefined}
+    aria-labelledby={`${uid}-title`}
+    aria-describedby={description ? `${uid}-desc` : undefined}
     style="--sheet-width: {width}"
     tabindex="-1"
     bind:this={panel}
@@ -91,8 +98,8 @@
   >
     <header class="sheet__head">
       <div>
-        <h2 class="h3" id={`${id}-title`}>{title}</h2>
-        {#if description}<p class="micro muted" id={`${id}-desc`}>{description}</p>{/if}
+        <h2 class="h3" id={`${uid}-title`}>{title}</h2>
+        {#if description}<p class="micro muted" id={`${uid}-desc`}>{description}</p>{/if}
       </div>
       <button class="icon-btn" type="button" aria-label="Закрыть" onclick={onclose}>
         <Icon name="close" size={18} />

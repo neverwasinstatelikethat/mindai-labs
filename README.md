@@ -322,7 +322,6 @@ neo4j-режиме), потоковая отдача хода запроса `/a
 | **Docker / Compose** | — | Контейнеризация и оркестрация |
 | **PostgreSQL** | 17.x | Долговременное хранение (чекпоинтер) |
 | **Redis** | 7.x | Кэширование |
-| **MinIO** | — | Объектное хранилище документов |
 | **GigaChat** | — | Единственный LLM-провайдер: чат и эмбеддинги |
 | **Tesseract OCR** | 5.x | OCR для сканированных PDF |
 | **Pydantic** | 2.x | Валидация моделей и контрактов |
@@ -361,7 +360,7 @@ docker compose up -d --build --wait
 ```
 
 Порядок запуска (автоматический через `depends_on`):
-1. Инфраструктура: Neo4j, Elasticsearch, Redis, PostgreSQL, MinIO
+1. Инфраструктура: Neo4j, Elasticsearch, Redis, PostgreSQL
 2. Backend (после готовности инфраструктуры)
 3. Frontend + Prometheus (после готовности backend)
 4. Grafana (после готовности Prometheus)
@@ -396,7 +395,7 @@ docker exec mindai-scientific-tangle-backend-1 python -m scientific_tangle.evalu
 
 ### Доступные сервисы
 
-Всего 9 контейнеров (порядок запуска определяется `depends_on` в `compose.yaml`):
+Всего 8 постоянных контейнеров (порядок запуска определяется `depends_on` в `compose.yaml`):
 
 | Сервис | Порт | Описание |
 |---|---|---|
@@ -406,7 +405,6 @@ docker exec mindai-scientific-tangle-backend-1 python -m scientific_tangle.evalu
 | elasticsearch | 127.0.0.1:42733 | Гибридный поиск (BM25 + kNN) |
 | postgresql | (internal) | Аккаунты, сессии, серверное состояние, чекпоинты LangGraph |
 | redis | (not mapped) | В контуре есть, приложением не вызывается: очередей и кэша нет |
-| minio | 127.0.0.1:48417, 127.0.0.1:48909 | Задел под артефакты: код объектное хранилище не использует |
 | prometheus | 46307 | Метрики |
 | grafana | 45213 | Дашборды |
 

@@ -9,7 +9,9 @@
     body = '',
     action,
   }: {
-    icon?: IconName;
+    /** `null` — без знака: на экране, где и так есть маскот-кольцо, лишний
+     *  кружок только поднимает высоту пустого состояния. */
+    icon?: IconName | null;
     title: string;
     body?: string;
     action?: Snippet;
@@ -17,7 +19,7 @@
 </script>
 
 <div class="empty">
-  <span class="empty__mark"><Icon name={icon} size={22} /></span>
+  {#if icon}<span class="empty__mark"><Icon name={icon} size={22} /></span>{/if}
   <h3 class="h4">{title}</h3>
   {#if body}<p class="lead small muted">{body}</p>{/if}
   {@render action?.()}

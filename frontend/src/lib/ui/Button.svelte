@@ -16,6 +16,7 @@
     title,
     expanded,
     controls,
+    current,
     class: className = '',
     onclick,
     children,
@@ -34,6 +35,9 @@
     // открывает, иначе экрану чтения не на что опереться.
     expanded?: boolean;
     controls?: string;
+    // Переключатель сценария или вкладки: активный элемент обязан называться
+    // не только цветом, но и `aria-current`.
+    current?: boolean;
     class?: string;
     onclick?: (event: MouseEvent) => void;
     children?: Snippet;
@@ -58,6 +62,7 @@
     class={cls}
     {title}
     aria-disabled={disabled || busy || undefined}
+    aria-current={current ? 'true' : undefined}
     rel={href.startsWith('http') ? 'external noreferrer' : undefined}
   >
     {#if busy}<span class="spinner spinner--quiet"></span>{/if}
@@ -74,6 +79,7 @@
     aria-busy={busy || undefined}
     aria-expanded={expanded}
     aria-controls={controls}
+    aria-current={current ? 'true' : undefined}
     {onclick}
   >
     {#if busy}<span class="spinner spinner--quiet"></span>{/if}
