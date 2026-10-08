@@ -1,3 +1,4 @@
+import { unitLabel } from './terms';
 import type { NumericObservation } from './types';
 
 /**
@@ -28,7 +29,8 @@ const NO_UNIT = 'без единицы';
 
 export function unitOf(source: IntervalSource): string {
   for (const observation of source.observations) {
-    const unit = (observation.normalized_unit || observation.unit || '').trim();
+    // Группа строится по свёрнутой единице: «mg/L» и «мг/л» — одна полоса.
+    const unit = unitLabel(observation.normalized_unit || observation.unit).label.trim();
     if (unit) return unit;
   }
   return NO_UNIT;

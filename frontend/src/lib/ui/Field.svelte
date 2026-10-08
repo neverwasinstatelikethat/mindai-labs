@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { FullAutoFill } from 'svelte/elements';
+  import Icon from './Icon.svelte';
 
   let {
     label,
@@ -41,6 +42,9 @@
     onenter?: () => void;
   } = $props();
 
+  // Идентификатор детерминирован: поле рендерится на сервере, а счётчик
+  // экземпляров разошёлся бы между серверной разметкой и гидратацией.
+  // Два поля с одним `name` на экране разделяет вызывающая сторона.
   const id = $derived(`f-${name}`);
 
   // Фокус по запросу — действием, чтобы не развешивать autofocus-атрибут.
@@ -105,13 +109,7 @@
           aria-label={revealPassword ? 'Скрыть пароль' : 'Показать пароль'}
           onclick={() => (revealPassword = !revealPassword)}
         >
-          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            {#if revealPassword}
-              <path d="M4 4l16 16" /><path d="M9.6 6.9A9.8 9.8 0 0 1 12 6.5c6 0 9.5 5.5 9.5 5.5a17 17 0 0 1-2.9 3.4M6.2 8.6A16.6 16.6 0 0 0 2.5 12S6 17.5 12 17.5c1 0 2-.2 2.9-.5" />
-            {:else}
-              <path d="M2.5 12S6 6.5 12 6.5 21.5 12 21.5 12 18 17.5 12 17.5 2.5 12 2.5 12Z" /><circle cx="12" cy="12" r="2.8" />
-            {/if}
-          </svg>
+          <Icon name={revealPassword ? 'eyeOff' : 'eye'} size={19} />
         </button>
       {/if}
     </div>
@@ -119,9 +117,7 @@
 
   {#if error}
     <p class="field__error" id="{id}-err">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-        <path d="M12 4.5l8.5 15H3.5l8.5-15Z" /><path d="M12 10v4M12 16.8h.01" />
-      </svg>
+      <Icon name="alert" size={15} />
       {error}
     </p>
   {:else if hint}

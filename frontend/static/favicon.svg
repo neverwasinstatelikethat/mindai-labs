@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!--
+    Фавикон — голова маскота. Холодный спектр принадлежит одному объекту системы,
+    присутствию агента, поэтому здесь он уместен.
+
+    Значения продублированы из tokens.css (--aura-cyan, --aura-blue,
+    --aura-violet, --aura-face, --paper): отдельный файл фавикона не видит
+    CSS-переменные страницы, это единственное легальное место с собственным
+    цветом. При смене палитры ауры править оба файла.
+  -->
+  <defs>
+    <radialGradient id="core" cx="46%" cy="40%" r="66%">
+      <stop offset="0%" stop-color="#6fdcf2" />
+      <stop offset="46%" stop-color="#7aa8ff" />
+      <stop offset="100%" stop-color="#b9a4ff" />
+    </radialGradient>
+  </defs>
+
+  <rect width="64" height="64" rx="14" fill="#fdfcf8" />
+  <circle cx="32" cy="32" r="23" fill="url(#core)" />
+  <ellipse cx="25" cy="23" rx="8" ry="5.5" fill="#ffffff" opacity="0.34" />
+
+  <g fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round">
+    <path d="M22 27.5c1.6-1.9 3.6-1.9 5.2 0" />
+    <path d="M36.8 27.5c1.6-1.9 3.6-1.9 5.2 0" />
+    <path d="M32 33.5v3.2" />
+  </g>
+</svg>

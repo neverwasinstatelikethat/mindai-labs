@@ -3,17 +3,21 @@
   // инспектор выбранной записи с доказательствами. Инспектор показывается,
   // только когда выбрана запись или связь: до выбора экран принадлежит карте,
   // и держать под ней пустую панель на весь экран нечего.
+  import { page } from '$app/state';
+  import { goto } from '$app/navigation';
+  import { tick } from 'svelte';
   import { api, ApiError } from '$lib/api';
-  import GraphMap, { classOf } from '$lib/GraphMap.svelte';
+  import GraphMap from '$lib/GraphMap.svelte';
   import { navLabel } from '$lib/nav';
   import { countOf, dateTime, num } from '$lib/format';
   import { session } from '$lib/sessionStore.svelte';
   import {
     ASK_SOURCE,
-    MAP_KNOWLEDGE_STATUS_LABELS,
-    MAP_META_LABELS,
+    MAP_LINK_MISS,
+    MAP_MODES,
     MAP_NAME_FALLBACK,
     MAP_NOUN,
+    MAP_SEARCH,
     MAP_UNNAMED_AREA,
     PROPERTY_LABELS,
     STATUS_SHORT,
@@ -23,16 +27,18 @@
     knownTerm,
     mapNodeType,
     mapRelationLabel,
+    mapSearchEmptyBody,
+    mapSearchShownOf,
   } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
+  import Field from '$lib/ui/Field.svelte';
   import Icon from '$lib/ui/Icon.svelte';
   import Notice from '$lib/ui/Notice.svelte';
   import Panel from '$lib/ui/Panel.svelte';
   import SectionHead from '$lib/ui/SectionHead.svelte';
   import Sheet from '$lib/ui/Sheet.svelte';
   import StatusPill from '$lib/ui/StatusPill.svelte';
-  import { DATA_CLASS_LABELS } from '$lib/types';
   import type {
     FindingListItem,
     GraphEdge,
@@ -59,6 +65,17 @@
   // Выбранная связь живёт на экране: поле подсвечивает её, инспектор описывает
   // словами и ведёт к обеим записям.
   let pickedEdge = $state<GraphEdge | null>(null);
+  // Два целевых сценария одного экрана. Поиск отвечает на «где это и что про это
+  // сказано» простым списком и карточкой сведений; карта отвечает на «как это
+  // связано» и требует чтения поля. Раньше экран начинался с поля, и человек,
+  // пришедший за одним фактом, получал стрелки.
+  let mode = $state<'search' | 'map'>(
+    page.url.searchParams.get('mode') === 'map' ? 'map' : 'search',
+  );
+  // Подписи связей по умолчанию только у выбранной записи; человек может
+  // включить их для всего поля.
+  let labelsAll = $state(false);
+  let query = $state('');
   // Доказательства берутся из настоящих находок корпуса: /api/v1/findings отдаёт
   // тот же Finding, что и ответ запроса, уже срезанный по классу данных сессии.
   // Список приходит страницей, а полное число подходит заголовком сервера: без
@@ -156,15 +173,6 @@
     return raw === '' ? TERM_FALLBACKS.predicate : mapRelationLabel(raw);
   }
 
-  /** Символьные оффсеты фрагмента: они читаются только в служебных данных. */
-  function offsetRows(finding: FindingListItem): { key: string; value: string }[] {
-    return finding.evidence.flatMap((ev, i) =>
-      ev.char_start != null && ev.char_end != null
-        ? [{ key: `символы фрагмента ${i + 1}`, value: `${ev.char_start}–${ev.char_end}` }]
-        : [],
-    );
-  }
-
   /** Область записи: серверная метка либо названная группа без метки. */
   function areaOf(node: GraphNode): string {
     const raw = node.metadata['community'];
@@ -175,19 +183,20 @@
    * Ссылка на находку и её источник: `/findings` читает `claim` (открывает
    * шторку первоисточника) и `document` (оставляет в списке этот документ).
    * Контракт тот же, что у перехода из ответа в «Находках»: карта своих
-   * параметров не изобретает.
+   * параметров не изобретает. Для записи-документа источник называется прямо:
+   * находка может ссылаться и на другой документ этого среза.
    */
-  function findingsHref(finding: FindingListItem): string {
+  function findingsHref(finding: FindingListItem, documentId = ''): string {
     const params = new URLSearchParams();
     params.set('claim', finding.id);
-    const doc = finding.evidence[0]?.document_id;
-    if (doc) params.set('document', doc);
+    const doc = documentId !== '' ? documentId : (finding.evidence[0]?.document_id ?? '');
+    if (doc !== '') params.set('document', doc);
     return `/findings?${params.toString()}`;
   }
 
   /** Ссылка на источник: `/findings?document=` оставляет в списке этот документ. */
-  function documentHref(node: GraphNode): string | null {
-    if (!node.id.startsWith('document-')) return null;
+  function documentHref(node: GraphNode): string | undefined {
+    if (!node.id.startsWith('document-')) return undefined;
     return `/findings?document=${encodeURIComponent(node.id.slice('document-'.length))}`;
   }
 
@@ -261,6 +270,38 @@
 
   const nodeIndex = $derived(new Map(graph.nodes.map((node) => [node.id, node])));
 
+  /**
+   * Результат поиска по карте: запись, её тип и одна строка сведений. Ищется по
+   * имени и по названию типа, поэтому «документ» находит источники, а «95» не
+   * находит ничего лишнего. Поле в поиске не участвует: оно перечитывает срез
+   * целиком, а не рисует новый граф.
+   */
+  const searchMatches = $derived.by<GraphNode[]>(() => {
+    const q = query.trim().toLowerCase();
+    if (q === '') return [];
+    return graph.nodes.filter((node) => {
+      const label = node.label.toLowerCase();
+      const type = mapNodeType(node.type).toLowerCase();
+      return label.includes(q) || type.includes(q);
+    });
+  });
+
+  /** На экране помещается первые строки, остальное называется числом. */
+  const SEARCH_WINDOW = 40;
+  const searchShown = $derived(searchMatches.slice(0, SEARCH_WINDOW));
+
+  function setMode(next: 'search' | 'map'): void {
+    if (mode === next) return;
+    mode = next;
+    const params = new URLSearchParams(page.url.searchParams);
+    params.set('mode', next);
+    void goto(`?${params.toString()}`, {
+      keepFocus: true,
+      noScroll: true,
+      replaceState: true,
+    }).catch(() => undefined);
+  }
+
   /** Связи выбранной записи: направление и вторая сторона берутся из этого же среза. */
   const connections = $derived.by<Connection[]>(() => {
     if (!selected) return [];
@@ -289,22 +330,24 @@
 
   /**
    * Главное действие инспектора: срез «Находок», а не пустой список. Сначала
-   * утверждение самой записи, затем её источник: ссылка ведёт в маршрут, который
-   * умеет открыть этот срез (`claim` и `document` читаются «Находками», своего
-   * контракта карта не задаёт). Когда у выбранной записи нет ни находки, ни
-   * источника, ссылки нет: кнопка, ведущая в никуда, на экран не выходит.
+   * находка самой записи вместе с её источником, затем документ этой записи,
+   * если находки в показанной части корпуса нет, и только потом источник по
+   * связи. Когда нет ни того, ни другого, ссылки нет: кнопка, ведущая в никуда,
+   * на экран не выходит.
    */
-  const findingHref = $derived.by<string | null>(() => {
-    if (!selected) return null;
-    const ownDocument = documentHref(selected);
-    if (ownDocument) return ownDocument;
+  const findingHref = $derived.by<string | undefined>(() => {
+    if (!selected) return undefined;
+    const docId = selected.id.startsWith('document-')
+      ? selected.id.slice('document-'.length)
+      : '';
     const own = relatedFindings[0];
-    if (own) return findingsHref(own);
+    if (own) return findingsHref(own, docId);
+    if (docId !== '') return documentHref(selected);
     if (selected.type === 'claim') {
       const code = findingIdFor(selected) ?? `finding-${selected.id}`;
       return `/findings?claim=${encodeURIComponent(code)}`;
     }
-    return sourceDocument ? documentHref(sourceDocument) : null;
+    return sourceDocument ? documentHref(sourceDocument) : undefined;
   });
 
   /** Смена записи обнуляет раскрытия и выбор связи: чужое состояние не держим. */
@@ -356,15 +399,17 @@
       findingsError = '';
     }
     try {
-      const page = await api.findings(
+      // Строка сервера называется не `page`: адрес экрана читается через `page`
+      // из `$app/state`, и две разные «страницы» в одном файле читались бы плохо.
+      const served = await api.findings(
         undefined,
         undefined,
         FINDINGS_PAGE_SIZE,
         more ? findingsShown : 0,
       );
-      findings = more ? mergePages(findings, page.items) : page.items;
-      findingsShown = more ? findingsShown + page.items.length : page.items.length;
-      findingsTotal = page.total;
+      findings = more ? mergePages(findings, served.items) : served.items;
+      findingsShown = more ? findingsShown + served.items.length : served.items.length;
+      findingsTotal = served.total;
       findingsStatus = 'ready';
     } catch (reason) {
       // На экран выходит человеческая строка, а не текст самого отказа.
@@ -406,30 +451,43 @@
     }
   });
 
-  const loadedAtText = $derived(loadedAt ? dateTime(loadedAt, true) : '');
+  /**
+   * Глубокая ссылка `/graph?claim=`: переход из ответа обещает открыть на карте
+   * ту же запись, к которой он ведёт. Код находки и код записи различаются
+   * соглашением `finding-`, поэтому узел ищется по всем вариантам этого среза.
+   * Записи на карте нет — экран говорит об этом словами: молчаливый обзор
+   * областей ответом на переход не считается.
+   */
+  let linkHandledFor = $state('');
+  let linkMiss = $state(false);
 
-  // Метаданные записи: переводим известные ключи словарём карты, JSON-блоб и
-  // неизвестные ключи не печатаем. Эти строки служебные: они живут под раскрытием
-  // «Служебные данные», а не в фактах записи.
-  const META_SKIP = new Set(['observations']);
-
-  function metaEntries(node: GraphNode | null): { key: string; label: string; value: string }[] {
-    if (!node) return [];
-    const rows: { key: string; label: string; value: string }[] = [];
-    for (const [key, raw] of Object.entries(node.metadata)) {
-      if (META_SKIP.has(key)) continue;
-      const label = MAP_META_LABELS[key];
-      // Без словарного перевода строку пропускаем: сырой snake_case-ключ не
-      // становится видимой подписью.
-      if (!label) continue;
-      let text = String(raw);
-      if (key === 'knowledge_status') text = MAP_KNOWLEDGE_STATUS_LABELS[text] ?? text;
-      // год=0 есть сервисный маркер «года нет», печатать его нельзя
-      if (text.trim() === '' || (key === 'year' && text === '0')) continue;
-      rows.push({ key, label, value: text });
+  /** Запись карты по коду находки: `finding-claim-…` против `claim-…`. */
+  function nodeByFindingCode(code: string): GraphNode | null {
+    const bare = code.startsWith('finding-') ? code.slice('finding-'.length) : code;
+    for (const id of [code, bare, `claim-${bare}`, `finding-${bare}`]) {
+      const node = nodeIndex.get(id);
+      if (node) return node;
     }
-    return rows;
+    return null;
   }
+
+  $effect(() => {
+    if (status !== 'ready') return;
+    const code = (page.url.searchParams.get('claim') ?? '').trim();
+    if (code === '' || code === linkHandledFor) return;
+    linkHandledFor = code;
+    const node = nodeByFindingCode(code);
+    linkMiss = node === null;
+    if (!node) return;
+    pick(node);
+    // Переход просит детали прямо: инспектор показывается сразу, а не тогда,
+    // когда человек докрутит поле до него.
+    void tick().then(() => {
+      document.getElementById('evidence')?.scrollIntoView({ block: 'start' });
+    });
+  });
+
+  const loadedAtText = $derived(loadedAt ? dateTime(loadedAt, true) : '');
 
   /**
    * Числовые условия могут лежать и в самой записи (`metadata.observations`:
@@ -456,9 +514,6 @@
 
   const nodeObs = $derived(nodeObservations(selected));
 
-  function confidenceWidth(value: number): string {
-    return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
-  }
 </script>
 
 <svelte:head>
@@ -467,7 +522,6 @@
 
 {#snippet nodeBody()}
   {#if selected}
-    {@const cls = classOf(selected)}
     <div class="stack map__node-facts">
       <dl class="kv">
         <dt>вид записи</dt>
@@ -480,10 +534,6 @@
           <dt>связей в этой области</dt>
           <dd class="num">{num(focusArea.links)}</dd>
         {/if}
-        <dt>класс данных</dt>
-        <dd><StatusPill status={cls.pill} label={cls.ru} /></dd>
-        <dt>уверенность</dt>
-        <dd class="num">{num(selected.confidence)}</dd>
         <dt>связей всего</dt>
         <dd class="num">{connections.length}</dd>
         <dt>из них исходящих</dt>
@@ -491,14 +541,6 @@
         <dt>входящих</dt>
         <dd class="num">{connections.length - outgoingCount}</dd>
       </dl>
-
-      <div
-        class="bar"
-        role="img"
-        aria-label="Уверенность записи {num(selected.confidence)} из 1"
-      >
-        <span class="bar__fill" style="width: {confidenceWidth(selected.confidence)}"></span>
-      </div>
 
       <div class="map__conn">
         <div class="row row--between">
@@ -527,7 +569,7 @@
           <p class="micro muted">В этой карте у записи нет связей.</p>
         {:else}
           <p class="micro muted map__list-head">
-            направление, отношение, вторая запись, уверенность
+            направление, отношение и связанная запись
           </p>
           <ul class="map__conn-list">
             {#each shownConnections as conn, i (`${conn.edge.id}-${i}`)}
@@ -540,7 +582,6 @@
                   onclick={() => pickEdge(pickedEdge?.id === conn.edge.id ? null : conn.edge)}
                 >
                   <span>{mapRelationLabel(conn.edge.relation)}</span>
-                  <code class="tech">{conn.edge.relation}</code>
                 </button>
                 {#if conn.other}
                   {@const target = conn.other}
@@ -551,7 +592,6 @@
                 {:else}
                   <span class="micro muted">запись вне этой карты</span>
                 {/if}
-                <span class="num micro map__conf">{num(conn.edge.confidence)}</span>
               </li>
             {/each}
           </ul>
@@ -570,22 +610,6 @@
           {/if}
         {/if}
       </div>
-
-      <details class="map__tech">
-        <summary class="micro">Служебные данные записи</summary>
-        <dl class="kv">
-          <dt>код записи</dt>
-          <dd><code class="tech">{selected.id}</code></dd>
-          <dt>вид в онтологии</dt>
-          <dd><code class="tech">{selected.type}</code></dd>
-          <dt>класс данных</dt>
-          <dd><code class="tech">{cls.code}</code></dd>
-          {#each metaEntries(selected) as row (row.key)}
-            <dt>{row.label}</dt>
-            <dd><code class="tech">{row.value}</code></dd>
-          {/each}
-        </dl>
-      </details>
     </div>
   {/if}
 {/snippet}
@@ -612,17 +636,6 @@
       </tbody>
     </table>
   </div>
-  <details class="map__tech">
-    <summary class="micro">Служебные данные условий</summary>
-    <dl class="kv">
-      {#each rows as obs, i (`code-${i}`)}
-        <dt>код показателя</dt>
-        <dd><code class="tech">{obs.property_name}</code></dd>
-        <dt>условие как записано в источнике</dt>
-        <dd><code class="tech">{obs.raw_text || 'нет данных'}</code></dd>
-      {/each}
-    </dl>
-  </details>
 {/snippet}
 
 {#snippet evidenceBlock()}
@@ -720,28 +733,6 @@
 
             <h4 class="h4">{finding.statement}</h4>
 
-            <dl class="kv">
-              <dt>уверенность</dt>
-              <dd class="num">{num(finding.confidence)}</dd>
-              <dt>класс данных</dt>
-              <dd>{DATA_CLASS_LABELS[finding.data_class]}</dd>
-              {#if finding.superseded_by}
-                <dt>заменена</dt>
-                <dd>более новой версией, её код лежит в служебных данных</dd>
-              {/if}
-            </dl>
-
-            <div
-              class="bar"
-              role="img"
-              aria-label="Уверенность находки {num(finding.confidence)} из 1"
-            >
-              <span
-                class="bar__fill bar__fill--{finding.status === 'disputed' ? 'disputed' : 'consensus'}"
-                style="width: {confidenceWidth(finding.confidence)}"
-              ></span>
-            </div>
-
             {#if finding.observations.length > 0}
               {@render obsTable(finding.observations, 'Числовые условия утверждения')}
             {:else}
@@ -788,32 +779,12 @@
               {/if}
             </div>
 
-            <details class="map__tech">
-              <summary class="micro">Служебные данные находки</summary>
-              <dl class="kv">
-                <dt>код находки</dt>
-                <dd><code class="tech">{finding.id}</code></dd>
-                <dt>субъект</dt>
-                <dd><code class="tech">{finding.subject || '—'}</code></dd>
-                <dt>предикат</dt>
-                <dd><code class="tech">{finding.predicate || '—'}</code></dd>
-                {#if finding.superseded_by}
-                  <dt>заменена на</dt>
-                  <dd><code class="tech">{finding.superseded_by}</code></dd>
-                {/if}
-                {#each offsetRows(finding) as row (row.key)}
-                  <dt>{row.key}</dt>
-                  <dd><code class="tech">{row.value}</code></dd>
-                {/each}
-              </dl>
-            </details>
-
             <div class="row">
               <Button href={findingsHref(finding)} variant="quiet" size="sm">
                 {ASK_SOURCE.findings}
               </Button>
               {#if finding.status === 'disputed'}
-                <Button href="/conflicts" variant="quiet" size="sm">Открыть расхождение</Button>
+                <Button href="/numbers" variant="quiet" size="sm">Открыть расхождение</Button>
               {/if}
             </div>
           </article>
@@ -851,7 +822,6 @@
       </div>
       <p class="small map__edge-line">
         <span>{mapRelationLabel(pickedEdge.relation)}</span>
-        <code class="tech">{pickedEdge.relation}</code>
       </p>
       <p class="small map__edge-line">
         <button type="button" class="map__jump" onclick={() => fromNode && pick(fromNode)}>
@@ -862,12 +832,6 @@
           {toNode?.label ?? 'запись вне этой карты'}
         </button>
       </p>
-      <dl class="kv">
-        <dt>уверенность связи</dt>
-        <dd class="num">{num(pickedEdge.confidence)}</dd>
-        <dt>класс данных связи</dt>
-        <dd>{DATA_CLASS_LABELS[pickedEdge.data_class]}</dd>
-      </dl>
     </div>
   {/if}
 {/snippet}
@@ -897,11 +861,34 @@
             {/if}
           </p>
           <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
-            Перечитать карту
+            Обновить карту
           </Button>
         </div>
       {/if}
     </SectionHead>
+
+    {#if status === 'ready' && graph.nodes.length > 0}
+      <!-- Переключатель сценариев стоит над содержимым: человек выбирает режим
+           до того, как увидел хоть одну стрелку. -->
+      <div class="map__modes" role="group" aria-label={MAP_MODES.group}>
+        <Button
+          variant={mode === 'search' ? 'action' : 'quiet'}
+          size="sm"
+          current={mode === 'search'}
+          onclick={() => setMode('search')}
+        >
+          {MAP_MODES.search}
+        </Button>
+        <Button
+          variant={mode === 'map' ? 'action' : 'quiet'}
+          size="sm"
+          current={mode === 'map'}
+          onclick={() => setMode('map')}
+        >
+          {MAP_MODES.analysis}
+        </Button>
+      </div>
+    {/if}
 
     {#if access === 'checking'}
       <Panel tone="sunk">
@@ -924,7 +911,6 @@
         {#if error}<p class="micro muted">{error}</p>{/if}
         <div class="row">
           <Button href="/research" variant="quiet">Перейти в рабочее пространство</Button>
-          <Button href="/dashboard" variant="ghost">{navLabel('/dashboard')}</Button>
         </div>
       </Panel>
     {:else if status === 'loading' || status === 'idle'}
@@ -962,14 +948,82 @@
         {/snippet}
       </Empty>
     {:else}
-      <GraphMap
-        {graph}
-        {narrow}
-        selectedId={selected ? selected.id : undefined}
-        edgeId={pickedEdge ? pickedEdge.id : undefined}
-        onselect={pick}
-        onpickEdge={pickEdge}
-      />
+      {#if linkMiss}
+        <Notice tone="warn" title={MAP_LINK_MISS.title}>{MAP_LINK_MISS.body}</Notice>
+      {/if}
+
+      {#if mode === 'search'}
+        <!-- Поиск: список и сведения простым форматом. Ни стрелок, ни поля
+             рисования здесь нет, потому что за этим сценарием приходят за
+             одной записью, а не за обзором связей. -->
+        <Panel tone="sunk">
+          <div class="map__search">
+          <div class="map__search-form">
+            <Field
+              label={MAP_MODES.searchLabel}
+              name="map-search"
+              type="search"
+              bind:value={query}
+              placeholder={MAP_MODES.searchPlaceholder}
+            />
+          </div>
+
+          {#if query.trim() === ''}
+            <p class="micro muted map__search-idle">{MAP_MODES.idle}</p>
+          {:else if searchMatches.length === 0}
+            <p class="small map__search-empty">{mapSearchEmptyBody(query.trim())}</p>
+          {:else}
+            <p class="micro muted map__search-count">
+              {mapSearchShownOf(searchShown.length, searchMatches.length, query.trim())}
+            </p>
+            <ul class="map__results" aria-label={MAP_MODES.search}>
+              {#each searchShown as node (node.id)}
+                <li class="map__result">
+                  <button
+                    type="button"
+                    class="map__result-row"
+                    data-active={selected?.id === node.id ? 'true' : undefined}
+                    onclick={() => pick(node)}
+                  >
+                    <span class="map__result-type">{mapNodeType(node.type)}</span>
+                    <span class="map__result-label">{node.label}</span>
+                  </button>
+                  {#if selected?.id === node.id}
+                    <div class="map__result-go">
+                      <Button variant="quiet" size="sm" onclick={() => setMode('map')}>
+                        {MAP_MODES.toMap}
+                      </Button>
+                    </div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          </div>
+        </Panel>
+      {:else}
+        <div class="map__density">
+          <!-- Режим подписей — подписанный control-элемент: он переключает поле,
+               а не описывает себя текстом рядом. -->
+          <Button
+            variant={labelsAll ? 'action' : 'quiet'}
+            size="sm"
+            current={labelsAll}
+            onclick={() => (labelsAll = !labelsAll)}
+          >
+            {MAP_SEARCH.labelsAll}
+          </Button>
+        </div>
+        <GraphMap
+          {graph}
+          {narrow}
+          labelMode={labelsAll ? 'all' : 'focus'}
+          selectedId={selected ? selected.id : undefined}
+          edgeId={pickedEdge ? pickedEdge.id : undefined}
+          onselect={pick}
+          onpickEdge={pickEdge}
+        />
+      {/if}
 
       {#if pickedEdge && !selected}
         <section class="map__edge-note" aria-label="Выбранная связь">
@@ -1040,6 +1094,103 @@
     align-items: center;
     gap: var(--s4);
     flex-wrap: wrap;
+  }
+
+  /* Переключатель сценариев: две кнопки в одной строке, активная читается и
+     заполнением, и `aria-current`. */
+  .map__modes {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+  }
+
+  .map__search {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+    margin-bottom: var(--s5);
+  }
+
+  /* Плотность подписей: настройка поля, а не сценария, поэтому стоит над
+     полем и в одну строку с пояснением. */
+  .map__density {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    flex-wrap: wrap;
+    margin-bottom: var(--s3);
+  }
+
+  .map__search-form {
+    max-width: var(--maxw-narrow);
+  }
+
+  .map__search-idle,
+  .map__search-empty,
+  .map__search-count {
+    margin: 0;
+  }
+
+  .map__search-empty {
+    color: var(--ink-2);
+  }
+
+  /* Результат поиска: одна строка на запись, тип слева, имя справа. Никаких
+     стрелок: список отвечает на «где это», связи смотрят в другом сценарии. */
+  .map__results {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .map__result {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+  }
+
+  .map__result-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    width: 100%;
+    padding: var(--s3) var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    transition: border-color var(--dur-fast) var(--ease-soft),
+      background var(--dur-fast) var(--ease-soft);
+  }
+
+  .map__result-row:hover {
+    border-color: var(--line-strong);
+    background: var(--surface-raised);
+  }
+
+  .map__result-row[data-active='true'] {
+    border-color: var(--line-strong);
+    background: var(--sage);
+  }
+
+  .map__result-type {
+    flex: none;
+    font-size: var(--t-micro);
+    color: var(--ink-3);
+  }
+
+  .map__result-label {
+    overflow-wrap: anywhere;
+  }
+
+  .map__result-go {
+    padding-left: var(--s4);
   }
 
   .map__meta {
@@ -1205,10 +1356,6 @@
     box-shadow: inset 0 0 0 1px var(--action-ink);
   }
 
-  .map__rel .tech {
-    color: var(--ink-3);
-  }
-
   .map__jump {
     display: inline-flex;
     align-items: baseline;
@@ -1229,11 +1376,6 @@
 
   .map__jump:hover {
     color: var(--action-ink);
-  }
-
-  .map__conf {
-    text-align: right;
-    color: var(--ink-2);
   }
 
   .map__evidence {
@@ -1269,26 +1411,6 @@
     padding: var(--s3) var(--s4) 0;
   }
 
-  /* Технические имена — только под раскрытием «Служебные данные»: в фактах узла
-     и находки они не заголовки. */
-  .map__tech {
-    border-top: 1px solid var(--line-soft);
-    padding-top: var(--s3);
-  }
-
-  .map__tech summary {
-    cursor: pointer;
-    color: var(--ink-3);
-  }
-
-  .map__tech .kv {
-    margin-top: var(--s2);
-  }
-
-  .map__tech dd {
-    overflow-wrap: anywhere;
-  }
-
   @media (max-width: 900px) {
     /* Шапка в один плотный ряд: подпись среза переносится, кнопка остаётся
        на своей ширине, и поле карты поднимается к первому вьюпорту. */
@@ -1316,11 +1438,4 @@
     }
   }
 
-  @media (max-width: 640px) {
-    /* В узкой колонке читаются направление, отношение и второй узел;
-       уверенность остаётся в полном составе списка. */
-    .map__conf {
-      display: none;
-    }
-  }
 </style>

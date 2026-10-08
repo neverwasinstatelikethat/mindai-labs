@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/state';
+  import { navLabel } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import { ApiError } from '$lib/api';
   import Button from '$lib/ui/Button.svelte';
@@ -41,9 +42,9 @@
       await goto(next);
       await invalidateAll();
     } catch (caught) {
-      // Отказ убирает введённое из полей: email возвращаем в форму, чтобы
-      // человек правил только пароль, а пароль оставаем чистым. Текст отказа
-      // обещает ровно это и не называет оба поля сохранёнными.
+      // Поля после отказа пустеют: email возвращаем в форму, чтобы человек правил
+      // только пароль, а пароль остаём чистым. Текст отказа обещает ровно это и не
+      // называет оба поля сохранёнными.
       email = typedEmail;
       password = '';
       // Сервер отвечает одинаковым отказом и на неизвестный email, и на неверный
@@ -77,16 +78,18 @@
 
   <div class="wrap wrap--narrow auth__inner">
     <h1 class="display reveal">Вход в Клубок</h1>
-    <p class="lead reveal" style="--reveal-delay: 90ms">
-      Один аккаунт на всё рабочее пространство: вопрос к корпусу, находки с цитатами и адресами
-      в источниках, карта связей и сравнение технологий.
-    </p>
 
     {#if cameToContinue}
       <Notice tone="info" title="Нужен вход">
-        Рабочий раздел открывается после входа. Войдите, и вы вернётесь на ту же страницу: адрес
-        сохранён.
+        Войдите, и вернётесь на ту же страницу: адрес сохранён.
       </Notice>
+    {:else}
+      <!-- Что будет сразу после входа: экран называет раздел, а не обещает
+           «рабочее пространство» вообще. -->
+      <p class="lead reveal" style="--reveal-delay: 90ms">
+        После входа открывается «{navLabel('/research')}»: там вводят вопрос и получают ответ с
+        цитатами и адресами в источниках.
+      </p>
     {/if}
 
     <form
@@ -127,31 +130,25 @@
         <Button type="submit" variant="action" {busy} disabled={busy}>
           {busy ? 'Отправляем…' : 'Войти'}
         </Button>
-        <Button href="/register" variant="link" size="sm">Нет аккаунта? Создать</Button>
+        <Button href="/register" variant="link" size="sm" class="auth__switch">
+          Нет аккаунта? Создать
+        </Button>
       </div>
 
-      <div class="stack auth__notes">
-        <p class="micro muted">
-          Email и пароль нужны только для входа в рабочее пространство и для подписи ваших
-          записей.
-        </p>
-        <p class="micro muted">
-          Забыли пароль? Новый задаёт администратор сервиса: самостоятельной сбросной ссылки
-          здесь нет.
-        </p>
-        <p class="micro muted">
-          Экспертное право на разбор предложений по ответам, журнал действий и закрытые данные
-          выдаёт администратор сервиса. Остальное открывается сразу после входа.
-        </p>
-      </div>
+      <p class="micro muted auth__gate">
+        Забытый пароль и экспертное право на разбор ответов открывает администратор сервиса.
+      </p>
     </form>
   </div>
 </div>
 
 <style>
   /* Центрирование и высоту даёт page--cover; здесь только свои отступы. */
+  /* Верхний отступ обязан учитывать измеренную высоту шапки: собственное
+     значение .auth перебивало зазор .page, и заголовок регистрации
+     ложился под плавающую навигацию. */
   .auth {
-    padding-block: var(--s6) var(--s8);
+    padding-block: calc(var(--topbar-h) + var(--s6)) var(--s8);
   }
 
   .auth__inner {
@@ -177,9 +174,20 @@
     max-width: 15ch;
   }
 
-  /* Примечания читаются dense-блоком под действиями, а не россыпью строк. */
-  .auth__notes {
-    --gap: var(--s2);
+  /* Единственная оговорка экрана: право выдаёт администратор, и оно сказано
+     один раз. */
+  .auth__gate {
     max-width: var(--maxw-measure);
+    padding-top: var(--s1);
+    border-top: 1px solid var(--line);
+  }
+
+  /* Ссылка-действие рядом с кнопкой входа: цель нажатия 32 px берётся
+     геометрией контрола, кегль остаётся micro. На узком экране и под пальцем
+     цель держит общее правило тач-целей (44 px) из app.css. */
+  @media (min-width: 641px) {
+    :global(a.auth__switch) {
+      min-block-size: 32px;
+    }
   }
 </style>

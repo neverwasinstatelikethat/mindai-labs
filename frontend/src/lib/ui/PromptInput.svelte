@@ -18,7 +18,6 @@
     variant = 'inline',
     mascot = true,
     autofocus = false,
-    suggestions = [] as string[],
     hint = '',
     rows = 1,
     name = 'prompt',
@@ -34,7 +33,6 @@
     variant?: 'hero' | 'inline' | 'docked';
     mascot?: boolean;
     autofocus?: boolean;
-    suggestions?: string[];
     hint?: string;
     rows?: number;
     name?: string;
@@ -84,10 +82,6 @@
     }
   }
 
-  function pick(suggestion: string) {
-    value = suggestion;
-    box?.focus();
-  }
 </script>
 
 <form
@@ -119,19 +113,13 @@
   <div class="prompt__bar">
     <div class="prompt__tools">
       {@render leading?.()}
-      {#each suggestions as suggestion (suggestion)}
-        <button class="chip" type="button" onclick={() => pick(suggestion)}>
-          <Icon name="sparkles" size={14} />
-          {suggestion}
-        </button>
-      {/each}
       {@render tools?.()}
     </div>
 
     {#if hint}
       <span class="prompt__hint">{hint}</span>
     {:else}
-      <span class="prompt__hint">Enter отправляет вопрос, Shift + Enter переносит строку</span>
+      <span class="prompt__hint">Enter — отправить</span>
     {/if}
 
     <button

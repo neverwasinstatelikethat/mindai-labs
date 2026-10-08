@@ -3,7 +3,7 @@
   import { navLabel } from '$lib/nav';
   import Button from '$lib/ui/Button.svelte';
   import Icon from '$lib/ui/Icon.svelte';
-  import Panel from '$lib/ui/Panel.svelte';
+  import InfoDot from '$lib/ui/InfoDot.svelte';
   import type { IconName } from '$lib/ui/icons';
 
   let { error }: { error?: App.Error } = $props();
@@ -20,41 +20,48 @@
   // Причина, названная сервером (например, «Сервис не отвечает» из guard'а
   // сессии), единственная, которую экран вправе показать: она формулируется
   // для читателя-аналитика. Технические тексты сборки и сообщения фреймворка
-  // на русском не выглядят и на экран не попадают.
+  // на русском не выглядят и в прозу экрана не попадают.
   const serverReason = $derived(/[А-Яа-яЁё]/.test(message) ? message : '');
+
+  type Action = { kind: 'back' } | { kind: 'href'; href: string; label: string };
 
   type Scene = {
     icon: IconName;
+    /** Состояние задачи — одним словом, до всякого пояснения. */
     label: string;
     title: string;
+    /** Одна фраза о том, что произошло. Не абзац. */
     problem: string;
-    recovery: string;
-    primary: { href: string; label: string };
+    /** Методика и частные случаи — за «i». */
+    detail?: string;
+    /** Ровно одно действие: назад или в раздел. */
+    action: Action;
   };
 
-  // Ветви смысловые, а не косметические: у каждой свой диагноз и ровно одно
-  // действие, которое его снимает.
+  const back: Action = { kind: 'back' };
+  const toResearch: Action = { kind: 'href', href: '/research', label: `Открыть «${navLabel('/research')}»` };
+
+  // Ветви смысловые, а не косметические: у каждой своё состояние задачи и
+  // ровно одно действие, которое его снимает.
   const scene = $derived.by<Scene>(() => {
     if (status === 401) {
       return {
         icon: 'key',
         label: 'нужен вход',
         title: 'Клубок вас не узнал',
-        problem:
-          'Вы вышли из аккаунта или не входили в него: без входа рабочее пространство не открывается. Находки, карта связей и история ваших запросов ждут за входом.',
-        recovery: 'Войдите заново, и вы вернётесь на эту же страницу.',
-        primary: { href: `/login?next=${encodeURIComponent(selfHref)}`, label: 'Войти' },
+        problem: 'Рабочее пространство открыто только по входу: находки, карта связей и история ваших запросов ждут за ним.',
+        action: { kind: 'href', href: `/login?next=${encodeURIComponent(selfHref)}`, label: 'Войти' },
       };
     }
     if (status === 403) {
       return {
         icon: 'shield',
-        label: 'нужно экспертное право',
-        title: 'Вашему аккаунту это действие не открыто',
-        problem:
-          'Экспертное право на разбор предложений по ответам, журнал действий и закрытые данные выдаёт администратор сервиса. Остальные разделы работают как обычно, показания корпуса этот отказ не тронул.',
-        recovery: 'Вернитесь к разделам, которые открыты сейчас: находки и карта связей.',
-        primary: { href: '/findings', label: `Открыть «${navLabel('/findings')}»` },
+        label: 'право не выдано',
+        title: 'Это действие вашему аккаунту не открыто',
+        problem: 'Решения по предложениям и закрытые данные относятся к экспертным правам.',
+        detail:
+          'Экспертное право выдаёт администратор сервиса. Остальные разделы доступны как обычно.',
+        action: back,
       };
     }
     if (status === 404) {
@@ -62,12 +69,8 @@
         icon: 'compass',
         label: 'адрес не найден',
         title: 'Такой страницы в Клубке нет',
-        problem:
-          'Ссылка не ведёт ни в один раздел: обычно это опечатка в адресе или устаревшая закладка. Находки, карта связей и запросы к корпусу на месте.',
-        // Витрина открыта всем и не требует входа, поэтому она и есть выход:
-        // раздел рабочего пространства без сессии привёл бы сюда же снова.
-        recovery: 'Начните с витрины: там видно, чем занят сервис, а вход стоит рядом.',
-        primary: { href: '/', label: 'Вернуться на витрину' },
+        problem: 'Ссылка не ведёт ни в один раздел: обычно это опечатка или устаревшая закладка.',
+        action: toResearch,
       };
     }
     if (status === 503) {
@@ -75,11 +78,10 @@
         icon: 'sparkles',
         label: 'ответ не собран',
         title: 'Сервис не смог ответить',
-        problem:
-          'Запрос дошёл до сервиса, но готового ответа нет: модель может быть недоступна или контур занят. Ничего в корпусе не изменилось.',
-        recovery:
-          'Наберите вопрос заново через минуту. Если ответа нет и второй раз, обратитесь к администратору сервиса: он видит состояние модели.',
-        primary: { href: '/research', label: `Открыть «${navLabel('/research')}»` },
+        problem: 'Модель недоступна или контур занят; ничего в корпусе не изменилось.',
+        detail:
+          'У запроса есть срок и предел шагов: если ответ собран не полностью, сервис говорит об этом словами в самом ответе.',
+        action: toResearch,
       };
     }
     if (status === 502 || status === 504) {
@@ -87,11 +89,8 @@
         icon: 'alert',
         label: 'сервис не отвечает',
         title: 'Клубок не ответил',
-        problem:
-          'Переход не дошёл до рабочего контура: ответ не обработан, и ничего в корпусе не изменилось.',
-        recovery:
-          'Повторите переход через минуту. Если повторяется, обратитесь к администратору сервиса.',
-        primary: { href: selfHref, label: 'Повторить переход' },
+        problem: 'Переход не дошёл до рабочего контура, данные при этом не менялись.',
+        action: back,
       };
     }
     if (status >= 500) {
@@ -99,10 +98,10 @@
         icon: 'alert',
         label: 'сбой страницы',
         title: 'Страница не открылась',
-        problem:
-          'Ошибка произошла при открытии страницы и могла затронуть только её. Операцию этим переходом считайте невыполненной: перед повтором загляните в находки, если это был импорт или экспертная правка.',
-        recovery: `Повторите переход. Если повторяется, начните с раздела «${navLabel('/dashboard')}»: там видно, что уже в корпусе.`,
-        primary: { href: selfHref, label: 'Повторить переход' },
+        problem: 'Ошибка могла затронуть только этот переход: повторите его, ничего не потеряется.',
+        detail:
+          'Если это был импорт документа или экспертная правка, проверьте результат в разделе «Находки» перед повтором.',
+        action: back,
       };
     }
     if (status >= 400) {
@@ -110,25 +109,32 @@
         icon: 'info',
         label: 'переход не принят',
         title: 'Переход не выполнен',
-        problem:
-          'Клубок не принял такой переход: обычно не хватает части адреса или адрес устарел после перестройки разделов. Данные при этом не менялись.',
-        recovery: 'Повторите переход из рабочего пространства, там вопрос формулируется заново.',
-        primary: { href: '/research', label: `Открыть «${navLabel('/research')}»` },
+        problem: 'Клубок не принял такой переход: обычно адрес устарел после перестройки разделов.',
+        action: toResearch,
       };
     }
     return {
       icon: 'info',
       label: 'сбой экрана',
       title: 'Страница не открылась',
-      problem:
-        'При переходе произошла ошибка, о которой точнее сказать нечего. Ничего в корпусе не изменилось: попробуйте открыть раздел заново.',
-      recovery: `Повторите переход. Если повторяется, начните с раздела «${navLabel('/dashboard')}»: там видно, что уже в корпусе.`,
-      primary: { href: selfHref, label: 'Повторить переход' },
+      problem: 'При переходе произошла ошибка, о которой точнее сказать нечего.',
+      action: back,
     };
   });
 
-  // Адрес полезен при опечатке и бесполезен во всех остальных случаях.
-  const showsAddress = $derived(status === 404);
+  // Служебные строки нужны тому, кто передаст их администратору сервиса: код
+  // ответа, путь и названная сервером причина. На поверхности экрана их нет.
+  const rows = $derived([
+    { label: 'Код ответа', value: String(status) },
+    { label: 'Путь', value: `${pathname}${page.url.search}` },
+    { label: 'Причина сервиса', value: serverReason },
+  ]);
+
+  function goBack(): void {
+    // Если истории нет (прямая загрузка ошибки), выход — в рабочий раздел.
+    if (window.history.length > 1) window.history.back();
+    else window.location.assign('/research');
+  }
 </script>
 
 <svelte:head>
@@ -138,55 +144,28 @@
 <div class="page fault page--cover">
   <div class="scene" aria-hidden="true">
     <span class="blob blob--coral" style="width:44vmax;height:44vmax;top:-20vmax;right:-14vmax"></span>
-    <span class="blob blob--sage" style="width:38vmax;height:38vmax;top:12vmax;left:-16vmax"></span>
-    <span class="blob blob--lav" style="width:36vmax;height:36vmax;bottom:-16vmax;right:-10vmax"></span>
+    <span class="blob blob--sage" style="width:38vmax;height:38vmax;bottom:-16vmax;left:-14vmax"></span>
   </div>
 
   <div class="wrap wrap--narrow fault__inner">
-    <!-- Состояние называется словом до того, как человек прочитает пояснение. -->
-    <span class="chip chip--static reveal">
+    <!-- Состояние называется словом до того, как человек прочтёт пояснение. -->
+    <p class="micro fault__label reveal">
       <Icon name={scene.icon} size={14} />
       {scene.label}
-    </span>
+    </p>
     <h1 class="display reveal">{scene.title}</h1>
     <p class="lead reveal" style="--reveal-delay: 90ms">{scene.problem}</p>
 
-    {#if showsAddress}
-      <Panel tone="sunk" class="reveal">
-        <p class="small muted">Вы переходили по адресу <code class="code">{pathname}</code>.</p>
-      </Panel>
-    {/if}
-
-    <Panel tone="sage" class="reveal">
-      <div class="fault__fix">
-        <p class="eyebrow"><Icon name="arrowRight" size={16} /> что сделать сейчас</p>
-        <p class="small">{scene.recovery}</p>
-        <!-- Ровно одно действие: второй ссылкой экран уводил бы человека в
-             раздумья, а не из состояния. -->
-        <div class="row fault__actions">
-          <Button variant="action" href={scene.primary.href} iconEnd="arrowRight">
-            {scene.primary.label}
-          </Button>
-        </div>
-      </div>
-    </Panel>
-
-    <!-- Код перехода и то, что назвал сервер, нужны администратору сервиса, а не
-         человеку на этой странице: они лежат свёрнутыми под «Служебные данные». -->
-    <details class="fault__tech reveal">
-      <summary class="micro">Служебные данные</summary>
-      <div class="stack fault__tech__body">
-        <p class="micro muted">Код ответа: {status}.</p>
-        {#if serverReason}
-          <p class="micro muted">Сервис назвал причину так: {serverReason}</p>
-        {:else}
-          <p class="micro muted">Сервис причину не назвал.</p>
-        {/if}
-        <p class="micro muted">
-          Эти строки передают администратору сервиса, когда переход не открывается повторно.
-        </p>
-      </div>
-    </details>
+    <div class="row fault__actions reveal" style="--reveal-delay: 140ms">
+      {#if scene.action.kind === 'back'}
+        <Button variant="action" onclick={goBack}>Вернуться назад</Button>
+      {:else}
+        <Button variant="action" href={scene.action.href}>{scene.action.label}</Button>
+      {/if}
+      {#if scene.detail}
+        <InfoDot title="Что проверить" body={scene.detail} />
+      {/if}
+    </div>
   </div>
 </div>
 
@@ -194,44 +173,17 @@
   .fault__inner {
     display: flex;
     flex-direction: column;
-    gap: var(--s5);
+    gap: var(--s4);
   }
 
   .fault__inner .display {
     max-width: 18ch;
   }
 
-  .fault__fix {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s3);
-  }
-
+  /* Действие одно, и оно стоит рядом с пояснением, а не под ним. */
   .fault__actions {
     --gap: var(--s4);
-    margin-top: var(--s1);
-  }
-
-  /* Служебные данные свёрнуты по умолчанию: код перехода и текст сервера нужны
-     администратору сервиса, а человеку на экране важно только состояние. */
-  .fault__tech {
-    align-self: flex-start;
-    max-width: var(--maxw-measure);
-  }
-
-  .fault__tech summary {
-    cursor: pointer;
-    color: var(--ink-3);
-  }
-
-  .fault__tech summary:hover {
-    color: var(--ink);
-  }
-
-  .fault__tech__body {
-    --gap: var(--s1);
+    align-items: center;
     margin-top: var(--s2);
-    padding-inline-start: var(--s3);
-    border-inline-start: 1px solid var(--line);
   }
 </style>

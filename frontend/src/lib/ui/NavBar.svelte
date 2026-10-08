@@ -3,6 +3,7 @@
   import { page } from '$app/state';
   import { goto, invalidateAll } from '$app/navigation';
   import { tick } from 'svelte';
+  import { api } from '../api';
   import { session } from '../sessionStore.svelte';
   import Icon from './Icon.svelte';
   import type { IconName } from './icons';
@@ -52,8 +53,33 @@
     seg.style.setProperty('--ind-h', `${a.height}px`);
     seg.style.setProperty('--ind-o', '1');
 
-    if (rail && rail.scrollWidth > rail.clientWidth + 2) {
-      rail.scrollLeft = a.left - s.left + rail.scrollLeft - (rail.clientWidth - a.width) / 2;
+    const railEl = rail;
+    if (railEl && railEl.scrollWidth > railEl.clientWidth + 2) {
+      const r = railEl.getBoundingClientRect();
+      // Активный раздел должен остаться видимым целиком: это коридор прокрутки.
+      const ax = a.left - r.left + railEl.scrollLeft;
+      const maxScroll = Math.max(0, railEl.scrollWidth - railEl.clientWidth);
+      const lo = Math.max(0, Math.min(ax + a.width - railEl.clientWidth, maxScroll));
+      const hi = Math.max(lo, Math.min(ax, maxScroll));
+      if (railEl.scrollLeft < lo || railEl.scrollLeft > hi) {
+        // Полоса останавливается на границе пункта, а не в середине слова:
+        // обрезанный хвост прилипает к логотипу и читается как часть названия
+        // продукта («Научный Клубок» + «ос» от «Вопрос»).
+        const current = railEl.scrollLeft;
+        const edges = [
+          0,
+          ...Array.from(railEl.querySelectorAll<HTMLElement>('.seg__item'), (el) =>
+            el.getBoundingClientRect().left - r.left + current,
+          ),
+        ];
+        const inside = edges.filter((edge) => edge >= lo && edge <= hi);
+        const chosen = inside.length
+          ? inside.reduce((best, edge) =>
+              Math.abs(edge - current) < Math.abs(best - current) ? edge : best,
+            )
+          : lo;
+        railEl.scrollLeft = chosen;
+      }
     }
   }
 
@@ -149,6 +175,7 @@
       busy = false;
     }
   }
+
 </script>
 
 <nav class="pill-nav" class:pill-nav--dock={dock} aria-label="Основная навигация" bind:this={nav}>
@@ -259,15 +286,36 @@
           <span class="flow__arrow"><Icon name="chevronRight" size={17} /></span>
         </a>
       {/each}
+
     </div>
   </Sheet>
 {/if}
 
 <style>
+  /* Бренд — живой контрол, а не подпись: на широком экране ссылка была 30 px,
+     пальцем по ней попасть нельзя. Цель поднимается геометрией, кегль текста
+     остаётся своим. Ниже 641px цель держит правило тач-целей из app.css (44px),
+     поэтому правка работает только там, где его не сработает. */
+  @media (min-width: 641px) {
+    .pill-nav__brand {
+      min-block-size: 32px;
+    }
+  }
+
   .pill-nav__account {
     position: relative;
   }
 
+  /* Телефон держит тот же закон, что и 641–1119 px: полоса разделов — одна
+     строка, которая не влезает, и она прокручивается (класс `--flow` включает
+     маску краёв, а прокрутка удерживает активный раздел в поле зрения).
+     Перенос в три строки поднимал шапку до 170 px: пятая часть экрана уходила
+     на оболочку раньше, чем человек видел содержимое раздела, и полоса
+     переставала быть той же капсулой, что на широком экране. Полный список с
+     пояснениями каждого раздела остаётся в «Разделах». */
+
+  /* Показание корпуса — pill-контрол той же природы, что и полоса: свой край,
+     свои числа моноширинные, пояснение спрятано в подсказке. */
   .pill-nav__scrim {
     position: fixed;
     inset: 0;

@@ -2,10 +2,12 @@
   import { onMount } from 'svelte';
   import { goto, invalidateAll } from '$app/navigation';
   import { page } from '$app/state';
+  import { NAV_LINKS } from '$lib/nav';
   import { session } from '$lib/sessionStore.svelte';
   import { api, ApiError } from '$lib/api';
   import Button from '$lib/ui/Button.svelte';
   import Field from '$lib/ui/Field.svelte';
+  import InfoDot from '$lib/ui/InfoDot.svelte';
   import Notice from '$lib/ui/Notice.svelte';
 
   // Открытого редиректа не будет: принимаем только внутренний путь. `//host` и
@@ -55,6 +57,9 @@
       }
     })();
   });
+
+  // Названия разделов берутся из того же списка, что и навигация: регистрация не
+  // имеет права учить одному языку, а рабочее пространство называть иначе.
 
   // Ссылка на вход сохраняет куда идти после входа, если путь задан в ?next=.
   const loginHref = $derived(next === '/research' ? '/login' : `/login?next=${encodeURIComponent(next)}`);
@@ -142,9 +147,8 @@
     </p>
 
     {#if volatileStorage}
-      <Notice tone="warn" title="Сервис работает без постоянного хранилища">
-        Аккаунт и история ответов проживут до перезапуска сервиса. Постоянный контур настраивает
-        администратор.
+      <Notice tone="warn" title="Хранилище непостоянное">
+        Аккаунт и история ответов проживут до перезапуска сервиса.
       </Notice>
     {/if}
 
@@ -214,36 +218,39 @@
       {/if}
 
       <p class="micro muted auth__consent">
-        Регистрация означает согласие на обработку указанных вами данных: email, имени и пароля.
-        Они нужны для входа и для подписи ваших записей, других целей у сервиса нет. Вопросы по
-        данным аккаунта решает администратор.
+        Регистрация означает согласие на обработку указанных вами данных.
+        <InfoDot
+          title="Зачем сервису эти данные"
+          body="Email и имя нужны для входа и для подписи ваших записей, пароль — только для входа. Других целей у них нет, письмами и уведомлениями сервис не пользуется."
+        />
       </p>
 
       <div class="row row--between">
         <Button type="submit" variant="action" {busy} disabled={busy}>
           {busy ? 'Отправляем…' : 'Создать аккаунт'}
         </Button>
-        <Button href="/login" variant="link" size="sm">Уже есть аккаунт? Войти</Button>
+        <Button href="/login" variant="link" size="sm" class="auth__switch">
+          Уже есть аккаунт? Войти
+        </Button>
       </div>
 
-      <div class="stack auth__notes">
-        <p class="small muted">
-          Сразу после регистрации открываются вопрос к корпусу, находки, карта связей, сравнение
-          технологий и расхождения.
-        </p>
-        <p class="micro muted">
-          Экспертное право на разбор предложений по ответам, журнал действий и закрытые данные
-          выдаёт администратор сервиса.
-        </p>
-      </div>
+      <p class="small muted auth__rooms">
+        После регистрации будут доступны рабочие разделы по вашему аккаунту.
+      </p>
+      <p class="micro muted auth__gate">
+        Экспертное право на разбор предложений по ответам выдаёт администратор сервиса.
+      </p>
     </form>
   </div>
 </div>
 
 <style>
   /* Центрирование и высоту даёт page--cover; здесь только свои отступы. */
+  /* Верхний отступ обязан учитывать измеренную высоту шапки: собственное
+     значение .auth перебивало зазор .page, и заголовок регистрации
+     ложился под плавающую навигацию. */
   .auth {
-    padding-block: var(--s6) var(--s8);
+    padding-block: calc(var(--topbar-h) + var(--s6)) var(--s8);
   }
 
   .auth__inner {
@@ -276,13 +283,30 @@
     border-top: 1px solid var(--line);
   }
 
-  .auth__notes {
-    --gap: var(--s2);
+  .auth__rooms,
+  .auth__gate {
     max-width: var(--maxw-measure);
+  }
+
+  /* Оговорка об экспертном праве звучит на экране одна: она стоит последней
+     строкой под действиями. */
+  .auth__gate {
+    padding-top: var(--s3);
+    border-top: 1px solid var(--line);
+    color: var(--ink-3);
   }
 
   .notice__actions {
     --gap: var(--s4);
     margin-top: var(--s2);
+  }
+
+  /* Ссылка-действие рядом с кнопкой регистрации: цель нажатия 32 px берётся
+     геометрией контрола, кегль остаётся micro. На узком экране и под пальцем
+     цель держит общее правило тач-целей (44 px) из app.css. */
+  @media (min-width: 641px) {
+    :global(a.auth__switch) {
+      min-block-size: 32px;
+    }
   }
 </style>

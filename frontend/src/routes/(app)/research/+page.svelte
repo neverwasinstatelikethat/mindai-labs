@@ -11,50 +11,21 @@
     type HistoryResult,
     type RunFailure,
     type SheetNotice,
-    type TrailStep,
   } from '$lib/ChatPanel.svelte';
   import { num } from '$lib/format';
-  import { navLabel } from '$lib/nav';
   import Notice from '$lib/ui/Notice.svelte';
-  import SectionHead from '$lib/ui/SectionHead.svelte';
   import { page } from '$app/state';
   import { session } from '$lib/sessionStore.svelte';
-  import { FAILURE_WORDS, RESEARCH_HEAD, RUN_FAILURES } from '$lib/terms';
+  import { FAILURE_WORDS, RUN_FAILURES } from '$lib/terms';
   import type { RunFailureKind } from '$lib/terms';
-  import type { AgentEvent, AnswerPayload, CorpusStats } from '$lib/types';
-
-  // Поток отдаёт шаг как есть; отсутствие поля — это отсутствие данных, а не
-  // «completed», «узел» и ноль миллисекунд.
-  interface StreamStep {
-    agent?: string | null;
-    status?: string | null;
-    message?: string | null;
-    duration_ms?: number | null;
-  }
+  import type { AnswerPayload } from '$lib/types';
 
   interface StreamEvent {
     type: string;
     question?: string;
-    step?: StreamStep;
     answer?: AnswerPayload;
     code?: string;
     message?: string;
-  }
-
-  const STEP_STATES: readonly AgentEvent['status'][] = ['started', 'completed', 'revised', 'failed'];
-
-  function realStatus(value: string | null | undefined): AgentEvent['status'] | null {
-    return STEP_STATES.find((state) => state === value) ?? null;
-  }
-
-  function normalizeStep(step: StreamStep): TrailStep {
-    const duration = step.duration_ms;
-    return {
-      agent: step.agent?.trim() || null,
-      status: realStatus(step.status),
-      message: step.message?.trim() || null,
-      duration_ms: typeof duration === 'number' && Number.isFinite(duration) ? duration : null,
-    };
   }
 
   // Вопрос со входа в раздел (/research?q=…): читаем один раз при открытии
@@ -70,39 +41,22 @@
   // прежний ответ сходит с экрана, только когда пришёл новый или когда человек
   // убрал его сам кнопкой.
   let delivered = false;
-  let steps = $state<TrailStep[]>([]);
-  let elapsedMs = $state(0);
   let failure = $state<RunFailure | null>(null);
-  let corpus = $state<CorpusStats | null>(null);
-  let corpusState = $state<'loading' | 'ready' | 'error'>('loading');
-  let examples = $state<string[]>([]);
   // Отдельное состояние для эталонных вопросов: пустой набор и непрогруженный
   // канал — разные экраны, и «повторить» должно чинить именно канал.
-  let examplesState = $state<'loading' | 'ready' | 'error'>('loading');
   let openClaimId = $state<string | null>(null);
   let focusKey = $state<string | null>(null);
-  let busy = $state<'correction' | 'feedback' | 'export' | 'import' | null>(null);
+  let busy = $state<'feedback' | 'export' | 'import' | null>(null);
   let notice = $state<SheetNotice | null>(null);
 
   let controller: AbortController | null = null;
-  let ticker: ReturnType<typeof setInterval> | null = null;
-  let startedAt = 0;
 
   const canAsk = $derived(session.can('query:ask'));
 
   // ── Формат ──────────────────────────────────────────────────────────────
-  // Числа — через общий `num` из `$lib/format`: локальная копия расходилась с
-  // остальными экранами в разрядах и показывала «1,234» там, где другие давали
-  // «1,23».
-
-  function seconds(ms: number): string {
-    return `${(ms / 1000).toFixed(1)} с`;
-  }
-
-  function shortCode(value: string | null | undefined, size = 8): string {
-    if (!value) return '—';
-    return value.slice(0, size);
-  }
+  // Числа и длительности — через общие `num` и `duration` из `$lib/format`:
+  // локальная копия расходилась с остальными экранами в разрядах и показывала
+  // «1,234» там, где другие давали «1,23».
 
   function reasonText(reason: unknown, fallback: string): string {
     if (reason instanceof TypeError) return fallback;
@@ -111,11 +65,6 @@
   }
 
   // ── Сборка ответа: SSE поверх прокси /backend ────────────────────────────
-
-  function stopTimer(): void {
-    if (ticker) clearInterval(ticker);
-    ticker = null;
-  }
 
   function applyAnswer(payload: AnswerPayload): void {
     delivered = true;
@@ -225,17 +174,10 @@
     question = asked;
     running = true;
     delivered = false;
-    steps = [];
     failure = null;
     notice = null;
     focusKey = null;
     openClaimId = null;
-    elapsedMs = 0;
-    startedAt = Date.now();
-    stopTimer();
-    ticker = setInterval(() => {
-      elapsedMs = Date.now() - startedAt;
-    }, 100);
 
     controller = new AbortController();
     const signal = controller.signal;
@@ -291,8 +233,6 @@
           }
           if (event.type === 'start' && event.question) {
             question = event.question;
-          } else if (event.type === 'step' && event.step) {
-            steps = [...steps, normalizeStep(event.step)];
           } else if (event.type === 'answer' && event.answer) {
             applyAnswer(event.answer);
           } else if (event.type === 'error') {
@@ -312,15 +252,13 @@
       if (signal.aborted) {
         failure = {
           ...RUN_FAILURES.stopped,
-          detail: `Вы остановили сборку ответа на ${seconds(elapsedMs)}: готового текста нет.`,
+          detail: 'Ответ остановлен. Готовый текст не получен.',
           question: asked,
         };
       } else {
         failure = failureOf('dropped', asked, reasonText(reason, ''));
       }
     } finally {
-      stopTimer();
-      elapsedMs = Date.now() - startedAt;
       running = false;
       controller = null;
     }
@@ -335,89 +273,13 @@
   function clearAnswer(): void {
     answer = null;
     question = '';
-    steps = [];
     failure = null;
     notice = null;
     focusKey = null;
     openClaimId = null;
-    elapsedMs = 0;
   }
 
-  // ── Правки, отзывы, выгрузка, импорт, версии ────────────────────────────
-
-  async function sendCorrection(input: {
-    finding: AnswerPayload['findings'][number];
-    comment: string;
-    correction: string;
-  }): Promise<boolean> {
-    if (!answer) return false;
-    busy = 'correction';
-    try {
-      // finding_id обязателен: supersede срабатывает только при
-      // verdict='correct' вместе с finding_id и correction.
-      const result = await api.feedback({
-        query_id: answer.query_id,
-        finding_id: input.finding.id,
-        verdict: 'correct',
-        comment: input.comment,
-        correction: input.correction,
-      });
-      // Предложение генерирует модель: без живого LLM правка всё равно записана,
-      // и об этом надо сказать прямо, а не ссылаться на несуществующее предложение.
-      const version = result.superseded?.version;
-      const proposalLine = result.proposal
-        ? 'предложение на проверку поставлено'
-        : 'модель предложение не сформировала, записано только решение';
-      notice = {
-        kind: 'ok',
-        title: 'Правка принята',
-        detail: `Тезис получил${version != null ? ` версию ${version}` : ' новую версию'}, ${proposalLine}. Решение видно в разделе «${navLabel('/feedback')}», отменить правку отсюда нельзя.`,
-      };
-      return true;
-    } catch (reason) {
-      notice = {
-        kind: 'error',
-        title: 'Правка не отправлена',
-        detail: `${reasonText(reason, 'Не удалось отправить правку.')} Введённый текст сохранён: отправьте правку ещё раз, если сервис не принял её.`,
-      };
-      return false;
-    } finally {
-      busy = null;
-    }
-  }
-
-  async function sendFeedback(input: {
-    verdict: 'accept' | 'reject';
-    comment: string;
-  }): Promise<boolean> {
-    if (!answer) return false;
-    busy = 'feedback';
-    try {
-      const result = await api.feedback({
-        query_id: answer.query_id,
-        finding_id: null,
-        verdict: input.verdict,
-        comment: input.comment,
-      });
-      notice = {
-        kind: 'ok',
-        title: 'Отзыв записан',
-        detail: result.proposal
-          ? 'Отзыв сохранён, предложение поставлено на проверку.'
-          : 'Отзыв сохранён, но предложение не сформировано: решение записано без него.',
-      };
-      return true;
-    } catch (reason) {
-      notice = {
-        kind: 'error',
-        title: 'Отзыв не отправлен',
-        detail: `${reasonText(reason, 'Не удалось отправить отзыв.')} Введённый текст сохранён: повторите отправку.`,
-      };
-      return false;
-    } finally {
-      busy = null;
-    }
-  }
+  // ── Отзывы, выгрузка, импорт, версии ────────────────────────────────────
 
   async function exportAnswer(format: 'markdown' | 'json-ld'): Promise<boolean> {
     // В файл уходит серверная копия ответа по query_id: присланный клиентом
@@ -428,7 +290,9 @@
       const response = await api.export(answer.query_id, format);
       const blob = await response.blob();
       const href = URL.createObjectURL(blob);
-      const filename = `klubok-${shortCode(answer.query_id)}.${format === 'markdown' ? 'md' : 'jsonld'}`;
+      // Идентификатор ответа живёт в имени файла, а не в строке на экране:
+      // Пользователь видит сообщение о результате, а не внутренние поля ответа.
+      const filename = `klubok-${answer.query_id || 'otvet'}.${format === 'markdown' ? 'md' : 'jsonld'}`;
       const link = document.createElement('a');
       link.href = href;
       link.download = filename;
@@ -439,7 +303,7 @@
       notice = {
         kind: 'ok',
         title: 'Файл выгружен',
-        detail: `${filename}, ${num(Math.round(blob.size / 1024))} КиБ: тот же ответ, что на экране.`,
+        detail: `${format === 'markdown' ? 'Markdown' : 'JSON-LD'}, ${num(Math.round(blob.size / 1024))} КиБ: тот же ответ, что на экране.`,
       };
       return true;
     } catch (reason) {
@@ -458,14 +322,6 @@
     busy = 'import';
     try {
       const receipt = await api.upload(file);
-      // Показания корпуса опрашиваем отдельно: отказ второго вызова не должен
-      // притворяться отказом импорта — документ сервер уже принял.
-      try {
-        corpus = await api.corpusStats();
-        corpusState = 'ready';
-      } catch {
-        corpusState = 'error';
-      }
       // Хвост документа за бюджетом разбора обязано быть помечено: число находок
       // из неполного разбора не выдаётся за полное.
       const tail = receipt.prompt_truncated
@@ -499,41 +355,9 @@
     }
   }
 
-  // ── Показания корпуса и готовые вопросы при входе на экран ───────────────
-
-  async function loadExamples(): Promise<void> {
-    examplesState = 'loading';
-    try {
-      const gold = await api.goldCases();
-      // Три готовых вопроса — подсказка, а не витрина: весь перечень остаётся
-      // в разделе оценки.
-      examples = gold.slice(0, 3).map((item) => item.question);
-      examplesState = 'ready';
-    } catch {
-      examples = [];
-      examplesState = 'error';
-    }
-  }
-
-  async function preflight(): Promise<void> {
-    const [statsResult] = await Promise.allSettled([api.corpusStats(), loadExamples()]);
-    if (statsResult.status === 'fulfilled') {
-      corpus = statsResult.value;
-      corpusState = 'ready';
-    } else {
-      corpus = null;
-      corpusState = 'error';
-    }
-  }
-
-  $effect(() => {
-    void preflight();
-  });
-
   // Поток переживает переход по маршрутам только пока экран смонтирован.
   $effect(() => {
     return () => {
-      stopTimer();
       controller?.abort();
     };
   });
@@ -544,8 +368,8 @@
 </svelte:head>
 
 <div class="page research">
-  <div class="wrap">
-    <SectionHead level="1" title={RESEARCH_HEAD.title} lead={RESEARCH_HEAD.lead} />
+  <div class="wrap stack">
+    <h1 class="sr-only">Чат</h1>
 
     {#if !session.signedIn}
       <p class="micro research__session">
@@ -575,13 +399,7 @@
       {answer}
       {question}
       {running}
-      {steps}
-      {elapsedMs}
       error={failure}
-      {corpus}
-      {corpusState}
-      {examples}
-      {examplesState}
       {openClaimId}
       {focusKey}
       {busy}
@@ -592,13 +410,10 @@
       onstop={stop}
       onselect={(id) => (openClaimId = id)}
       onfocus={(key) => (focusKey = key)}
-      oncorrection={sendCorrection}
-      onfeedback={sendFeedback}
       onexport={exportAnswer}
       onimport={importDocument}
       onnotice={(value) => (notice = value)}
       onhistory={loadHistory}
-      onexamples={loadExamples}
     />
   </div>
 </div>
@@ -612,6 +427,11 @@
 
   .research > .wrap {
     padding-top: var(--s4);
+  }
+
+  .research > .wrap--bleed :global(.ask) {
+    max-width: 58rem;
+    margin-inline: 0;
   }
 
   .research__session {

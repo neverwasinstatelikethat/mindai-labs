@@ -25,18 +25,15 @@
   // Карта связей читается за два хода.
   //
   // 1. Обзор областей: названные множества связанных записей (их считает
-  //    сервер, числа берутся из этого же среза). Показывать граф целиком
-  //    нельзя: реальным корпусом считаются сотни источников, и поле на N
-  //    тысяч записей не читается ни при какой раскладке. Поэтому уровень поля
-  //    ограничен по построению: на нём всегда лежит одна названная область,
-  //    входа «весь корпус» у экрана нет. Обзор отвечает на вопрос «где искать»
-  //    и остаётся одного размера при любом корпусе.
-  // 2. Цепочки выбранной области: три колонки по роли записи. Порядок колонок
-  //    повторяет трассу доверия продукта («откуда известно», «что заявлено»,
-  //    «о чём говорят»), и из него следует главное: почти каждое отношение
-  //    связывает соседние колонки, то есть пересекает ровно один промежуток.
-  //    Длинных диагоналей через всё поле, из-за которых граф распадался в
-  //    клубок, при такой раскладке не бывает.
+  //    сервер, числа берутся из этого же среза). Уровня «весь корпус» у экрана
+  //    нет ни по клику, ни с клавиатуры, ни по ссылке: на поле всегда лежит
+  //    одна названная область. Поиск по названиям записей стоит прямо на
+  //    обзоре и ведёт в область найденной записи.
+  // 2. Цепочки выбранной области: три колонки по роли записи — Источники,
+  //    Утверждения, Сущности (единственный словарь колонок, см. terms/map.ts).
+  //    Из порядка колонок следует главное: почти каждое отношение связывает
+  //    соседние колонки, то есть пересекает ровно один промежуток. Длинных
+  //    диагоналей через всё поле при такой раскладке не бывает.
   //
   // Запись — строка с полным названием, связь — линия с остриём у цели и
   // русским именем на линии. Якоря линий измеряются в живом DOM, а не
@@ -48,17 +45,23 @@
   // содержимым, прокрутку ведёт документ. Плотность регулируется областью,
   // отбором и «Показать ещё».
   //
-  // Текстовое чтение обязательно и не зависит от поля: связи строки печатаются
-  // списком под ней на узком экране, а на широком все связи области читаются
-  // списком под полем, где техническое имя стоит подписью под русским.
-  // Клавиатура: Tab по строкам обычного потока и по списку связей, ← → между
+  // Методика (способ чтения поля, клавиатура, причина списка связей без линии)
+  // живёт за «i» (InfoDot), а не инлайн. Текстовое чтение обязательно и не
+  // зависит от поля: связи строки печатаются списком под ней на узком экране,
+  // а на широком связи без линии читаются списком под полем.
+  // Клавиатура: Tab по строкам, меткам связей и списку под полем, ← → между
   // колонками, ↑ ↓ по колонке, Home/End край колонки, Enter выбрать, Esc снять.
+  // У каждой нарисованной линии есть метка-кнопка (слово или точка), поэтому
+  // связь, доступная кликом по линии, доступна и с клавиатуры.
   import { tick } from 'svelte';
   // GraphNode уже импортирован в <script module> — то же пространство имён.
   import type { GraphEdge, GraphSnapshot } from './types';
   import { countOf, plural } from './format';
   import {
-    MAP_FIELD_NOTE,
+    MAP_INFO_AREAS,
+    MAP_INFO_FIELD,
+    MAP_INFO_KEYS,
+    MAP_INFO_STARTERS,
     MAP_LAYER_GLOSS,
     MAP_LAYER_LABELS,
     MAP_LAYER_ORDER,
@@ -66,17 +69,20 @@
     MAP_NODE_TYPE_ORDER,
     MAP_NOUN,
     MAP_OVERVIEW_TITLE,
+    MAP_SEARCH,
     MAP_UNNAMED_AREA,
+    mapAreaName,
     mapLayerOf,
     mapNodeType,
-    mapRelationKnown,
     mapRelationLabel,
+    mapSearchEmptyBody,
+    mapSearchShownOf,
     type MapLayer,
   } from './terms';
   import Button from './ui/Button.svelte';
-  import Chip from './ui/Chip.svelte';
   import Empty from './ui/Empty.svelte';
   import Icon from './ui/Icon.svelte';
+  import InfoDot from './ui/InfoDot.svelte';
   import StatusPill from './ui/StatusPill.svelte';
 
   interface Props {
@@ -86,23 +92,38 @@
     edgeId?: string;
     /** Узкий экран измеряет страница: второго matchMedia на карте нет. */
     narrow?: boolean;
+    /**
+     * Плотность подписей на линиях: `focus` — имена только у выбранной записи,
+     * `all` — на всём поле. Экран задаёт её подписанным control-элементом.
+     */
+    labelMode?: 'all' | 'focus';
     onselect?: (node: GraphNode | null) => void;
     onpickEdge?: (edge: GraphEdge | null) => void;
   }
 
-  // Совпадение в поиске читается одинаково на поле, в списке и в счётчике,
-  // чтобы «найдено» и «показано» не расходились.
+  // Совпадение в поиске и в фильтре читается одинаково на поле, в списке и в
+  // счётчике. Ищут только человеческие названия: код записи и сырой ключ типа
+  // в совпадении не участвуют.
   function searchHit(node: GraphNode, q: string): boolean {
     if (!q) return false;
     return (
       node.label.toLowerCase().includes(q) ||
-      node.id.toLowerCase().includes(q) ||
-      node.type.toLowerCase().includes(q) ||
       mapNodeType(node.type).toLowerCase().includes(q)
     );
   }
 
-  let { graph, selectedId, edgeId, narrow = false, onselect, onpickEdge }: Props = $props();
+  let {
+    graph,
+    selectedId,
+    edgeId,
+    narrow = false,
+    labelMode = 'focus',
+    onselect,
+    onpickEdge,
+  }: Props = $props();
+
+  /** Подписи на всех линиях или только у выбранной записи: режим задаёт экран. */
+  const labelsAll = $derived(labelMode === 'all');
 
   // ── Правила поля ────────────────────────────────────────────────────────
   /**
@@ -121,13 +142,10 @@
   const MARK_GAP = 26;
   /** Смещение параллельных связей между одной парой записей. */
   const FAN = 9;
-  /** Больше этого числа подписей не печатаем: поле начинает читаться с трудом. */
-  const MARK_LIMIT = 36;
+  /** Сколько строк поиска на обзоре показано; остальное называется числом. */
+  const FIND_WINDOW = 40;
 
   const LAYER_INDEX: Record<MapLayer, number> = { source: 0, claim: 1, entity: 2 };
-
-  const nf = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 3 });
-  const fmt = (v: number): string => nf.format(v);
 
   // ── Состояние ───────────────────────────────────────────────────────────
   let level = $state<'overview' | 'chain'>('overview');
@@ -138,9 +156,12 @@
    * экрана нет ни по клику, ни с клавиатуры, ни по ссылке.
    */
   let chosenArea = $state('');
-  /** Набросок поиска: в отбор уходит после паузы ввода, а не на каждый символ. */
+  /** Набросок фильтра цепочек: в отбор уходит после паузы ввода, а не на каждый символ. */
   let queryDraft = $state('');
   let query = $state('');
+  /** Набросок поиска на обзоре: та же пауза, свой запрос. */
+  let findDraft = $state('');
+  let findQuery = $state('');
   let hiddenTypes = $state<Set<string>>(new Set());
   let cap = $state(PAGE);
   let cardsCap = $state(CARD_PAGE);
@@ -167,6 +188,8 @@
     x: number;
     y: number;
     text: string;
+    /** Печатать ли слово на метке, или оставить только точку связи. */
+    word: boolean;
     picked: boolean;
     dim: boolean;
   }
@@ -175,10 +198,9 @@
   let marks = $state<Mark[]>([]);
 
   // ── Разбор карты ────────────────────────────────────────────────────────
-  /** Область записи: серверная метка либо названная группа без метки. */
+  /** Область записи: человеческое имя с сервера либо «Область без названия». */
   function areaOf(node: GraphNode): string {
-    const raw = node.metadata['community'];
-    return typeof raw === 'string' && raw.trim() !== '' ? raw : MAP_UNNAMED_AREA;
+    return mapAreaName(node.metadata['community']);
   }
 
   const nodeById = $derived(new Map(graph.nodes.map((n) => [n.id, n])));
@@ -282,13 +304,27 @@
       .map((node) => ({ node, links: degree.get(node.id) ?? 0 })),
   );
 
+  // ── Поиск на обзоре ─────────────────────────────────────────────────────
+  /** Результат поиска: записи всей загруженной карты по совпадению названия. */
+  const findMatches = $derived.by<GraphNode[]>(() => {
+    const q = findQuery.trim().toLowerCase();
+    if (q === '') return [];
+    return graph.nodes.filter((node) => searchHit(node, q));
+  });
+  const findShown = $derived(findMatches.slice(0, FIND_WINDOW));
+
+  function clearFind(): void {
+    findDraft = '';
+    findQuery = '';
+  }
+
   // ── Отбор поля ──────────────────────────────────────────────────────────
   function matches(node: GraphNode, q: string): boolean {
     if (hiddenTypes.has(node.type)) return false;
     return !q || searchHit(node, q);
   }
 
-  /** Цепочка выбранной записи: она и есть то, что ограничивает чип. */
+  /** Цепочка выбранной записи ограничивает видимую область карты. */
   const chainIds = $derived.by<Set<string> | null>(() => {
     if (!chainOnly || !selectedNode) return null;
     const ids = new Set<string>([selectedNode.id]);
@@ -296,7 +332,7 @@
     return ids;
   });
 
-  /** Записи выбранной области до поиска: из них же строятся чипы видов. */
+  /** Записи выбранной области до поиска: из них же строятся фильтры видов. */
   const areaNodes = $derived.by<GraphNode[]>(() =>
     graph.nodes.filter(
       (node) => areaOf(node) === activeArea && (!chainIds || chainIds.has(node.id)),
@@ -538,7 +574,6 @@
     const fan = new Map<string, number>();
     const rows: Link[] = [];
     const pending: { edge: GraphEdge; gutter: number; x: number; y: number }[] = [];
-    const wantAllMarks = edgeSplit.drawn.length <= MARK_LIMIT;
 
     for (const edge of edgeSplit.drawn) {
       const from = pos.get(edge.source);
@@ -569,9 +604,10 @@
         dim: selectedNode != null && !incident.has(edge.id),
       });
 
-      if (wantAllMarks || incident.has(edge.id) || edge.id === edgeId) {
-        pending.push({ edge, gutter, x: (x0 + x1) / 2, y: (y0 + y1) / 2 });
-      }
+      // Метка есть у каждой нарисованной линии: это и точка входа в связь для
+      // клавиатуры (линия кликабельна, но не фокусируема), и место русского
+      // имени. Без слова метка остаётся маленькой точкой.
+      pending.push({ edge, gutter, x: (x0 + x1) / 2, y: (y0 + y1) / 2 });
     }
 
     // Подписи раздвигаются по вертикали внутри своего промежутка: две связи
@@ -590,6 +626,13 @@
           x: row.x,
           y,
           text: labelFor(row.edge),
+          // Слово печатается только про выбранную запись (или на всей карте,
+          // если человек сам попросил): подписи на каждой линии плотного поля
+          // мешают найти то, ради чего на карту заходили.
+          word:
+            labelsAll ||
+            row.edge.id === edgeId ||
+            (selectedNode != null && incident.has(row.edge.id)),
           picked: row.edge.id === edgeId,
           // Подпись гаснет вместе со своей линией: иначе выбранный узел
           // тонет в ярком тумане чужих отношений.
@@ -611,6 +654,9 @@
       selectedId ?? '',
       edgeId ?? '',
       edgeSplit.drawn.length,
+      // Подписи печатает measure(): без переключения в ключе поле не перечитает
+      // свои же метки, когда человек попросит имена на всех линиях.
+      labelMode,
     ].join('#'),
   );
 
@@ -634,13 +680,21 @@
   });
 
   /**
-   * Поиск пересобирает поле не на каждый символ: без паузы каждое нажатие
-   * перекладывало набор строк под курсором.
+   * Поиск и фильтр пересобирают списки не на каждый символ: без паузы каждое
+   * нажатие перекладывало набор строк под курсором.
    */
   $effect(() => {
     const draft = queryDraft;
     const timer = setTimeout(() => {
       query = draft;
+    }, 250);
+    return () => clearTimeout(timer);
+  });
+
+  $effect(() => {
+    const draft = findDraft;
+    const timer = setTimeout(() => {
+      findQuery = draft;
     }, 250);
     return () => clearTimeout(timer);
   });
@@ -892,8 +946,11 @@
     <!-- Уровень 1: где искать. Экран остаётся одного размера и на 6 записях,
          и на 6 тысячах: дальше идут области, а не весь граф. -->
     <div class="map__head">
-      <h2 class="h4">{MAP_OVERVIEW_TITLE}</h2>
-      <p class="micro muted">{MAP_FIELD_NOTE}</p>
+      <!-- Методика деления на области живёт за «i»: заголовок остаётся
+           заголовком, а не подзаголовком о себе. -->
+      <h2 class="h4 row">{MAP_OVERVIEW_TITLE}
+        <InfoDot title={MAP_INFO_AREAS.title} body={MAP_INFO_AREAS.body} />
+      </h2>
     </div>
 
     <ul class="cards">
@@ -910,7 +967,7 @@
                 {plural(card.claims, MAP_NOUN.claim.one, MAP_NOUN.claim.few, MAP_NOUN.claim.many)}
               </span>
               <span>
-                <span class="num">{card.sources}</span> источников
+                {countOf(card.sources, MAP_NOUN.source.one, MAP_NOUN.source.few, MAP_NOUN.source.many)}
               </span>
               <span>
                 <span class="num">{card.entities}</span>
@@ -943,11 +1000,9 @@
     {/if}
 
     <div class="map__head map__head--sub">
-      <h2 class="h4">Крупнейшие записи карты</h2>
-      <p class="micro muted">
-        Записи с наибольшим числом связей: у них самая длинная цепочка, и вход в
-        свою область идёт прямо отсюда.
-      </p>
+      <h2 class="h4 row">Крупнейшие записи карты
+        <InfoDot title={MAP_INFO_STARTERS.title} body={MAP_INFO_STARTERS.body} />
+      </h2>
     </div>
     <ul class="starters">
       {#each starters as row (row.node.id)}
@@ -975,10 +1030,10 @@
         {/if}
         <h2 class="h4 map__path-name">{activeArea}</h2>
         <p class="micro muted map__path-count">
-          <span class="num">
+          в отборе <span class="num">
             {countOf(filtered, MAP_NOUN.record.one, MAP_NOUN.record.few, MAP_NOUN.record.many)}
           </span>
-          в отборе
+          из <span class="num">{countOf(areaNodes.length, MAP_NOUN.record.one, MAP_NOUN.record.few, MAP_NOUN.record.many)}</span>
         </p>
       </nav>
 
@@ -988,18 +1043,23 @@
           type="search"
           class="input"
           bind:value={queryDraft}
-          placeholder="название, вид или код записи"
-          aria-label="Найти запись в этой области по названию, виду или коду"
+          placeholder={MAP_SEARCH.filterPlaceholder}
+          aria-label={MAP_SEARCH.filterLabel}
         />
       </div>
 
       {#if legend.length > 0}
         <div class="map__types" role="group" aria-label="Виды записей на поле">
           {#each legend as item (item.type)}
-            <Chip pressed={item.on} title={item.type} onclick={() => toggleType(item.type)}>
+            <Button
+              size="sm"
+              variant={item.on ? 'ink' : 'quiet'}
+              current={item.on}
+              onclick={() => toggleType(item.type)}
+            >
               {item.label}
               <span class="num">{item.count}</span>
-            </Chip>
+            </Button>
           {/each}
         </div>
       {/if}
@@ -1031,9 +1091,9 @@
             в этой области
           </p>
           <div class="row">
-            <Chip pressed={chainOnly} onclick={toggleChain}>
+            <Button variant={chainOnly ? 'ink' : 'quiet'} current={chainOnly} onclick={toggleChain}>
               {chainOnly ? 'Показать всю область' : 'Показать только цепочку'}
-            </Chip>
+            </Button>
             <Button href="#evidence" variant="quiet" size="sm">К доказательствам</Button>
             <Button variant="ghost" size="sm" onclick={() => select(null)}>Снять выбор</Button>
           </div>
@@ -1101,7 +1161,7 @@
               <header class="chain-col__head">
                 <h3 class="h4">{column.label}</h3>
                 <p class="chain-col__count micro muted">
-                  на поле <span class="num">{column.rows.length}</span>
+                  показано <span class="num">{column.rows.length}</span>
                   {#if column.rest > 0}
                     из <span class="num">{column.rows.length + column.rest}</span>
                   {/if}
@@ -1142,9 +1202,9 @@
                             MAP_NOUN.link.many,
                           )}
                         </span>
-                        <span class="micro muted">
-                          уверенность <span class="num">{fmt(node.confidence)}</span>
-                        </span>
+                        <!-- Дробную уверенность модели на строке поля не печатают:
+                             у неё нет калиброванного смысла, она читается за «i»
+                             в инспекторе вместе с оговоркой о её происхождении. -->
                         {#if node.data_class !== 'public'}
                           <StatusPill status={classOf(node).pill} label={classOf(node).ru} />
                         {/if}
@@ -1168,9 +1228,6 @@
                               <span class="chain-rel__to">
                                 ведёт к: {rowOf(edge.target)?.label ?? 'запись вне поля'}
                               </span>
-                              {#if !mapRelationKnown(edge.relation)}
-                                <code class="tech">{edge.relation}</code>
-                              {/if}
                             </button>
                           </li>
                         {/each}
@@ -1186,9 +1243,6 @@
                               <span class="chain-rel__to">
                                 исходит от: {rowOf(edge.source)?.label ?? 'запись вне поля'}
                               </span>
-                              {#if !mapRelationKnown(edge.relation)}
-                                <code class="tech">{edge.relation}</code>
-                              {/if}
                             </button>
                           </li>
                         {/each}
@@ -1222,11 +1276,12 @@
                 class="chain-mark"
                 class:chain-mark--on={mark.picked}
                 class:chain-mark--dim={mark.dim}
+                class:chain-mark--dot={!mark.word}
                 aria-pressed={mark.picked}
                 aria-label="Связь «{mark.text}»: «{nodeById.get(mark.edge.source)?.label ?? 'запись вне поля'}» ведёт к «{nodeById.get(mark.edge.target)?.label ?? 'запись вне поля'}»"
                 style="left: {mark.x.toFixed(1)}px; top: {mark.y.toFixed(1)}px"
                 onclick={() => pick(mark.edge)}
-              >{mark.text}</button>
+              >{mark.word ? mark.text : ''}</button>
             {/each}
           </div>
         {/if}
@@ -1315,9 +1370,8 @@
           </summary>
           <div class="acc__body">
             <p class="micro muted">
-              На линию встаёт только отношение между соседними колонками. Здесь
-              перечислены остальные связи области: каждая строка выбирается и
-              читается в инспекторе вместе с техническим именем.
+              На линию встаёт только отношение между соседними колонками: здесь
+              остальные связи области.
             </p>
             <ul class="map__other-list">
               {#each shownLinks as edge (edge.id)}
@@ -1332,9 +1386,6 @@
                     onclick={() => pick(edge)}
                   >
                     <span>{labelFor(edge)}, ведёт к</span>
-                    {#if !mapRelationKnown(edge.relation)}
-                      <code class="tech">{edge.relation}</code>
-                    {/if}
                   </button>
                   <button type="button" class="map__jump" onclick={() => select(rowOf(edge.target))}>
                     {rowOf(edge.target)?.label ?? 'запись вне поля'}
@@ -1360,28 +1411,18 @@
       {/if}
 
       <div class="map__legend">
-        <p class="micro muted">
-          Колонка это роль записи, строка сама запись, линия отношение. Остриё
-          смотрит в цель, имя отношения стоит на линии, техническое имя связи
-          читается в списке под полем.
-        </p>
-        <details class="map__tech">
-          <summary class="micro">Как читать поле и клавиатура</summary>
-          <dl class="kv map__keys">
-            <dt>Tab</dt>
-            <dd>по строкам поля и по списку связей</dd>
-            <dt>Стрелки влево и вправо</dt>
-            <dd>между колонками</dd>
-            <dt>Стрелки вверх и вниз</dt>
-            <dd>по колонке</dd>
-            <dt>Home и End</dt>
-            <dd>первая и последняя строка колонки</dd>
-            <dt>Enter</dt>
-            <dd>выбрать запись</dd>
-            <dt>Esc</dt>
-            <dd>снять выбор</dd>
-          </dl>
-        </details>
+        <!-- Способ чтения поля и клавиатура стоят за «i»: инлайн-методика не
+             спорит с полем за внимание. -->
+        <InfoDot title={MAP_INFO_FIELD.title} body={MAP_INFO_FIELD.body}>
+          {#snippet children()}
+            <dl class="kv map__keys">
+              {#each MAP_INFO_KEYS as key (key.key)}
+                <dt>{key.key}</dt>
+                <dd>{key.action}</dd>
+              {/each}
+            </dl>
+          {/snippet}
+        </InfoDot>
       </div>
     {/if}
   {/if}
@@ -1404,11 +1445,6 @@
      подписью даёт только gap области. */
   .map__head h2 {
     margin: 0;
-  }
-
-  .map__head p {
-    margin: 0;
-    max-width: 68ch;
   }
 
   .map__head--sub {
@@ -1769,10 +1805,6 @@
     flex-wrap: wrap;
   }
 
-  .chain-row__meta .num {
-    font-family: var(--font-data);
-  }
-
   .chain-item--on .chain-row {
     border-color: var(--action-ink);
     box-shadow: 0 0 0 1px var(--action-ink), var(--shadow-lift);
@@ -1867,6 +1899,39 @@
   .chain-mark:hover {
     color: var(--ink);
     border-color: var(--line-strong);
+  }
+
+  /* Метка без слова: точка на линии. Доступ к связи не прячется у зрения.
+     Цель остаётся 20x20, видимый кружок рисует псевдоэлемент. */
+  .chain-mark--dot {
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    max-width: 20px;
+    padding: 0;
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .chain-mark--dot::after {
+    content: '';
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--edge);
+  }
+
+  .chain-mark--dot:hover,
+  .chain-mark--dot:focus-visible {
+    border-color: var(--line-strong);
+    background: var(--surface);
+  }
+
+  .chain-mark--dot.chain-mark--on {
+    border-color: var(--line-strong);
+    background: var(--surface);
   }
 
   .chain-mark--on {
@@ -1972,10 +2037,6 @@
     box-shadow: inset 0 0 0 1px var(--action-ink);
   }
 
-  .map__word .tech {
-    color: var(--ink-3);
-  }
-
   .map__jump {
     border: 0;
     border-radius: var(--r-xs);
@@ -1996,21 +2057,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--s2);
-  }
-
-  .map__legend p {
-    margin: 0;
-    max-width: 68ch;
-  }
-
-  .map__tech {
-    border-top: 1px solid var(--line-soft);
-    padding-top: var(--s3);
-  }
-
-  .map__tech summary {
-    cursor: pointer;
-    color: var(--ink-3);
   }
 
   /* Раскладка клавиатуры читается парами «клавиша, действие»: список, а не
@@ -2077,10 +2123,6 @@
     display: block;
     min-width: 0;
     overflow-wrap: break-word;
-  }
-
-  .chain-rel .tech {
-    display: block;
   }
 
   @media (max-width: 900px) {

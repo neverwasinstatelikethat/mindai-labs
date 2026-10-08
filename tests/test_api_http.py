@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import socket
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
@@ -1737,6 +1738,46 @@ def test_storage_reads_run_on_the_named_bounded_pool() -> None:
     assert sample("mindai_storage_pool_threads", {"state": "in_flight"}) == 0
     assert sample("mindai_storage_pool_threads", {"state": "queued"}) == 0
     assert sample("mindai_storage_pool_threads", {"state": "limit"}) == 3
+
+
+def test_storage_pool_forwards_arguments_to_submitted_work() -> None:
+    """Обёртка метрик не съедает аргументы: пул — default executor всего цикла.
+
+    ``set_default_executor`` ставит пул исполнителем не только для
+    ``asyncio.to_thread``. ``asyncio.to_thread`` передаёт работу уже свёрнутой в
+    ``partial`` и для обёртки с нулевым вызовом оставался рабочим путём, а вот
+    ``loop.run_in_executor`` с аргументами — нет: через него идёт сетевое
+    разрешение имён стандартной библиотеки (``getaddrinfo`` получает шесть
+    аргументов), и нулевой обёрнутый вызов ронял ``TypeError`` в любом соединении
+    с Neo4j, Elasticsearch или GigaChat. Тест держит оба пути — прямой вызов с
+    позиционными и именованными аргументами и разрешение имени.
+    """
+    from prometheus_client import REGISTRY
+
+    from scientific_tangle.api.app import _configure_storage_pool
+
+    def work(first: int, second: int, third: str) -> str:
+        return f"{first}/{second}/{third}"
+
+    async def scenario() -> tuple[str, str, list[Any]]:
+        pool = _configure_storage_pool(Settings(storage_thread_pool_size=2))
+        try:
+            loop = asyncio.get_running_loop()
+            via_executor = await loop.run_in_executor(None, work, 1, 2, "из потока")
+            via_thread = await asyncio.to_thread(work, 3, 4, third="to_thread")
+            addresses = await loop.getaddrinfo("localhost", 46617, type=socket.SOCK_STREAM)
+            return via_executor, via_thread, addresses
+        finally:
+            pool.shutdown(wait=False)
+
+    via_executor, via_thread, addresses = asyncio.run(scenario())
+
+    assert via_executor == "1/2/из потока"
+    assert via_thread == "3/4/to_thread"
+    assert addresses
+    sample = REGISTRY.get_sample_value
+    assert sample("mindai_storage_pool_threads", {"state": "in_flight"}) == 0
+    assert sample("mindai_storage_pool_threads", {"state": "queued"}) == 0
 
 
 def test_undersized_storage_pool_is_named_at_startup(

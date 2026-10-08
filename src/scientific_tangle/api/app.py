@@ -471,11 +471,11 @@ class _StorageThreadPool(ThreadPoolExecutor):
         return future
 
     @staticmethod
-    def _instrumented(fn: Callable[..., Any]) -> Callable[[], Any]:
-        def run() -> Any:
+    def _instrumented(fn: Callable[..., Any]) -> Callable[..., Any]:
+        def run(*call_args: Any, **call_kwargs: Any) -> Any:
             STORAGE_THREADS.labels(state="in_flight").inc()
             try:
-                return fn()
+                return fn(*call_args, **call_kwargs)
             finally:
                 STORAGE_THREADS.labels(state="in_flight").dec()
 
