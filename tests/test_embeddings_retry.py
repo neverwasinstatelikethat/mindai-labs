@@ -57,6 +57,9 @@ def _stub_client(
 ) -> GigaChatEmbeddingClient:
     """Клиент без сети и без конструктора GigaChat: только проверяемые поля."""
     client = GigaChatEmbeddingClient.__new__(GigaChatEmbeddingClient)
+    from scientific_tangle.config import Settings
+
+    client._settings = Settings(_env_file=None, knowledge_backend="memory")
     client._lock = threading.Lock()
     client._model = "Embeddings"
     client._dimensions = 4

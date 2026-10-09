@@ -10,8 +10,10 @@ from typing import Protocol
 import httpx
 from gigachat import GigaChat
 from gigachat.exceptions import GigaChatException
+from psycopg import Error as PsycopgError
 
 from scientific_tangle.config import Settings
+from scientific_tangle.services.model_slot import model_slot
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,7 @@ class GigaChatEmbeddingClient:
     def __init__(self, settings: Settings) -> None:
         if not settings.gigachat_api_key:
             raise ValueError("GIGACHAT_API_KEY обязателен для эмбеддингов")
+        self._settings = settings
         self._model = settings.gigachat_embeddings_model
         self._dimensions = settings.embedding_dimensions
         # Бюджет всех сетевых попыток одного ``_embed``: сумма таймаутов и пауз
@@ -275,7 +278,11 @@ class GigaChatEmbeddingClient:
                 # раньше одна цепочка повторов приковывала эмбеддинги всего процесса
                 # на 2+4+8 с, а вместе с ними и вопрос аналитика.
                 with self._lock:
-                    response = self._client.embeddings(payload, model=self._model)
+                    try:
+                        with model_slot(self._settings):
+                            response = self._client.embeddings(payload, model=self._model)
+                    except PsycopgError:
+                        raise EmbeddingError("Общий слот GigaChat недоступен или занят") from None
                 ordered = sorted(response.data, key=lambda item: item.index)
                 vectors = [[float(value) for value in item.embedding] for item in ordered]
                 if not vectors:

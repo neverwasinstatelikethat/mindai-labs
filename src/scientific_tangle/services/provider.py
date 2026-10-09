@@ -24,13 +24,14 @@ from gigachat.exceptions import (
     ServerError,
 )
 from gigachat.models import Chat, ChatCompletion, Messages, MessagesRole
-from psycopg import AsyncConnection
 from psycopg import Error as PsycopgError
+from psycopg.errors import QueryCanceled
 from pydantic import BaseModel, ValidationError
 
 from scientific_tangle.config import Settings
 from scientific_tangle.domain.contracts import ModelMode
 from scientific_tangle.services.agent_metrics import AgentMetricsRegistry, agent_metrics
+from scientific_tangle.services.model_slot import async_model_slot
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,6 @@ _TRUNCATION_ATTEMPT_LIMIT = 2
 _OUTPUT_TOKENS_STEP = 2
 # 16384 — фиксированный рабочий лимит ответа; повтор при обрезке не превышает его.
 _OUTPUT_TOKENS_CEILING = 16384
-_GIGACHAT_ADVISORY_LOCK_KEY = 0x4D494E444149
 
 
 class ModelUnavailableError(RuntimeError):
@@ -427,10 +427,10 @@ class GigaChatProvider:
     Повторный identical structured-output обслуживается кэшем
     ``complete_model`` (см. ``_llm_cache`` выше), а не новым обращением к модели.
 
-    Семафор на ``gigachat_max_concurrent`` — в пределах процесса: один воркер
-    uvicorn = один счётчик, несколько воркеров перемножают фактическую нагрузку
-    на тариф. Поэтому приём запросов ограничен отдельным слоем
-    (``services/admission.py``), а ожидание слота здесь наблюдаемо и ограничено
+    Семафор на ``gigachat_max_concurrent`` ограничивает локальную очередь.
+    Общий PostgreSQL-слот сериализует chat и embeddings между воркерами и preload.
+    Приём исследований ограничен отдельным слоем (``services/admission.py``),
+    а ожидание слота здесь наблюдаемо и ограничено
     ``gigachat_queue_wait_seconds``: очередь внутри чужого агентного дедлайна —
     это будущая молчаливая деградация ответа вместо честного «сервис занят».
     """
@@ -505,49 +505,23 @@ class GigaChatProvider:
         его при отмене задачи или падении процесса. Для memory/test контура нет
         общей БД и остаётся локальный семафор.
         """
-        if self._settings.knowledge_backend != "neo4j":
-            yield
-            return
-
-        connection: AsyncConnection | None = None
         try:
-            connection = await AsyncConnection.connect(
-                self._settings.database_url,
-                autocommit=True,
-                connect_timeout=5,
-            )
-            try:
-                await asyncio.wait_for(
-                    connection.execute(
-                        "SELECT pg_advisory_lock(%s)",
-                        (_GIGACHAT_ADVISORY_LOCK_KEY,),
-                    ),
-                    timeout=self._queue_wait_seconds,
-                )
-            except TimeoutError:
-                raise ModelBusyError(
-                    "GigaChat: сервис занят — ожидание общего слота превысило "
-                    f"{self._queue_wait_seconds:g} с; повторите запрос позже",
-                    retry_after=max(1, int(self._queue_wait_seconds)),
-                    active=1,
-                    waiting=1,
-                    limit=1,
-                ) from None
-            try:
+            async with async_model_slot(self._settings):
                 yield
-            finally:
-                await connection.execute(
-                    "SELECT pg_advisory_unlock(%s)",
-                    (_GIGACHAT_ADVISORY_LOCK_KEY,),
-                )
+        except QueryCanceled:
+            raise ModelBusyError(
+                "GigaChat: сервис занят — ожидание общего слота превысило "
+                f"{self._queue_wait_seconds:g} с; повторите запрос позже",
+                retry_after=max(1, int(self._queue_wait_seconds)),
+                active=1,
+                waiting=1,
+                limit=1,
+            ) from None
         except PsycopgError as exc:
             logger.warning("GigaChat: общий слот PostgreSQL недоступен (%s)", type(exc).__name__)
             raise ModelUnavailableError(
                 "GigaChat: не удалось получить общий слот; повторите запрос позже"
             ) from None
-        finally:
-            if connection is not None:
-                await connection.close()
 
     def _call_timeout(self) -> int:
         """Потолок одной транспортной попытки, согласованный с агентным дедлайном.
