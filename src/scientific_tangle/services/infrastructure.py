@@ -366,7 +366,7 @@ class Neo4jElasticsearchKnowledgeBase:
                 # отсечь заменённые версии на стороне индекса, иначе страница выдачи
                 # зависела бы от того, что случайно лежит в RAM-каталоге процесса.
                 "superseded_by": {"type": "keyword"},
-                "finding_json": {"type": "keyword", "index": False},
+                "finding_json": {"type": "keyword", "index": False, "ignore_above": 8191},
                 "embedding": {
                     "type": "dense_vector",
                     "dims": self._embedding_dimensions,
@@ -396,7 +396,7 @@ class Neo4jElasticsearchKnowledgeBase:
                 "scope.year": {"type": "keyword"},
                 "scope.origin": {"type": "keyword"},
                 "superseded_by": {"type": "keyword"},
-                "finding_json": {"type": "keyword", "index": False},
+                "finding_json": {"type": "keyword", "index": False, "ignore_above": 8191},
             }
         }
         if self._search.indices.exists(index=FINDING_INDEX):
@@ -420,6 +420,16 @@ class Neo4jElasticsearchKnowledgeBase:
 
     def _ensure_hypothesis_index(self) -> None:
         if self._search.indices.exists(index=HYPOTHESIS_INDEX):
+            self._extend_index_mapping(
+                HYPOTHESIS_INDEX,
+                {
+                    "properties": {
+                        "signal_json": {
+                            "type": "keyword", "index": False, "ignore_above": 8191
+                        }
+                    }
+                },
+            )
             return
         self._search.indices.create(
             index=HYPOTHESIS_INDEX,
@@ -431,7 +441,7 @@ class Neo4jElasticsearchKnowledgeBase:
                     "statement": {"type": "text", "analyzer": "ru"},
                     "statement_sort": {"type": "keyword", "ignore_above": 2048},
                     "data_class": {"type": "keyword"},
-                    "signal_json": {"type": "keyword", "index": False},
+                    "signal_json": {"type": "keyword", "index": False, "ignore_above": 8191},
                 }
             },
         )
@@ -451,7 +461,10 @@ class Neo4jElasticsearchKnowledgeBase:
                 properties={
                     key: value
                     for key, value in mappings["properties"].items()
-                    if key in {"status", "subject", "schema", "scope.geography", "scope.year"}
+                    if key in {
+                        "status", "subject", "schema", "scope.geography", "scope.year",
+                        "finding_json", "signal_json",
+                    }
                 },
             )
         except Exception as error:  # noqa: BLE001 - старые поля не теряются из-за новых

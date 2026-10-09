@@ -66,7 +66,18 @@ with (
             if end is not None:
                 ranges[finding.id] = end
         if actions:
-            helpers.bulk(search, actions)
+            try:
+                helpers.bulk(search, actions)
+            except helpers.BulkIndexError as error:
+                first = error.errors[0]["update"]["error"]
+                logger.error(
+                    "chunk_evidence_bulk_failure type=%s reason=%s",
+                    first.get("type"),
+                    first.get("reason", "")[:300],
+                    extra={"failed": len(error.errors)},
+                )
+                hits.close()
+                raise
             updated += len(actions)
         if ranges:
             nodes = session.run(
