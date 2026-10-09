@@ -8,7 +8,8 @@ import logging
 import re
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from time import monotonic, perf_counter
 from typing import Any, Protocol, TypeVar, cast
@@ -23,6 +24,8 @@ from gigachat.exceptions import (
     ServerError,
 )
 from gigachat.models import Chat, ChatCompletion, Messages, MessagesRole
+from psycopg import AsyncConnection
+from psycopg import Error as PsycopgError
 from pydantic import BaseModel, ValidationError
 
 from scientific_tangle.config import Settings
@@ -48,6 +51,7 @@ _TRUNCATION_ATTEMPT_LIMIT = 2
 _OUTPUT_TOKENS_STEP = 2
 # 16384 — фиксированный рабочий лимит ответа; повтор при обрезке не превышает его.
 _OUTPUT_TOKENS_CEILING = 16384
+_GIGACHAT_ADVISORY_LOCK_KEY = 0x4D494E444149
 
 
 class ModelUnavailableError(RuntimeError):
@@ -493,6 +497,58 @@ class GigaChatProvider:
                         raise self._wrap(exc) from exc
         return self._client
 
+    @asynccontextmanager
+    async def _global_model_slot(self) -> AsyncIterator[None]:
+        """Сериализует обращения GigaChat между backend и CLI-процессами.
+
+        Advisory lock привязан к PostgreSQL-соединению: PostgreSQL сам освободит
+        его при отмене задачи или падении процесса. Для memory/test контура нет
+        общей БД и остаётся локальный семафор.
+        """
+        if self._settings.knowledge_backend != "neo4j":
+            yield
+            return
+
+        connection: AsyncConnection | None = None
+        try:
+            connection = await AsyncConnection.connect(
+                self._settings.database_url,
+                autocommit=True,
+                connect_timeout=5,
+            )
+            try:
+                await asyncio.wait_for(
+                    connection.execute(
+                        "SELECT pg_advisory_lock(%s)",
+                        (_GIGACHAT_ADVISORY_LOCK_KEY,),
+                    ),
+                    timeout=self._queue_wait_seconds,
+                )
+            except TimeoutError:
+                raise ModelBusyError(
+                    "GigaChat: сервис занят — ожидание общего слота превысило "
+                    f"{self._queue_wait_seconds:g} с; повторите запрос позже",
+                    retry_after=max(1, int(self._queue_wait_seconds)),
+                    active=1,
+                    waiting=1,
+                    limit=1,
+                ) from None
+            try:
+                yield
+            finally:
+                await connection.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (_GIGACHAT_ADVISORY_LOCK_KEY,),
+                )
+        except PsycopgError as exc:
+            logger.warning("GigaChat: общий слот PostgreSQL недоступен (%s)", type(exc).__name__)
+            raise ModelUnavailableError(
+                "GigaChat: не удалось получить общий слот; повторите запрос позже"
+            ) from None
+        finally:
+            if connection is not None:
+                await connection.close()
+
     def _call_timeout(self) -> int:
         """Потолок одной транспортной попытки, согласованный с агентным дедлайном.
 
@@ -754,7 +810,6 @@ class GigaChatProvider:
         max_tokens: int | None = None,
         model: str | None = None,
     ) -> ChatCompletion:
-        client = await self._get_client()
         request = Chat(
             model=model or self._settings.gigachat_agent_model,
             messages=list(messages),
@@ -789,7 +844,11 @@ class GigaChatProvider:
             self._in_flight += 1
             self._report_queue()
             try:
-                return await client.achat(request)
+                async with self._global_model_slot():
+                    # Получение токена тоже обращение к GigaChat и должно
+                    # проходить через тот же межпроцессный слот.
+                    client = await self._get_client()
+                    return await client.achat(request)
             finally:
                 self._in_flight -= 1
                 self._report_queue()
