@@ -26,7 +26,7 @@ import type {
 export const STATUS_SHORT: Record<FindingApiStatus, string> = {
   consensus: 'согласуется',
   disputed: 'оспаривается',
-  hypothesis: 'гипотеза',
+  hypothesis: 'не сверено',
 };
 
 // Там, где статус читают как вывод, а не как метку в строке таблицы.

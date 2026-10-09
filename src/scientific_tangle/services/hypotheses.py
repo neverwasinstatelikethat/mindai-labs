@@ -21,7 +21,7 @@ from scientific_tangle.services.research_intelligence import (
 )
 
 _HYPOTHESIS_NAMESPACE = uuid5(NAMESPACE_URL, "urn:stormidea:hypothesis-signal")
-_MAX_BATCH_CHARACTERS = 28_000
+_MAX_BATCH_CHARACTERS = 12_000
 _MAX_SOURCE_STATEMENT = 1_000
 _MAX_SOURCE_QUOTE = 3_000
 _DATA_CLASS_RANK = {
@@ -64,6 +64,23 @@ class _HypothesisDraftBatch(BaseModel):
 
 def _asserts_numeric_conflict(draft: HypothesisDraft) -> bool:
     return bool(_CONFLICT_LANGUAGE.search(f"{draft.kind} {draft.statement}"))
+
+
+def _is_source_restatement(statement: str, evidence: Sequence[EvidenceLocator]) -> bool:
+    """Reject a finding that only repeats one cited source as a hypothesis."""
+    statement_tokens = set(
+        re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", statement).casefold())
+    )
+    if len(statement_tokens) < 4:
+        return False
+    for item in evidence:
+        quote_tokens = set(
+            re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", item.quote).casefold())
+        )
+        overlap = len(statement_tokens & quote_tokens) / len(statement_tokens)
+        if overlap >= 0.9:
+            return True
+    return False
 
 
 class HypothesisGenerator:
@@ -179,18 +196,21 @@ class HypothesisGenerator:
 
         node_to_finding: dict[str, str] = {}
         community_members: dict[str, list[str]] = defaultdict(list)
+        graph_nodes = {node.id: node for node in graph.nodes}
         for finding in findings:
             aliases = {
                 finding.id,
                 finding.id.removeprefix("finding-"),
                 f"claim-{finding.id.removeprefix('finding-')}",
             }
-            for node in graph.nodes:
-                if node.id in aliases:
-                    node_to_finding[node.id] = finding.id
-                    community = node.metadata.get("community")
-                    if isinstance(community, str) and community:
-                        community_members[community].append(finding.id)
+            for node_id in aliases:
+                node = graph_nodes.get(node_id)
+                if node is None:
+                    continue
+                node_to_finding[node_id] = finding.id
+                community = node.metadata.get("community")
+                if isinstance(community, str) and community:
+                    community_members[community].append(finding.id)
 
         adjacency: dict[str, set[str]] = defaultdict(set)
         for edge in graph.edges:
@@ -274,6 +294,8 @@ class HypothesisGenerator:
         if not cited:
             return None
         evidence = _unique_locators([locator for _, locator in cited])
+        if _is_source_restatement(draft.statement, evidence):
+            return None
         if draft.kind == "cross_source_conflict":
             if len({item.document_id for item in evidence}) < 2:
                 return None
@@ -401,11 +423,30 @@ def _make_signal(
     )
 
 
-_HYPOTHESIS_SYSTEM = """Ты анализируешь семантические утверждения и точные цитаты из документов.
-Выводи только полезные, конкретные гипотезы: расхождения, возможные улучшения,
-узкие места, пробелы для проверки и другие содержательные сигналы. Тип категории
-свободный. Не пересказывай документ, биографии, справочные списки и отдельные
-факты как гипотезы. Отделяй наблюдение от предположения и предложения. Каждый
-вывод должен поддерживаться приведёнными evidence id. Не добавляй новые источники,
-страницы или цитаты; используй ID дословно. Если данных недостаточно, верни пустой
-список. Утверждение должно быть коротким и осторожным, без выдачи идеи за факт."""
+_HYPOTHESIS_SYSTEM = """Ты — аналитик, который ищет полезные проверяемые выводы в фактах и цитатах.
+Входные statement — атомарные факты корпуса, а не готовые гипотезы. Не переносить
+их в ответ дословно или в виде краткого пересказа. Гипотеза должна добавлять
+аналитический шаг: показать несостыковку, возможное следствие, ограничение,
+узкое место, скрытую зависимость, пробел или конкретную возможность улучшения.
+Допустимы как сопоставления нескольких документов, так и осторожные идеи по одному
+источнику, если прямо указать, что именно в тексте наводит на идею и чего пока
+нельзя утверждать. Не делай вывод о дефиците или проблеме только из одной цифры.
+
+В statement сформулируй именно аналитический вывод, а не факт из источника.
+В proposal укажи конкретный следующий шаг, который может подтвердить или
+опровергнуть вывод; не используй общие фразы вроде «изучить вопрос».
+Полезный пример: факт «в лаборатории 18 сотрудников, из них 3 кандидата наук»
+сам по себе не гипотеза. Аналитический сигнал может предложить сопоставить
+квалификацию с составом задач лаборатории, если другие приведённые сведения
+описывают эти задачи; без такого основания сигнал не создавай.
+При сравнении источников проверь, сопоставимы ли периоды, определения и условия.
+Если данные этого не позволяют, называй это вопросом для проверки, не доказанным
+противоречием.
+
+Категория свободная; используй точный короткий тип, например discrepancy,
+improvement_opportunity, bottleneck, information_gap, dependency, risk или иной
+подходящий тип. Не пересказывай биографии, справочные списки, заголовки,
+учебные цели и отдельные факты. Каждый вывод должен ссылаться на переданные
+evidence id. Не добавляй источники, страницы или цитаты; используй ID дословно.
+Если после анализа данных действительно нет, верни пустой список. Пиши кратко,
+осторожно и полезно для дальнейшей проверки."""

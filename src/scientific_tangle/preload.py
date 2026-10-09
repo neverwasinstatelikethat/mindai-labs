@@ -28,7 +28,16 @@ async def main() -> None:
         action="store_true",
         help="обработать семантически весь поддерживаемый корпус",
     )
-    semantic_corpus = parser.parse_args().semantic_corpus
+    parser.add_argument(
+        "--hypotheses-only",
+        action="store_true",
+        help="построить аналитические гипотезы по уже загруженным семантическим фактам",
+    )
+    args = parser.parse_args()
+    if args.semantic_corpus and args.hypotheses_only:
+        parser.error("--semantic-corpus и --hypotheses-only нельзя использовать вместе")
+    semantic_corpus = args.semantic_corpus
+    hypotheses_only = args.hypotheses_only
     settings = get_settings()
     knowledge = build_knowledge_base(settings)
     provider = build_provider(settings)
@@ -38,7 +47,11 @@ async def main() -> None:
     )
     source_root = Path(settings.source_root)
     structural = None
-    if not semantic_corpus and settings.preload_mode in {"full", "structural"}:
+    if (
+        not semantic_corpus
+        and not hypotheses_only
+        and settings.preload_mode in {"full", "structural"}
+    ):
         structural = CorpusCompiler(
             knowledge,
             source_root,
@@ -54,6 +67,7 @@ async def main() -> None:
     )
     if semantic_corpus:
         semantic = await preload.run_corpus()
+    if semantic_corpus or hypotheses_only:
         findings = await asyncio.to_thread(knowledge.semantic_findings)
         graph = await asyncio.to_thread(knowledge.semantic_graph)
         conflicts = ResearchIntelligenceService().detect_conflicts(
@@ -70,7 +84,9 @@ async def main() -> None:
             {
                 "structural": json.loads(structural.model_dump_json()) if structural else None,
                 "semantic": json.loads(semantic.model_dump_json()) if semantic else None,
-                "hypotheses": hypothesis_count if semantic_corpus else None,
+                "hypotheses": (
+                    hypothesis_count if semantic_corpus or hypotheses_only else None
+                ),
             },
             ensure_ascii=False,
             indent=2,

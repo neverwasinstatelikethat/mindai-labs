@@ -21,6 +21,7 @@
     SUBJECT_LABELS,
     describeScope,
     describeValue,
+    hypothesisKindLabel,
     findingsNotLoadedBody,
     findingsPartialNote,
     findingsScaleGapNote,
@@ -278,6 +279,8 @@
   let index = $state<FindingListItem[]>([]);
   let rows = $state<FindingListItem[]>([]);
   let hypotheses = $state<HypothesisSignal[]>([]);
+  let hypothesesQuery = $state('');
+  let hypothesesKind = $state('');
   let hypothesesTotal = $state<number | null>(null);
   let hypothesesPhase = $state<'loading' | 'ready' | 'failed'>('loading');
   let hypothesesFailure = $state('');
@@ -345,6 +348,26 @@
       ? (sourceSignal.evidence[sourceEvidenceIndex] ?? null)
       : null,
   );
+  const hypothesisKinds = $derived(
+    [...new Set(hypotheses.map((signal) => signal.kind))].sort((left, right) =>
+      hypothesisKindLabel(left).localeCompare(hypothesisKindLabel(right), 'ru'),
+    ),
+  );
+  const visibleHypotheses = $derived.by(() => {
+    const query = hypothesesQuery.trim().toLocaleLowerCase('ru');
+    return hypotheses.filter((signal) => {
+      if (hypothesesKind && signal.kind !== hypothesesKind) return false;
+      if (!query) return true;
+      const searchable = [
+        signal.statement,
+        signal.proposal ?? '',
+        ...signal.evidence.flatMap((item) => [item.source_title, item.quote]),
+      ]
+        .join(' ')
+        .toLocaleLowerCase('ru');
+      return searchable.includes(query);
+    });
+  });
 
   const subjectIndex = $derived.by(() => {
     const groups = new Map<string, FindingListItem[]>();
@@ -1334,16 +1357,26 @@
           <div>
             <h2 class="h3" id="analytical-hypotheses-title">Аналитические гипотезы</h2>
             <p class="micro muted">
-              Несостыковки, идеи и возможные узкие места с цитатами, на которых основан вывод.
+              Вывод и следующий шаг отдельно от исходных фактов. Цитаты раскрываются в основаниях.
             </p>
           </div>
-          <p class="micro findings__hypotheses-count" role="status" aria-live="polite">
-            {#if hypothesesTotal !== null}
-              {countOf(hypothesesTotal, 'гипотеза', 'гипотезы', 'гипотез')}
-            {:else if hypothesesPhase === 'ready'}
-              Показано {hypotheses.length}; общее число не получено
-            {/if}
-          </p>
+          <div class="findings__hypotheses-head-actions">
+            <p class="micro findings__hypotheses-count" role="status" aria-live="polite">
+              {#if hypothesesTotal !== null}
+                {countOf(hypothesesTotal, 'гипотеза', 'гипотезы', 'гипотез')}
+              {:else if hypothesesPhase === 'ready'}
+                Показано {hypotheses.length}; общее число не получено
+              {/if}
+            </p>
+            <Button
+              variant="quiet"
+              size="sm"
+              disabled={hypothesesPhase === 'loading'}
+              onclick={() => void loadHypotheses()}
+            >
+              {hypothesesPhase === 'loading' ? 'Обновляем…' : 'Обновить'}
+            </Button>
+          </div>
         </div>
 
         {#if hypothesesPhase === 'loading'}
@@ -1367,7 +1400,7 @@
             <Empty
               icon="layers"
               title="Аналитических гипотез пока нет"
-              body="Когда система найдёт обоснованный сигнал в документах, здесь появятся вывод и ссылки на подтверждения."
+              body="Факты и цитаты остаются в каталоге. Здесь появятся только аналитические выводы с основаниями и конкретным следующим шагом."
             >
               {#snippet action()}
                 <div class="row findings__hypotheses-actions">
@@ -1380,11 +1413,68 @@
             </Empty>
           </Panel>
         {:else}
-          <div class="findings__hypotheses-grid">
-            {#each hypotheses as signal (signal.id)}
-              <HypothesisCard {signal} />
+          <div class="findings__hypotheses-tools">
+            <label class="findings__hypotheses-search">
+              <span class="micro">Поиск по гипотезам</span>
+              <input
+                type="search"
+                bind:value={hypothesesQuery}
+                placeholder="Тема, вывод или источник"
+                aria-label="Поиск по загруженным аналитическим гипотезам"
+              />
+            </label>
+            <p class="micro muted">
+              Поиск по загруженным: {hypothesesServed}
+              {#if hypothesesTotal !== null && hypothesesServed < hypothesesTotal}
+                из {hypothesesTotal}
+              {/if}
+            </p>
+          </div>
+          <div
+            class="findings__hypotheses-kinds"
+            role="group"
+            aria-label="Тип аналитического сигнала"
+          >
+            <Button
+              size="sm"
+              variant={hypothesesKind === '' ? 'ink' : 'quiet'}
+              current={hypothesesKind === ''}
+              onclick={() => (hypothesesKind = '')}
+            >
+              Все типы
+            </Button>
+            {#each hypothesisKinds as kind (kind)}
+              <Button
+                size="sm"
+                variant={hypothesesKind === kind ? 'ink' : 'quiet'}
+                current={hypothesesKind === kind}
+                onclick={() => (hypothesesKind = kind)}
+              >
+                {hypothesisKindLabel(kind)}
+              </Button>
             {/each}
           </div>
+          {#if visibleHypotheses.length === 0}
+            <div class="findings__hypotheses-empty">
+              <p class="small muted">По этому поиску гипотезы не найдены.</p>
+              <Button
+                variant="quiet"
+                size="sm"
+                onclick={() => {
+                  hypothesesQuery = '';
+                  hypothesesKind = '';
+                }}
+              >
+                Сбросить поиск и тип
+              </Button>
+            </div>
+          {:else}
+            <div class="findings__hypotheses-grid">
+              {#each visibleHypotheses as signal (signal.id)}
+                <HypothesisCard {signal} />
+              {/each}
+            </div>
+          {/if}
           {#if hypothesesMoreFailure}
             <p class="micro findings__morefail" role="alert">
               Не удалось загрузить следующие гипотезы. {hypothesesMoreFailure}
@@ -1661,7 +1751,7 @@
             <p class="micro findings__status-label">Статус</p>
             <InfoDot
               title="Что значат статусы"
-              body="Согласуется: несколько источников называют одно число в сопоставимых условиях. Гипотеза: число стоит на одном источнике либо на условиях, которые ни с чем не сопоставлены. Оспаривается: источники по одному субъекту дают разные числа, и расхождение видно в доказательствах. Заменено: прежнюю версию утверждения вытеснила экспертная правка, она в истории версий."
+              body="Согласуется: несколько источников называют одно число в сопоставимых условиях. Не сверено: утверждение пока опирается на один источник или не сопоставлено с другими. Оспаривается: источники по одному субъекту дают разные числа, и расхождение видно в доказательствах. Заменено: прежнюю версию утверждения вытеснила экспертная правка, она в истории версий."
               align="start"
             />
             {#each facets as facet (facet.key)}
@@ -2352,9 +2442,63 @@
     margin-top: var(--s1);
   }
 
+  .findings__hypotheses-head-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+  }
+
   .findings__hypotheses-count {
     color: var(--ink-3);
     font-variant-numeric: tabular-nums;
+  }
+
+  .findings__hypotheses-tools {
+    display: grid;
+    grid-template-columns: minmax(14rem, 28rem) 1fr;
+    align-items: end;
+    gap: var(--s3) var(--s4);
+  }
+
+  .findings__hypotheses-tools p {
+    margin: 0 0 var(--s2);
+  }
+
+  .findings__hypotheses-search {
+    display: grid;
+    gap: var(--s1);
+  }
+
+  .findings__hypotheses-search input {
+    width: 100%;
+    min-height: 2.75rem;
+    padding: var(--s2) var(--s3);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink);
+  }
+
+  .findings__hypotheses-search input:focus-visible {
+    outline: 2px solid var(--action-ink);
+    outline-offset: 2px;
+  }
+
+  .findings__hypotheses-kinds {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s2);
+  }
+
+  .findings__hypotheses-empty {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--s3);
+  }
+
+  .findings__hypotheses-empty p {
+    margin: 0;
   }
 
   .findings__source-view {
@@ -2402,6 +2546,14 @@
   @media (max-width: 640px) {
     .findings__hypotheses {
       padding: var(--s4);
+    }
+
+    .findings__hypotheses-tools {
+      grid-template-columns: 1fr;
+    }
+
+    .findings__hypotheses-tools p {
+      margin-bottom: 0;
     }
   }
 

@@ -6,6 +6,7 @@
 export * from './shared';
 export * from './map';
 export * from './findings';
+export * from './hypotheses';
 export * from './conflicts';
 export * from './compare';
 export * from './research';
