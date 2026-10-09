@@ -337,6 +337,14 @@ async def test_numeric_hypothesis_uses_only_comparable_conflicts() -> None:
     numeric = [signal for signal in signals if signal.kind == "numeric_discrepancy"]
     assert len(numeric) == 1
     assert {item.document_id for item in numeric[0].evidence} == {document_a, document_b}
+    # Формулировка идёт в интерфейс: имя свойства остаётся служебным (его
+    # переводит экран по своему словарю), длинное тире экран не печатает, а
+    # значения с единицами обязаны остаться — по ним расхождение и находится.
+    statement = numeric[0].statement
+    assert "производительность" not in statement
+    assert "_" not in statement
+    assert "—" not in statement
+    assert "10 т/ч" in statement and "15 т/ч" in statement
 
 
 @pytest.mark.asyncio

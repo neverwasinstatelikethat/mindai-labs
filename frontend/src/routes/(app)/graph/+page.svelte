@@ -541,20 +541,25 @@
               Имя связи в графе не задано ни у одной строки: показаны направление и запись.
             </p>
           {/if}
-          <ul class="map__conn-list" data-unnamed={relationsUnnamed ? 'true' : undefined}>
+          <ul class="map__conn-list">
             {#each shownConnections as conn, i (`${conn.edge.id}-${i}`)}
+              <!-- Направление и имя связи стоят строкой выше, а запись занимает
+                   всю ширину колонки: в три колонки длинное имя утверждения
+                   ломалось по буквам. -->
               <li>
-                <span class="micro muted map__dir">{conn.outgoing ? 'исходит' : 'входит'}</span>
-                {#if !relationsUnnamed}
-                  <button
-                    type="button"
-                    class="map__rel"
-                    aria-pressed={pickedEdge?.id === conn.edge.id}
-                    onclick={() => pickEdge(pickedEdge?.id === conn.edge.id ? null : conn.edge)}
-                  >
-                    <span>{mapRelationLabel(conn.edge.relation)}</span>
-                  </button>
-                {/if}
+                <span class="micro muted map__conn-meta">
+                  <span>{conn.outgoing ? 'исходит' : 'входит'}</span>
+                  {#if !relationsUnnamed}
+                    <button
+                      type="button"
+                      class="map__rel"
+                      aria-pressed={pickedEdge?.id === conn.edge.id}
+                      onclick={() => pickEdge(pickedEdge?.id === conn.edge.id ? null : conn.edge)}
+                    >
+                      <span>{mapRelationLabel(conn.edge.relation)}</span>
+                    </button>
+                  {/if}
+                </span>
                 {#if conn.other}
                   {@const target = conn.other}
                   <button type="button" class="map__jump" onclick={() => pick(target)}>
@@ -841,29 +846,32 @@
       level="1"
       title="Связи"
       lead="Изучите, как связаны факты, гипотезы и источники."
-    >
-      {#if status === 'ready'}
-        <div class="map__head-tools">
-          {#if graph.nodes.length > 0}
-            <!-- Единственный переключатель вида на экране: плотность подписей
-                 на линиях. Режимов «поиск» и «карта» больше нет, поэтому
-                 переключать сюда нечего. -->
-            <Segmented
-              class="map__density-mode"
-              label={MAP_LABEL_DENSITY.group}
-              items={[
-                { value: 'focus', label: MAP_LABEL_DENSITY.focus },
-                { value: 'all', label: MAP_LABEL_DENSITY.all },
-              ]}
-              bind:value={labelMode}
-            />
-          {/if}
-          <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
-            Обновить
-          </Button>
-        </div>
-      {/if}
-    </SectionHead>
+    />
+
+    {#if status === 'ready'}
+      <!-- Инструменты поля идут по левому краю, а не в углу заголовка: колонка
+           сведений прижата к правому краю и накрывала бы переключатель
+           подписей ровно в тот момент, когда выбор сделан. -->
+      <div class="map__head-tools">
+        {#if graph.nodes.length > 0}
+          <!-- Единственный переключатель вида на экране: плотность подписей
+               на линиях. Режимов «поиск» и «карта» больше нет, поэтому
+               переключать сюда нечего. -->
+          <Segmented
+            class="map__density-mode"
+            label={MAP_LABEL_DENSITY.group}
+            items={[
+              { value: 'focus', label: MAP_LABEL_DENSITY.focus },
+              { value: 'all', label: MAP_LABEL_DENSITY.all },
+            ]}
+            bind:value={labelMode}
+          />
+        {/if}
+        <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
+          Обновить
+        </Button>
+      </div>
+    {/if}
 
     {#if access === 'checking'}
       <Panel tone="sunk">
@@ -1001,12 +1009,15 @@
     align-items: center;
     gap: var(--s4);
     flex-wrap: wrap;
+    margin-block: calc(var(--s6) * -1 + var(--s3)) var(--s5);
   }
 
-  /* Поле связей и колонка сведений — один контейнер на две роли. При 1120 px
-     колонка встаёт справа и прилипает: выбор заполняет её на месте, и за
-     деталями не надо прокручивать экран. Ниже этой ширины колонка становится
-     нижней, но не меняет ни заголовка, ни содержания. */
+  /* Поле связей и колонка сведений. На широком экране это две колонки одной
+     сетки: колонка прилипает к верху и прокручивается сама, поэтому конец
+     доказательств дочитывается и без конца страницы. Поверх поля колонку не
+     ставить — под ней пропала бы целая цепочка сущностей, а выбор записи как раз
+     и делается ради этой цепочки. Ниже 1280 px колонка встаёт в поток под поле и
+     не меняет ни заголовка, ни содержания. */
   .map-lab {
     display: grid;
     gap: var(--s5);
@@ -1019,18 +1030,26 @@
     min-width: 0;
   }
 
-  @media (min-width: 1120px) {
+  @media (min-width: 1280px) {
     .map-lab {
-      grid-template-columns: minmax(0, 1fr) minmax(340px, 400px);
-      gap: var(--s6);
+      grid-template-columns:
+        minmax(0, 1fr)
+        clamp(300px, 27vw, 460px);
     }
 
     .map-lab__insp {
       position: sticky;
       top: calc(var(--topbar-h) + var(--s4));
       max-height: calc(100dvh - var(--topbar-h) - var(--s8));
+      padding-block-end: var(--s6);
       overflow-y: auto;
       overscroll-behavior: contain;
+      /* Колонка прилипает и держит тень сцены: под ней прокручиваются карточки,
+         и граница слоёв должна быть видна. Полоса прокрутки названа явно — без
+         неё конец списка обрывается на сгибе, и не понять, что ниже есть. */
+      box-shadow: var(--shadow-lift);
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) var(--surface-sunk);
     }
   }
 
@@ -1130,22 +1149,19 @@
   /* Плотный список связей: линия между строками работает здесь разделителем
      колонок, а не рамкой блока. За его пределами рамок на экране нет. */
   .map__conn-list li {
-    display: grid;
-    grid-template-columns: 62px minmax(90px, 0.9fr) minmax(0, 1.4fr);
-    gap: var(--s2) var(--s3);
-    align-items: baseline;
-    padding: var(--s2) 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+    padding: var(--s3) 0;
     border-top: 1px solid var(--line-soft);
   }
 
-  .map__dir {
+  .map__conn-meta {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--s1) var(--s3);
     color: var(--ink-3);
-  }
-
-  /* Без имён связей колонка под заглушку не нужна: строка читается как
-     направление и запись. */
-  .map__conn-list[data-unnamed='true'] li {
-    grid-template-columns: 66px minmax(0, 1fr);
   }
 
   /* Тип записи — короткое слово, резать его по слогам нельзя: перенос
@@ -1188,7 +1204,8 @@
   .map__jump {
     display: inline-flex;
     align-items: baseline;
-    gap: var(--s2);
+    flex-wrap: wrap;
+    gap: var(--s1) var(--s2);
     border: 0;
     border-radius: var(--r-xs);
     background: none;
@@ -1306,9 +1323,8 @@
       flex: none;
     }
 
-    /* Строка связи перестраивается в текучую: сетка на ширине шторки оставляла
+    /* Концы связи в шторке выбранной связи: сетка на ширине шторки оставляла
        метке ~30 px, и слово разваливалось по буквам. */
-    .map__conn-list li,
     .map__edge-ends li {
       display: flex;
       flex-wrap: wrap;

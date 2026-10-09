@@ -613,7 +613,11 @@ class ResearchWorkflow:
             if web_search_enabled or action.tool != "public_search"
         ]
         internal_readers = {
-            "hybrid_search", "finding_lookup", "graph_traverse", "community_search", "numeric_filter",
+            "hybrid_search",
+            "finding_lookup",
+            "graph_traverse",
+            "community_search",
+            "numeric_filter",
         }
         if any(action.tool == "public_search" for action in actions) and not any(
             action.tool in internal_readers for action in actions

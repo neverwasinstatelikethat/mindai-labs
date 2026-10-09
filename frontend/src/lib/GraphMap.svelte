@@ -2035,6 +2035,12 @@
     padding: var(--s5);
     border-radius: var(--r-xl);
     background: var(--surface-sunk);
+    /* Дорожка между колонками и подпись связи на линии — одно и то же число.
+       Пока метка могла быть шире промежутка, она наезжала на карточку и
+       закрывала первые буквы утверждения. Низ в 112 px держит самое длинное
+       русское слово отношения целиком: меньше — и подпись начнёт рваться
+       по буквам. */
+    --chain-gap: clamp(112px, 9vw, 128px);
   }
 
   .chain-links {
@@ -2046,12 +2052,14 @@
 
   /* Три колонки, промежутки — это column-gap: линии рисуются поверх них.
      Раньше пустые дорожки чередовались с колонками, и автопосстановление
-     ставило вторую колонку в дорожку промежутка. */
+     ставило вторую колонку в дорожку промежутка. Дорожка держит только подпись
+     связи на линии, а не половину поля: при 144 px на колонку утверждений
+     оставалось 240 px, и карточка вырастала в шесть строк. */
   .chain-grid {
     position: relative;
     display: grid;
-    grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.3fr) minmax(0, 0.92fr);
-    column-gap: clamp(88px, 10vw, 168px);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.9fr) minmax(0, 1fr);
+    column-gap: var(--chain-gap);
     align-items: start;
   }
 
@@ -2247,9 +2255,9 @@
     align-items: center;
     justify-content: center;
     transform: translate(-50%, -50%);
-    max-width: clamp(76px, 9vw, 150px);
+    max-width: calc(var(--chain-gap) - var(--s2));
     min-height: 32px;
-    padding: 0 var(--s3);
+    padding: 0 var(--s2);
     border: 0;
     border-radius: var(--r-pill);
     background: var(--surface-raised);

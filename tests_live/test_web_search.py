@@ -65,8 +65,10 @@ async def test_live_agent_honors_web_switch(tmp_path: Path) -> None:
     assert not enabled.limitations
     assert any(item.tool == "public_search" and item.status == "success"
                for item in enabled.tool_observations)
-    assert any(item.tool in {"hybrid_search", "finding_lookup", "graph_traverse", "community_search"}
-               for item in enabled.tool_observations)
+    assert any(
+        item.tool in {"hybrid_search", "finding_lookup", "graph_traverse", "community_search"}
+        for item in enabled.tool_observations
+    )
     assert "6" in enabled.summary and "finding:" in enabled.summary
     assert all(item.tool != "public_search" for item in disabled.tool_observations)
     assert not disabled.limitations

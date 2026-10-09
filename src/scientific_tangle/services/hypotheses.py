@@ -350,9 +350,9 @@ class HypothesisGenerator:
             if len(evidence) < 2:
                 continue
             statement = (
-                f"Проверить расхождение по показателю «{conflict.property_name[:140]}»: "
-                f"в первом источнике указано {format_range(left_claim.value)}, "
-                f"во втором — {format_range(right_claim.value)}."
+                f"Проверить расхождение показателя: {format_range(left_claim.value)} "
+                f"по данным «{_source_title(left)}», {format_range(right_claim.value)} "
+                f"по данным «{_source_title(right)}»."
             )
             statement = statement[:597].rstrip() + "…" if len(statement) > 600 else statement
             signals.append(
@@ -366,6 +366,21 @@ class HypothesisGenerator:
                 )
             )
         return signals
+
+
+def _source_title(finding: Finding) -> str:
+    """Заголовок источника для текста гипотезы.
+
+    Имя свойства из онтологии (``salt_rejection``) в предложение не попадает:
+    это служебный ключ, его переводит экран по своему словарю подписей. В фразе,
+    которую читает аналитик, остаются значение и название источника — по ним
+    расхождение и находится.
+    """
+    for item in finding.evidence:
+        title = item.source_title.strip()
+        if title:
+            return title[:80]
+    return "источник без названия"
 
 
 def _unique_locators(evidence: Sequence[EvidenceLocator]) -> list[EvidenceLocator]:

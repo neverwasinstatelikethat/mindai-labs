@@ -4,8 +4,8 @@
   import { tick } from 'svelte';
   import { ApiError, api } from '$lib/api';
   import { navLabel } from '$lib/nav';
-  import { gapNotesOf, topicGroups, type GapKind } from '$lib/numbers';
-  import { countOf, num, pct } from '$lib/format';
+  import { charRangeOf, gapNotesOf, topicGroups, type GapKind } from '$lib/numbers';
+  import { countOf, dateTime, num, pct } from '$lib/format';
   import { observeReveals } from '$lib/reveal';
   import { session } from '$lib/sessionStore.svelte';
   import SourceRef from '$lib/ui/SourceRef.svelte';
@@ -94,18 +94,6 @@
   // Возврат после входа — на этот же экран, а не в раздел по умолчанию:
   // сессия прервалась посреди отбора, и сбрасывать его незачем.
   const LOGIN_HREF = $derived(`/login?next=${encodeURIComponent(page.url.pathname)}`);
-
-  const sourceRequest = $derived.by(() => {
-    const params = page.url.searchParams;
-    const signalId = params.get('hypothesis')?.trim() ?? '';
-    const rawEvidenceIndex = params.get('evidence');
-    if (!signalId && rawEvidenceIndex === null) return null;
-    const parsedIndex = rawEvidenceIndex === null ? Number.NaN : Number(rawEvidenceIndex);
-    return {
-      signalId,
-      evidenceIndex: Number.isInteger(parsedIndex) && parsedIndex >= 0 ? parsedIndex : null,
-    };
-  });
 
   type Failure = {
     kind: 'session' | 'forbidden' | 'model' | 'backend' | 'other';
@@ -291,11 +279,9 @@
   let hypothesesMoreFailure = $state('');
   let hypothesesServed = $state(0);
   let hypothesesSeq = 0;
-  let sourceSignal = $state<HypothesisSignal | null>(null);
-  let sourceEvidenceIndex = $state<number | null>(null);
-  let sourcePhase = $state<'idle' | 'loading' | 'ready' | 'empty' | 'failed'>('idle');
-  let sourceFailure = $state('');
-  let sourceRequestSeq = 0;
+  // Цитата, открытая из «Основания» гипотезы: сам сигнал уже лежит в списке,
+  // поэтому листу хватает ссылки на него и номера доказательства.
+  let quoteView = $state<{ signal: HypothesisSignal; index: number } | null>(null);
   let indexTotal = $state<number | null>(null);
   let rowsTotal = $state<number | null>(null);
   // X-Window-Note: явная оговорка сервера о неполном списке. Пустая строка значит
@@ -347,11 +333,6 @@
     { value: '', label: 'Любой статус' },
     ...STATUS_ORDER.map((key) => ({ value: key as string, label: STATUS_SHORT[key] })),
   ]);
-  const sourceEvidence = $derived(
-    sourceSignal && sourceEvidenceIndex !== null
-      ? (sourceSignal.evidence[sourceEvidenceIndex] ?? null)
-      : null,
-  );
   // Типы с русским именем: ключ модели без перевода остаётся служебным и
   // чипом фильтра не становится. Один тип — фильтра нет, выбирать не из чего.
   const hypothesisKinds = $derived.by(() => {
@@ -696,14 +677,6 @@
     window.history.replaceState(window.history.state, '', url);
   }
 
-  function closeSourceView(): void {
-    const url = new URL(page.url);
-    for (const key of [...url.searchParams.keys()]) {
-      if (key === 'hypothesis' || key === 'evidence') url.searchParams.delete(key);
-    }
-    void goto(url, { replaceState: true, noScroll: true });
-  }
-
   function clearDocument(): void {
     appliedDocument = '';
     dropLinkParams();
@@ -722,30 +695,6 @@
   ): HypothesisSignal[] {
     const seen = new Set(current.map((signal) => signal.id));
     return [...current, ...incoming.filter((signal) => !seen.has(signal.id))];
-  }
-
-  async function loadSourceCitation(signalId: string, evidenceIndex: number): Promise<void> {
-    const sequence = ++sourceRequestSeq;
-    sourcePhase = 'loading';
-    sourceFailure = '';
-    sourceSignal = null;
-    sourceEvidenceIndex = evidenceIndex;
-    try {
-      const signal = await api.hypothesis(signalId);
-      if (sequence !== sourceRequestSeq) return;
-      sourceSignal = signal;
-      sourcePhase = evidenceIndex < signal.evidence.length ? 'ready' : 'empty';
-    } catch (reason) {
-      if (sequence !== sourceRequestSeq) return;
-      sourceFailure = guidanceOf(classify(reason));
-      sourcePhase = 'failed';
-    }
-  }
-
-  function retrySourceCitation(): void {
-    const request = sourceRequest;
-    if (!request || !request.signalId || request.evidenceIndex === null) return;
-    void loadSourceCitation(request.signalId, request.evidenceIndex);
   }
 
   async function loadHypotheses(): Promise<void> {
@@ -1025,43 +974,6 @@
     dragDepth = 0;
     void ingest(Array.from(event.dataTransfer?.files ?? []));
   }
-
-  // URL передаёт только идентификатор и индекс. Подробности источника выводятся
-  // после ACL-проверки detail endpoint, а не из редактируемых query-параметров.
-  $effect(() => {
-    const request = sourceRequest;
-    const state = session.state;
-    const allowed = canRead;
-    if (!request) {
-      sourceRequestSeq += 1;
-      sourceSignal = null;
-      sourceEvidenceIndex = null;
-      sourceFailure = '';
-      sourcePhase = 'idle';
-      return;
-    }
-    if (state === 'unknown') {
-      sourceSignal = null;
-      sourcePhase = 'loading';
-      return;
-    }
-    if (state !== 'authenticated' || !allowed) {
-      sourceRequestSeq += 1;
-      sourceSignal = null;
-      sourceEvidenceIndex = null;
-      sourcePhase = 'idle';
-      return;
-    }
-    if (!request.signalId || request.evidenceIndex === null) {
-      sourceRequestSeq += 1;
-      sourceSignal = null;
-      sourceEvidenceIndex = null;
-      sourceFailure = 'Ссылка на источник неполная. Откройте цитату из карточки гипотезы.';
-      sourcePhase = 'failed';
-      return;
-    }
-    void loadSourceCitation(request.signalId, request.evidenceIndex);
-  });
 
   // Право и сам факт входа приходят с сервера: до /auth/me находки не
   // запрашиваем, иначе экран показал бы «пусто» там, где ещё нет сессии.
@@ -1414,56 +1326,6 @@
            у очереди пар, а не рядом с переключателем фасетов. -->
     </section>
 
-    {#if sourceRequest && session.state === 'authenticated' && canRead}
-      <section class="panel findings__source-view" aria-labelledby="source-view-title" aria-busy={sourcePhase === 'loading'}>
-        <div class="findings__source-view-head">
-          <h2 class="h4" id="source-view-title">Фрагмент источника</h2>
-          <Button variant="quiet" size="sm" onclick={closeSourceView}>Закрыть фрагмент</Button>
-        </div>
-        {#if sourcePhase === 'loading'}
-          <p class="small muted" role="status">Проверяем доступ и загружаем цитату…</p>
-          <span class="skeleton findings__skel"></span>
-        {:else if sourcePhase === 'failed'}
-          <Notice tone="warn" title="Цитату не удалось открыть">
-            {sourceFailure || 'Повторите запрос из карточки гипотезы.'}
-            {#if sourceRequest.signalId && sourceRequest.evidenceIndex !== null}
-              <div class="row">
-                <Button
-                  variant="quiet"
-                  size="sm"
-                  onclick={retrySourceCitation}
-                >
-                  Повторить
-                </Button>
-              </div>
-            {/if}
-          </Notice>
-        {:else if sourcePhase === 'empty'}
-          <Empty
-            icon="alert"
-            title="Цитата не найдена"
-            body="В гипотезе нет доказательства с таким номером. Откройте источник из карточки ещё раз."
-          />
-        {:else if sourcePhase === 'ready' && sourceEvidence}
-          <div class="findings__source-detail">
-            <p class="small"><strong>{sourceEvidence.source_title || 'Источник без названия'}</strong></p>
-            <div class="micro muted findings__source-location">
-              {#if sourceEvidence.page != null}<span>страница {sourceEvidence.page}</span>{/if}
-              {#if sourceEvidence.sheet}<span>лист {sourceEvidence.sheet}</span>{/if}
-              {#if sourceEvidence.cell_range}<span>ячейки {sourceEvidence.cell_range}</span>{/if}
-              {#if sourceEvidence.char_start != null && sourceEvidence.char_end != null}
-                <span>символы {sourceEvidence.char_start}–{sourceEvidence.char_end}</span>
-              {:else if sourceEvidence.char_start != null}
-                <span>символы с {sourceEvidence.char_start}</span>
-              {:else if sourceEvidence.char_end != null}
-                <span>символы до {sourceEvidence.char_end}</span>
-              {/if}
-            </div>
-            <blockquote class="findings__source-quote">{sourceEvidence.quote}</blockquote>
-          </div>
-        {/if}
-      </section>
-    {/if}
 
     {#if pane === 'numbers' && session.state === 'authenticated' && canRead}
       {#if groups.length === 0}
@@ -1476,7 +1338,7 @@
                 id={`topic-${group.id}`}
                 size="h4"
                 title={group.topic.title}
-                open={group.findings.length > 1}
+                defaultOpen={group.findings.length > 1}
               >
                 {#snippet aside()}
                   <span class="micro muted">
@@ -2155,7 +2017,7 @@
           {:else}
             <div class="findings__hypotheses-grid">
               {#each visibleHypotheses as signal (signal.id)}
-                <HypothesisCard {signal} />
+                <HypothesisCard {signal} onquote={(index) => (quoteView = { signal, index })} />
               {/each}
             </div>
           {/if}
@@ -2478,6 +2340,50 @@
   </Sheet>
 {/if}
 
+{#if quoteView}
+  {@const item = quoteView.signal.evidence[quoteView.index] ?? null}
+  <Sheet
+    title="Цитата из источника"
+    description={quoteView.signal.statement}
+    width="720px"
+    onclose={() => (quoteView = null)}
+  >
+    {#snippet footer()}
+      <Button variant="ghost" onclick={() => (quoteView = null)}>Закрыть</Button>
+    {/snippet}
+
+    {#if item}
+      <SourceRef evidence={item} quote />
+      {#if charRangeOf(item) || item.retrieved_at}
+        <dl class="facts">
+          <div>
+            <dt>Символы во фрагменте</dt>
+            <dd>
+              {#if charRangeOf(item)}
+                <span class="num">{charRangeOf(item)}</span>
+              {:else}
+                фрагмент без символьных границ
+              {/if}
+            </dd>
+          </div>
+          {#if item.retrieved_at}
+            <div>
+              <dt>Получено из источника</dt>
+              <dd>{dateTime(item.retrieved_at)}</dd>
+            </div>
+          {/if}
+        </dl>
+      {/if}
+    {:else}
+      <Empty
+        icon="alert"
+        title="Цитата не найдена"
+        body="В этом основании нет доказательства с таким номером: список изменился, пока он был открыт. Обновите карточку гипотезы."
+      />
+    {/if}
+  </Sheet>
+{/if}
+
 <style>
   .interval__quotes {
     display: grid;
@@ -2609,38 +2515,6 @@
 
   .findings__hypotheses-empty p {
     margin: 0;
-  }
-
-  .findings__source-view {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s3);
-    scroll-margin-top: calc(var(--topbar-h) + var(--s4));
-  }
-
-  .findings__source-view-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--s4);
-    flex-wrap: wrap;
-  }
-
-  .findings__source-quote {
-    margin: 0;
-    padding: var(--s4);
-    border-left: 2px solid var(--line-strong);
-    border-radius: var(--r-sm);
-    background: var(--surface-sunk);
-    color: var(--ink-2);
-    overflow-wrap: anywhere;
-    white-space: pre-wrap;
-  }
-
-  .findings__source-location {
-    display: flex;
-    gap: var(--s3);
-    flex-wrap: wrap;
   }
 
   .findings__hypotheses-grid {

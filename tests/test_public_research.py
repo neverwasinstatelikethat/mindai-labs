@@ -106,7 +106,9 @@ async def test_web_only_model_plan_runs_internal_and_public_sources_concurrently
     workflow.tool_executor = ResearchToolExecutor(
         knowledge, PublicSourceSearch(transport=httpx.MockTransport(handler)),
     )
-    answer = await workflow.run(QueryRequest(question="Сопоставь закрытый отчёт SecretDoc с наукой"))
+    answer = await workflow.run(
+        QueryRequest(question="Сопоставь закрытый отчёт SecretDoc с наукой")
+    )
     assert answer.limitations == []
     assert {item.id for item in answer.findings} == {internal.id, identifier}
     assert {item.tool for item in answer.tool_observations} == {"hybrid_search", "public_search"}

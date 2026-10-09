@@ -10,6 +10,7 @@
     summary,
     id,
     open = $bindable(false),
+    defaultOpen,
     size = 'small',
     class: className = '',
     bodyClass = '',
@@ -22,6 +23,10 @@
     summary?: string;
     id: string;
     open?: boolean;
+    // Начальное состояние для тех, кому оно не нужно под контролем: список сам
+    // решает, что открыто по умолчанию, а дальнейшие нажатия живут внутри
+    // раскрытия. Без `defaultOpen` оно управляемое и пишет в `open`.
+    defaultOpen?: boolean;
     // Заголовок строки может быть и крупным: тема списка читается заголовком, а
     // не подписью действия.
     size?: 'micro' | 'small' | 'h4';
@@ -31,6 +36,22 @@
     aside?: Snippet;
     children: Snippet;
   } = $props();
+
+  // Выбор читается внутри derived, а не один раз при создании состояния:
+  // начальное значение берётся из пропа, а решение человека, уже нажавшего
+  // строку, остаётся и после пересборки списка.
+  let own = $state<boolean | null>(null);
+
+  // Два режима в одном компоненте, и различаются они наличием `defaultOpen`:
+  // управляемое раскрытие (`bind:open`) живёт у родителя, неуправляемое — здесь.
+  // Одностороннее `open={...}` так работать не может: запись ребёнка возвращается
+  // к значению родителя, и строка, закрытая по умолчанию, не раскрывалась никогда.
+  const expanded = $derived(defaultOpen === undefined ? open : (own ?? defaultOpen));
+
+  function toggle(): void {
+    if (defaultOpen === undefined) open = !open;
+    else own = !expanded;
+  }
 
   // Геометрию строки ведёт app.css: заголовок, пояснение и числа должны
   // переноситься целиком, а не сжиматься в нечитаемую колонку на узком экране.
@@ -52,9 +73,9 @@
   <button
     type="button"
     class={head}
-    aria-expanded={open}
+    aria-expanded={expanded}
     aria-controls={id}
-    onclick={() => (open = !open)}
+    onclick={toggle}
   >
     <span class="disclosure__title">{title}</span>
     {#if summary}
@@ -68,7 +89,7 @@
     <Icon name="chevronDown" size={16} class="disclosure__mark" />
   </button>
 
-  <div {id} class="disclosure__body {bodyClass}" hidden={!open}>
-    {#if open}{@render children()}{/if}
+  <div {id} class="disclosure__body {bodyClass}" hidden={!expanded}>
+    {#if expanded}{@render children()}{/if}
   </div>
 </div>

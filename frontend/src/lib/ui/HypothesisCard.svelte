@@ -1,18 +1,18 @@
 <script lang="ts">
   import { countOf } from '$lib/format';
+  import { locatorsOf } from '$lib/numbers';
   import { hypothesisKindLabel } from '$lib/terms';
   import type { HypothesisSignal } from '$lib/types';
   import Disclosure from './Disclosure.svelte';
-  import SourceRef from './SourceRef.svelte';
 
-  let { signal }: { signal: HypothesisSignal } = $props();
-
-  function sourceHref(evidenceIndex: number): string {
-    const params = new URLSearchParams();
-    params.set('hypothesis', signal.id);
-    params.set('evidence', String(evidenceIndex));
-    return `/findings?${params.toString()}`;
-  }
+  // Цитата открывается листом у страницы, а не ссылкой на этот же экран:
+  // `/findings?hypothesis=…&evidence=…` вела обратно туда же и показывала
+  // полосой то, что уже лежало в этом же раскрытии. В строке списка остаётся
+  // отсылка (документ и место), а сам текст цитаты — в листе.
+  let {
+    signal,
+    onquote,
+  }: { signal: HypothesisSignal; onquote?: (index: number) => void } = $props();
 
   const sourceCount = $derived(new Set(signal.evidence.map((item) => item.document_id)).size);
 
@@ -48,9 +48,15 @@
     <ul class="hypo__evidence">
       {#each signal.evidence as item, index (`${signal.id}-evidence-${index}`)}
         <li>
-          <a class="hypo__source" href={sourceHref(index)}>
-            <SourceRef evidence={item} quote />
-          </a>
+          <button class="hypo__source" type="button" onclick={() => onquote?.(index)}>
+            <span class="hypo__doc">{item.source_title || 'Источник без названия'}</span>
+            <span class="hypo__where">
+              {#each locatorsOf(item) as part (part.kind)}
+                <span class="locator">{part.kind} <span class="num">{part.value}</span></span>
+              {/each}
+            </span>
+            <span class="micro hypo__open">Прочитать цитату</span>
+          </button>
         </li>
       {/each}
     </ul>
@@ -99,11 +105,47 @@
     list-style: none;
   }
 
+  /* Отсылка — действие: она открывает лист с текстом цитаты. Подложка у
+     строки появляется вместе с наведением, а не рамкой: рядов может быть
+     несколько, и обведённые строки читались бы списком карточек. */
   .hypo__source {
-    display: block;
-    color: inherit;
-    text-decoration: none;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--s1) var(--s3);
+    width: 100%;
+    min-height: 36px;
+    padding: var(--s2) var(--s3);
+    border: 0;
     border-radius: var(--r-sm);
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-soft);
+  }
+
+  .hypo__source:hover {
+    background: var(--surface-sunk);
+  }
+
+  .hypo__doc {
+    color: var(--ink-2);
+    font-size: var(--t-small);
+    overflow-wrap: anywhere;
+  }
+
+  .hypo__where {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: var(--s2);
+    color: var(--ink-3);
+    font-size: var(--t-micro);
+  }
+
+  .hypo__open {
+    color: var(--action-ink);
   }
 
   .hypo__source:focus-visible {
