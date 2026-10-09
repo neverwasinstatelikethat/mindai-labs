@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     gigachat_api_key: str | None = Field(default=None, repr=False)
     gigachat_base_url: str = "https://api.giga.chat/v1"
     gigachat_agent_model: str = "GigaChat-3-Ultra"
-    gigachat_graphrag_model: str = "GigaChat-Pro"
+    gigachat_graphrag_model: str = "GigaChat-3-Pro"
     # Legacy adapter retained for compatibility; production retrieval does not create it.
     gigachat_embeddings_model: str = "Embeddings"
     # TLS проверяется всегда: ключ провайдера не должен уходить в незащищённый канал.

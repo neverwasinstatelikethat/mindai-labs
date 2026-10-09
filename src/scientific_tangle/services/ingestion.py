@@ -107,16 +107,20 @@ class IngestionService:
             )
         ]
         if len(supported_claims) != len(extraction.claims):
-            supported_subjects = {claim.subject.casefold() for claim in supported_claims}
+            supported_entities = {
+                term.casefold()
+                for claim in supported_claims
+                for term in (claim.subject, claim.object)
+            }
             extraction = extraction.model_copy(
                 update={
                     "claims": supported_claims,
                     "entities": [
                         entity
                         for entity in extraction.entities
-                        if entity.name.casefold() in supported_subjects
-                        or entity.canonical_name.casefold() in supported_subjects
-                        or any(alias.casefold() in supported_subjects for alias in entity.aliases)
+                        if entity.name.casefold() in supported_entities
+                        or entity.canonical_name.casefold() in supported_entities
+                        or any(alias.casefold() in supported_entities for alias in entity.aliases)
                     ],
                 }
             )

@@ -109,6 +109,63 @@ async def test_ingestion_drops_claims_without_an_exact_source_quote() -> None:
     assert not any(item.id.startswith("finding-claim-") for item in knowledge.all_findings())
 
 
+@pytest.mark.asyncio
+async def test_ingestion_keeps_supported_claim_object_entities() -> None:
+    knowledge = InMemoryKnowledgeBase()
+    claim = ExtractedClaim(
+        subject="Шахтная вода",
+        predicate="CONTAINS",
+        object="Магнетит",
+        statement="Шахтная вода содержит магнетит.",
+        confidence=0.9,
+        evidence_quote="Шахтная вода содержит магнетит.",
+        fact_kind="composition",
+        context="",
+    )
+    supported_entities = [
+        ExtractedEntity(
+            name="Шахтная вода",
+            canonical_name="Шахтная вода",
+            type=NodeType.MATERIAL,
+        ),
+        ExtractedEntity(
+            name="Магнетит",
+            canonical_name="Магнетит",
+            type=NodeType.MATERIAL,
+        ),
+    ]
+    valid_bundle = IngestionBundle(
+        extraction=ExtractionResult(entities=supported_entities, claims=[claim])
+    )
+    unsupported_claim = claim.model_copy(
+        update={"subject": "Неназванный материал", "evidence_quote": "Нет в источнике."}
+    )
+    initial_bundle = IngestionBundle(
+        extraction=ExtractionResult(
+            entities=[
+                *supported_entities,
+                ExtractedEntity(
+                    name="Неназванный материал",
+                    canonical_name="Неназванный материал",
+                    type=NodeType.MATERIAL,
+                ),
+            ],
+            claims=[claim, unsupported_claim],
+        )
+    )
+    provider = ScriptedProvider(initial_bundle, valid_bundle)
+
+    receipt = await IngestionService(knowledge, provider).ingest(
+        DocumentRequest(
+            title="Пилот",
+            text="Шахтная вода содержит магнетит.",
+        )
+    )
+
+    assert receipt.extracted_claims == 1
+    assert provider.calls == ["IngestionBundle"]
+
+
 def test_facts_window_excludes_retrieval_chunks() -> None:
     knowledge = InMemoryKnowledgeBase()
     document = DocumentRequest(
