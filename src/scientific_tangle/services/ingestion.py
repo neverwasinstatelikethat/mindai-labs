@@ -42,8 +42,9 @@ Predicate — ровно одно имя из закрытого словаря 
 {relations_for_extraction()}
 У каждого claim.subject и claim.object обязана быть сущность в entities — по name,
 canonical_name или alias. Иначе утверждение считается неподдержанным.
-Для каждой сущности сформируй resolution proposal: link только при высокой уверенности,
-иначе create. Русские и английские синонимы своди к одному canonical_name.
+Формируй resolution proposals только для явных синонимов или алиасов; не создавай
+proposal типа create для каждой сущности. Если явных alias нет, верни пустой список resolutions.
+Русские и английские синонимы своди к одному canonical_name.
 """
 
 EXTRACTION_REPAIR_SYSTEM = f"""{EXTRACTION_SYSTEM}

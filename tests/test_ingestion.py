@@ -57,6 +57,10 @@ def test_extraction_prompts_require_entities_for_both_claim_endpoints() -> None:
         assert "entities" in prompt
 
 
+def test_extraction_prompt_avoids_resolution_proposal_per_entity() -> None:
+    assert "Если явных alias нет, верни пустой список resolutions." in EXTRACTION_SYSTEM
+
+
 @pytest.mark.asyncio
 async def test_ingestion_writes_extracted_claim_and_provenance_to_graph() -> None:
     knowledge = InMemoryKnowledgeBase()
