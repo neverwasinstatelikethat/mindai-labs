@@ -354,6 +354,7 @@ StoreBackend = AccountsMode
 
 class AnswerPayload(BaseModel):
     query_id: UUID = Field(default_factory=uuid4)
+    conversation_id: UUID | None = None
     question: str
     summary: str
     intent: IntentClassification | None = None
@@ -370,6 +371,8 @@ class AnswerPayload(BaseModel):
     # Честная сигнализация деградации: какие ограничения не дали собрать ответ
     # полностью (дедлайн, лимит рекурсии, пустое доказательное покрытие).
     degradation_reasons: list[str] = Field(default_factory=list)
+    # Ограничения, существенные для чтения ответа; диагностика остаётся отдельно.
+    limitations: list[str] = Field(default_factory=list)
 
 
 class QueryRequest(BaseModel):
@@ -415,10 +418,13 @@ class ToolAction(LlmForm):
         "conflict_scan",
         "gap_scan",
         "expert_lookup",
+        "finding_lookup",
+        "public_search",
     ]
     purpose: str = ""
     query: str = ""
     entities: list[str] = Field(default_factory=list)
+    finding_ids: list[str] = Field(default_factory=list, max_length=10)
     relation_types: list[str] = Field(default_factory=list)
     # Потолок прыжков остаётся жёстким в самой схеме: обход графа глубже потолка
     # — это бюджет провайдера, и «нельзя попросить весь provenance» должен
@@ -541,6 +547,7 @@ class ToolObservation(BaseModel):
     tool: str
     status: Literal["success", "warning", "error"]
     summary: str
+    public_query: str | None = None
     next_actions: list[str] = Field(default_factory=list)
     artifacts: list[str] = Field(default_factory=list)
     finding_ids: list[str] = Field(default_factory=list)
@@ -558,6 +565,7 @@ class AgentControlDecision(LlmForm):
     decision: Literal["continue_tools", "reason"]
     rationale: str = ""
     missing_evidence: list[str] = Field(default_factory=list)
+    action_plan: AgentActionPlan | None = None
 
     @field_validator("decision", mode="before")
     @classmethod
@@ -741,13 +749,16 @@ class IngestionBundle(LlmForm):
 
 
 class ReasoningResult(LlmForm):
-    summary: str
+    # Свободный Markdown; структура текста определяется задачей пользователя.
+    summary: str = ""
     # Пустой список — это «не найдено», а не «модель сломалась»: ответ без
     # цитат и без перечня пробелов честен, и штрафовать его за форму нельзя.
     finding_ids: list[str] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
     knowledge_gaps: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    # Автор может запросить ещё один поиск до написания окончательного ответа.
+    action_plan: AgentActionPlan | None = None
 
 
 class CritiqueResult(LlmForm):

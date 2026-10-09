@@ -13,18 +13,27 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 
 class EvidenceLocator(BaseModel):
     document_id: UUID
     source_title: str = "Источник"
+    source_url: str | None = None
+    retrieved_at: str | None = None
     page: int | None = Field(default=None, ge=1)
     sheet: str | None = None
     cell_range: str | None = None
     char_start: int | None = Field(default=None, ge=0)
     char_end: int | None = Field(default=None, ge=0)
     quote: str = Field(min_length=1)
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def validate_source_url(cls, value: object) -> str | None:
+        # Строка сохраняется в LangGraph/Postgres checkpoint; объект HttpUrl
+        # не поддерживается msgpack-сериализатором состояния графа.
+        return None if value is None else str(HttpUrl(str(value)))
 
     @model_validator(mode="after")
     def validate_offsets(self) -> EvidenceLocator:
@@ -33,8 +42,8 @@ class EvidenceLocator(BaseModel):
         if self.char_start is not None and self.char_end is not None:
             if self.char_end <= self.char_start:
                 raise ValueError("char_end должен быть больше char_start")
-        if self.page is None and self.sheet is None:
-            raise ValueError("evidence должен указывать страницу или лист")
+        if self.page is None and self.sheet is None and self.source_url is None:
+            raise ValueError("evidence должен указывать страницу, лист или URL источника")
         return self
 
 

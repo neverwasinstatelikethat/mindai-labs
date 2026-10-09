@@ -125,7 +125,9 @@
   }
 </script>
 
-<Sheet title="Вердикт" description={subject} width="620px" {onclose}>
+<!-- `subject` называется один раз: ниже, в блоке «Что вы решаете», где он и
+     прочитывается как основание вердикта. -->
+<Sheet title="Вердикт" width="620px" {onclose}>
   {#if gate}
     <Notice tone="warn" title="Вердикт не записывается">{gate}</Notice>
   {:else if sent}
@@ -285,11 +287,16 @@
     cursor: pointer;
     transition:
       border-color var(--dur-fast) var(--ease-soft),
-      background-color var(--dur-fast) var(--ease-soft);
+      background-color var(--dur-fast) var(--ease-soft),
+      transform var(--dur-fast) var(--ease-enter);
   }
 
   .verdict__option:hover {
     border-color: var(--line-strong);
+  }
+
+  .verdict__option:active {
+    transform: scale(0.98);
   }
 
   .verdict__option--on {
@@ -330,8 +337,6 @@
     gap: var(--s2);
     margin: 0;
     padding: 0;
-    max-block-size: 16rem;
-    overflow-y: auto;
     list-style: none;
   }
 
@@ -346,10 +351,16 @@
     background: var(--surface);
     text-align: start;
     cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease-soft);
+    transition:
+      border-color var(--dur-fast) var(--ease-soft),
+      transform var(--dur-fast) var(--ease-enter);
   }
 
   .verdict__pick:hover {
     border-color: var(--line-strong);
+  }
+
+  .verdict__pick:active {
+    transform: scale(0.99);
   }
 </style>

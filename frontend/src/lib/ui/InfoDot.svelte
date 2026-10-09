@@ -248,6 +248,9 @@
   .infodot__pop--above {
     top: auto;
     bottom: calc(100% + var(--s2));
+    /* Вверх пояснение входит со стороны триггера, а не с той же стороны, что
+       и обычный выпуск вниз. */
+    animation-name: info-in-above;
   }
 
   .infodot__pop--mobile {
@@ -290,6 +293,17 @@
     from {
       opacity: 0;
       transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes info-in-above {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
     }
     to {
       opacity: 1;

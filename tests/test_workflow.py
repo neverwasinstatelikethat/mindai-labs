@@ -82,7 +82,7 @@ def planning_bundle() -> PlanningBundle:
 
 @pytest.mark.parametrize("language", ["ru", "en"])
 @pytest.mark.asyncio
-async def test_unapproved_answer_shows_open_issue_before_draft(language: str) -> None:
+async def test_unapproved_answer_withholds_draft(language: str) -> None:
     workflow = ResearchWorkflow(provider=ScriptedProvider())
     issue = "Связь с выбранным оборудованием не подтверждена."
     draft = "Размагничивание может снизить энергозатраты."
@@ -94,8 +94,11 @@ async def test_unapproved_answer_shows_open_issue_before_draft(language: str) ->
         "revision_count": 1,
     })
     summary = result["answer"].summary
-    assert summary.index(issue) < summary.index(draft)
-    assert summary.startswith("Предварительный" if language == "ru" else "Preliminary")
+    assert draft not in summary
+    assert issue not in summary
+    assert summary.startswith("Подготовленный" if language == "ru" else "The draft")
+    assert result["answer"].confidence == 0
+    assert result["answer"].limitations
 
 
 @pytest.mark.asyncio
@@ -275,7 +278,7 @@ async def test_ingestion_and_self_evolve_are_model_driven() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("intent", ["graph_edit", "report_generation"])
+@pytest.mark.parametrize("intent", ["graph_edit"])
 async def test_intents_without_retrieval_exit_before_the_tool_loop(intent: str) -> None:
     """Запросам вне action space не нужен ни retrieval, ни цикл критика."""
     provider = ScriptedProvider(

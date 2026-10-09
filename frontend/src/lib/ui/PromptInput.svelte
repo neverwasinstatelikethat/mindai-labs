@@ -119,7 +119,7 @@
     {#if hint}
       <span class="prompt__hint">{hint}</span>
     {:else}
-      <span class="prompt__hint">Enter — отправить</span>
+      <span class="prompt__hint">Enter: отправить</span>
     {/if}
 
     <button

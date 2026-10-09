@@ -2,7 +2,7 @@ import { redirect } from '@sveltejs/kit';
 import type { PageLoad } from './$types';
 
 /**
- * Экран сравнения чисел переехал в раздел «Числа» (фасет сходимости).
+ * Экран сравнения чисел переехал в фасет «Числа» раздела «Гипотезы».
  *
  * Редирект серверный и постоянный: старые ссылки живут в документах, в
  * закладках аналитиков и в ответах агента, поэтому 301/308, а не 307.
@@ -11,7 +11,7 @@ import type { PageLoad } from './$types';
  */
 export const load: PageLoad = ({ url }) => {
   const params = new URLSearchParams(url.searchParams);
-  params.set('facet', 'topics');
+  params.set('facet', 'numbers');
   const query = params.toString();
-  throw redirect(308, query ? `/numbers?${query}` : '/numbers');
+  throw redirect(308, query ? `/findings?${query}` : '/findings?facet=numbers');
 };

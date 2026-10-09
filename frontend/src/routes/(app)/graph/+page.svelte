@@ -8,8 +8,9 @@
   import { tick } from 'svelte';
   import { api, ApiError } from '$lib/api';
   import GraphMap from '$lib/GraphMap.svelte';
+  import SourceRef from '$lib/ui/SourceRef.svelte';
   import { navLabel } from '$lib/nav';
-  import { countOf, num } from '$lib/format';
+  import { countOf, num, plainName } from '$lib/format';
   import { session } from '$lib/sessionStore.svelte';
   import {
     ASK_SOURCE,
@@ -18,13 +19,13 @@
     MAP_NAME_FALLBACK,
     MAP_NOUN,
     MAP_SEARCH,
-    MAP_UNNAMED_AREA,
     PROPERTY_LABELS,
     STATUS_SHORT,
     SUBJECT_LABELS,
     TERM_FALLBACKS,
     describeValue,
     knownTerm,
+    mapAreaName,
     mapNodeType,
     mapRelationLabel,
     mapSearchEmptyBody,
@@ -112,16 +113,22 @@
    * раскрытием «Служебные данные».
    */
   const serverNames = $derived.by(() => {
+    // Ключ реестра записывается в двух формах: сырой (`carbon_dioxide`) и
+    // человеческой (`carbon dioxide`). Метка узла на экран выходит уже без
+    // подчёркиваний, и по обеим формам она находится одинаково.
     const map = new Map<string, string>();
+    const register = (key: string, value: string) => {
+      const clean = key.trim().toLowerCase();
+      if (clean === '') return;
+      map.set(clean, value);
+      map.set(clean.replaceAll('_', ' '), value);
+    };
     for (const node of graph.nodes) {
-      map.set(node.id.toLowerCase(), node.label);
-      map.set(node.label.toLowerCase(), node.label);
+      register(node.id, node.label);
+      register(node.label, node.label);
       const aliases = node.metadata['aliases'];
       if (typeof aliases === 'string') {
-        for (const alias of aliases.split(',')) {
-          const key = alias.trim().toLowerCase();
-          if (key !== '') map.set(key, node.label);
-        }
+        for (const alias of aliases.split(',')) register(alias, node.label);
       }
     }
     return map;
@@ -172,10 +179,9 @@
     return raw === '' ? TERM_FALLBACKS.predicate : mapRelationLabel(raw);
   }
 
-  /** Область записи: серверная метка либо названная группа без метки. */
+  /** Область записи: тем же именем, что и на поле, — со служебным ключом вне. */
   function areaOf(node: GraphNode): string {
-    const raw = node.metadata['community'];
-    return typeof raw === 'string' && raw.trim() !== '' ? raw : MAP_UNNAMED_AREA;
+    return mapAreaName(node.metadata['community']);
   }
 
   /**
@@ -319,6 +325,15 @@
     connectionsAll ? connections : connections.slice(0, CONNECTIONS_PAGE),
   );
 
+  /** Имена связей отсутствуют у всего списка сразу: тогда заглушку нечего
+   *  повторять в каждой строке, и факт говорит одной строкой над списком. */
+  const relationsUnnamed = $derived(
+    shownConnections.length > 0 &&
+      shownConnections.every(
+        (conn) => mapRelationLabel(conn.edge.relation) === mapRelationLabel(''),
+      ),
+  );
+
   /** Источник выбранной записи: соседний документ этого же среза карты. */
   const sourceDocument = $derived.by<GraphNode | null>(() => {
     for (const conn of connections) {
@@ -369,7 +384,13 @@
     try {
       const snapshot = await api.graph();
       if (call !== requestSeq) return;
-      graph = snapshot;
+      // Узлы приходят из графа служебной формой имени (`Carbon_dioxide`).
+      // Исправляется один раз на входе: поиск, подписи поля, строки цепочки и
+      // шапка инспектора читают уже человеческое имя.
+      graph = {
+        ...snapshot,
+        nodes: snapshot.nodes.map((node) => ({ ...node, label: plainName(node.label) })),
+      };
       pick(null);
       status = 'ready';
     } catch (reason) {
@@ -525,61 +546,44 @@
         <dd>{mapNodeType(selected.type)}</dd>
         <dt>область на карте</dt>
         <dd>{areaOf(selected)}</dd>
-        {#if focusArea}
-          <dt>записей в этой области</dt>
-          <dd class="num">{num(focusArea.records)}</dd>
-          <dt>связей в этой области</dt>
-          <dd class="num">{num(focusArea.links)}</dd>
-        {/if}
-        <dt>связей всего</dt>
-        <dd class="num">{connections.length}</dd>
-        <dt>из них исходящих</dt>
-        <dd class="num">{outgoingCount}</dd>
-        <dt>входящих</dt>
-        <dd class="num">{connections.length - outgoingCount}</dd>
       </dl>
 
       <div class="map__conn">
         <div class="row row--between">
           <h3 class="h4">Связи этой записи</h3>
-          <p class="micro muted map__count">
-            {#if connections.length > shownConnections.length}
-              <span>
-                показано
-                <span class="num">{shownConnections.length}</span>
-                из
-                <span class="num">{connections.length}</span>
-              </span>
-            {:else}
-              <span class="num">
-                {countOf(
-                  connections.length,
-                  MAP_NOUN.link.one,
-                  MAP_NOUN.link.few,
-                  MAP_NOUN.link.many,
-                )}
-              </span>
-            {/if}
-          </p>
+          {#if connections.length > shownConnections.length}
+            <!-- Число называет только скрытую часть: когда список весь на
+                 экране, счётчик повторял бы то, что посчитано глазами. -->
+            <p class="micro muted map__count">
+              показано
+              <span class="num">{shownConnections.length}</span>
+              из
+              <span class="num">{connections.length}</span>
+            </p>
+          {/if}
         </div>
         {#if connections.length === 0}
           <p class="micro muted">В этой карте у записи нет связей.</p>
         {:else}
-          <p class="micro muted map__list-head">
-            направление, отношение и связанная запись
-          </p>
-          <ul class="map__conn-list">
+          {#if relationsUnnamed}
+            <p class="micro muted">
+              Имя связи в графе не задано ни у одной строки: показаны направление и запись.
+            </p>
+          {/if}
+          <ul class="map__conn-list" data-unnamed={relationsUnnamed ? 'true' : undefined}>
             {#each shownConnections as conn, i (`${conn.edge.id}-${i}`)}
               <li>
                 <span class="micro muted map__dir">{conn.outgoing ? 'исходит' : 'входит'}</span>
-                <button
-                  type="button"
-                  class="map__rel"
-                  aria-pressed={pickedEdge?.id === conn.edge.id}
-                  onclick={() => pickEdge(pickedEdge?.id === conn.edge.id ? null : conn.edge)}
-                >
-                  <span>{mapRelationLabel(conn.edge.relation)}</span>
-                </button>
+                {#if !relationsUnnamed}
+                  <button
+                    type="button"
+                    class="map__rel"
+                    aria-pressed={pickedEdge?.id === conn.edge.id}
+                    onclick={() => pickEdge(pickedEdge?.id === conn.edge.id ? null : conn.edge)}
+                  >
+                    <span>{mapRelationLabel(conn.edge.relation)}</span>
+                  </button>
+                {/if}
                 {#if conn.other}
                   {@const target = conn.other}
                   <button type="button" class="map__jump" onclick={() => pick(target)}>
@@ -640,7 +644,8 @@
     <div class="map__evidence">
       <div class="row row--between">
         <h3 class="h4">Доказательства этой записи</h3>
-        {#if findingsStatus === 'ready'}
+        {#if findingsStatus === 'ready' && relatedFindings.length > 0}
+          <!-- Нуль здесь только повторил бы строку «доказательств не найдено». -->
           <p class="micro muted map__count">
             <span class="num">
               {countOf(relatedFindings.length, 'находка', 'находки', 'находок')}
@@ -721,69 +726,38 @@
           <article class="map__claim">
             <div class="row row--between">
               <p class="eyebrow map__claim-tags">
-                <span>{subjectName(finding)}</span>
-                <span>{predicateName(finding)}</span>
-                <span>версия <span class="num">{finding.version}</span></span>
+                <span>{predicateName(finding)}: {subjectName(finding)}</span>
+                {#if finding.version > 1}
+                  <span>версия <span class="num">{num(finding.version)}</span></span>
+                {/if}
               </p>
               <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
             </div>
 
-            <h4 class="h4">{finding.statement}</h4>
+            <h4 class="h4 map__claim-title">
+              <!-- Формулировка утверждения и есть вход в него: отдельная кнопка
+                   «Открыть» под текстом только повторяет тот же путь. -->
+              <a class="map__claim-open" href={findingsHref(finding)}>{finding.statement}</a>
+            </h4>
 
             {#if finding.observations.length > 0}
               {@render obsTable(finding.observations, 'Числовые условия утверждения')}
-            {:else}
-              <p class="micro muted">
-                Утверждение без числовых условий: сравнение идёт по формулировке и по месту
-                в источнике.
-              </p>
             {/if}
 
-            <div class="map__ev">
-              <div class="row row--between">
+            {#if finding.evidence.length > 0}
+              <div class="map__ev">
                 <p class="small">Места в источнике</p>
-                <p class="micro muted">
-                  <span class="num">
-                    {countOf(
-                      finding.evidence.length,
-                      'доказательство',
-                      'доказательства',
-                      'доказательств',
-                    )}
-                  </span>
-                </p>
-              </div>
-              {#if finding.evidence.length === 0}
-                <p class="micro muted">
-                  У утверждения нет ни одного места в источнике: проверить первоисточник
-                  по этой находке нельзя.
-                </p>
-              {:else}
                 {#each finding.evidence as ev, i (`${finding.id}-ev-${i}`)}
-                  <figure class="map__evidence-item">
-                    <blockquote class="quote">{ev.quote}</blockquote>
-                    <figcaption class="locator">
-                      <Icon name="doc" size={14} />
-                      <span>{ev.source_title || 'источник без названия'}</span>
-                      {#if ev.page != null}<span>стр. <span class="num">{ev.page}</span></span>{/if}
-                      {#if ev.sheet}<span>лист {ev.sheet}</span>{/if}
-                      {#if ev.cell_range}
-                        <span>ячейки {ev.cell_range}</span>
-                      {/if}
-                    </figcaption>
-                  </figure>
+                  <SourceRef evidence={ev} quote />
                 {/each}
-              {/if}
-            </div>
+              </div>
+            {/if}
 
-            <div class="row">
-              <Button href={findingsHref(finding)} variant="quiet" size="sm">
-                {ASK_SOURCE.findings}
+            {#if finding.status === 'disputed'}
+              <Button href="/findings?facet=numbers" variant="link" size="sm">
+                Открыть расхождение
               </Button>
-              {#if finding.status === 'disputed'}
-                <Button href="/numbers" variant="quiet" size="sm">Открыть расхождение</Button>
-              {/if}
-            </div>
+            {/if}
           </article>
         {/each}
 
@@ -836,23 +810,26 @@
       {#if status === 'ready'}
         <div class="map__head-tools">
           {#if graph.nodes.length > 0}
-            <div class="map__modes" role="group" aria-label={MAP_MODES.group}>
-              <Button
-                variant={mode === 'search' ? 'action' : 'quiet'}
-                size="sm"
-                current={mode === 'search'}
+            <!-- Режимы карты — та же сегментная полоса, что и фасеты находок:
+                 две кнопки с заливкой читались как два отдельных действия,
+                 хотя выбирают они один и тот же вид. -->
+            <div class="seg map__modes" role="group" aria-label={MAP_MODES.group}>
+              <button
+                class="seg__item"
+                type="button"
+                aria-pressed={mode === 'search'}
                 onclick={() => setMode('search')}
               >
                 {MAP_MODES.search}
-              </Button>
-              <Button
-                variant={mode === 'map' ? 'action' : 'quiet'}
-                size="sm"
-                current={mode === 'map'}
+              </button>
+              <button
+                class="seg__item"
+                type="button"
+                aria-pressed={mode === 'map'}
                 onclick={() => setMode('map')}
               >
                 {MAP_MODES.analysis}
-              </Button>
+              </button>
             </div>
           {/if}
           <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
@@ -909,7 +886,7 @@
       <Empty
         icon="graph"
         title="Связей пока нет"
-        body="Загрузите материалы или начните с вопроса — связанные факты появятся здесь."
+        body="Загрузите материалы или начните с вопроса. Связанные факты появятся здесь."
       >
         {#snippet action()}
           <div class="row">
@@ -975,9 +952,10 @@
       {:else}
         <div class="map__density">
           <!-- Режим подписей — подписанный control-элемент: он переключает поле,
-               а не описывает себя текстом рядом. -->
+               а не описывает себя текстом рядом. Кораловый ход на экране занят
+               задачей, настройка поля darker не требует. -->
           <Button
-            variant={labelsAll ? 'action' : 'quiet'}
+            variant={labelsAll ? 'ink' : 'quiet'}
             size="sm"
             current={labelsAll}
             onclick={() => (labelsAll = !labelsAll)}
@@ -1073,12 +1051,6 @@
 
   /* Переключатель сценариев: две кнопки в одной строке, активная читается и
      заполнением, и `aria-current`. */
-  .map__modes {
-    display: flex;
-    align-items: center;
-    gap: var(--s2);
-  }
-
   .map__search {
     display: flex;
     flex-direction: column;
@@ -1127,30 +1099,30 @@
     gap: var(--s2);
   }
 
+  /* Найденное живёт в утопленной панели: рамка вокруг каждой строки превращала
+     список из тринадцати записей в тринадцать карточек. Строка остаётся
+     строкой, отклик появляется под курсором и на выбранной записи. */
   .map__result-row {
     display: flex;
     align-items: baseline;
     gap: var(--s3);
     width: 100%;
     padding: var(--s3) var(--s4);
-    border: 1px solid var(--line);
+    border: 0;
     border-radius: var(--r-sm);
-    background: var(--surface);
+    background: none;
     color: var(--ink);
     font: inherit;
     text-align: start;
     cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease-soft),
-      background var(--dur-fast) var(--ease-soft);
+    transition: background var(--dur-fast) var(--ease-soft);
   }
 
   .map__result-row:hover {
-    border-color: var(--line-strong);
-    background: var(--surface-raised);
+    background: var(--surface);
   }
 
   .map__result-row[data-active='true'] {
-    border-color: var(--line-strong);
     background: var(--sage);
   }
 
@@ -1279,11 +1251,6 @@
     flex-wrap: wrap;
   }
 
-  .map__list-head {
-    margin: var(--s2) 0 0;
-    letter-spacing: var(--tr-body);
-  }
-
   .map__conn-list {
     list-style: none;
     margin: var(--s2) 0 0;
@@ -1303,6 +1270,19 @@
 
   .map__dir {
     color: var(--ink-3);
+  }
+
+  /* Без имён связей колонка под заглушку не нужна: строка читается как
+     направление и запись. */
+  .map__conn-list[data-unnamed='true'] li {
+    grid-template-columns: 66px minmax(0, 1fr);
+  }
+
+  /* Тип записи — короткое слово, резать его по слогам нельзя: перенос
+     остаётся метке записи, тип стоит цельным словом. */
+  .map__jump > span {
+    flex: none;
+    white-space: nowrap;
   }
 
   /* Отношение связи — действие: с клавиатуры оно выбирает связь и раскрывает её
@@ -1364,25 +1344,47 @@
     gap: var(--s4);
   }
 
+  /* Находка — плоская строка панели: заполнение остаётся цитате, иначе блок
+     ложится на блок и в панели из трёх слоёв ничего не читается. */
   .map__claim {
     display: flex;
     flex-direction: column;
     gap: var(--s3);
-    padding: var(--s5);
-    border-radius: var(--r-lg);
-    background: var(--surface-sunk);
+    padding-top: var(--s4);
+    border-top: 1px solid var(--line-soft);
+  }
+
+  .map__claim:first-of-type {
+    padding-top: 0;
+    border-top: 0;
+  }
+
+  .map__claim-title {
+    margin: 0;
+    max-width: var(--maxw-measure);
+  }
+
+  .map__claim-open {
+    color: inherit;
+    text-decoration: none;
+    border-radius: var(--r-sm);
+    overflow-wrap: anywhere;
+  }
+
+  .map__claim-open:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .map__claim-open:focus-visible {
+    outline: 2px solid var(--action-ink);
+    outline-offset: 3px;
   }
 
   .map__ev {
     display: flex;
     flex-direction: column;
     gap: var(--s3);
-  }
-
-  .map__evidence-item {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s2);
   }
 
   .map__caption {

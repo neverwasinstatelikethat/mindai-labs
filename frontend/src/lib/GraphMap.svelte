@@ -56,7 +56,7 @@
   import { tick } from 'svelte';
   // GraphNode уже импортирован в <script module> — то же пространство имён.
   import type { GraphEdge, GraphSnapshot } from './types';
-  import { countOf, plural } from './format';
+  import { countOf, num, plural } from './format';
   import {
     MAP_INFO_AREAS,
     MAP_INFO_FIELD,
@@ -1011,12 +1011,14 @@
             {MAP_OVERVIEW_TITLE}
           </button>
         {/if}
-        <h2 class="h4 map__path-name">{activeArea}</h2>
+        <h2 class="h4 map__path-name" title={activeArea}>{activeArea}</h2>
         <p class="micro muted map__path-count">
           в отборе <span class="num">
             {countOf(filtered, MAP_NOUN.record.one, MAP_NOUN.record.few, MAP_NOUN.record.many)}
           </span>
-          из <span class="num">{countOf(areaNodes.length, MAP_NOUN.record.one, MAP_NOUN.record.few, MAP_NOUN.record.many)}</span>
+          {#if filtered !== areaNodes.length}
+            из <span class="num">{num(areaNodes.length)}</span>
+          {/if}
         </p>
       </nav>
 
@@ -1031,18 +1033,21 @@
         />
       </div>
 
-      {#if legend.length > 0}
+      {#if legend.length > 1}
+        <!-- Все виды включены по умолчанию, поэтому чипы спокойные: тёмным
+             становится только то, что человек выключил, и выключенное названо
+             словом, а не одним цветом. -->
         <div class="map__types" role="group" aria-label="Виды записей на поле">
           {#each legend as item (item.type)}
             <Button
-              class="map__type-button"
+              class={`map__type-button${item.on ? '' : ' map__type-button--off'}`}
               size="sm"
-              variant={item.on ? 'ink' : 'quiet'}
-              current={item.on}
+              variant="quiet"
               onclick={() => toggleType(item.type)}
             >
               {item.label}
               <span class="num">{item.count}</span>
+              {#if !item.on}<span class="map__type-off">скрыт</span>{/if}
             </Button>
           {/each}
         </div>
@@ -1520,11 +1525,18 @@
     min-width: 0;
   }
 
-  /* Название области — заголовок уровня, а не абзац: под ним читается счётчик. */
+  /* Название области — заголовок уровня, а не абзац: под ним читается счётчик.
+     Сервер подписывает область и целой формулировкой утверждения: заголовок
+     держит две строки, полное имя остаётся в подсказке и в карточке обзора. */
   .map__path h2 {
     margin: 0;
     min-width: 0;
-    overflow-wrap: anywhere;
+    max-width: min(100%, 46ch);
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
   }
 
   .map__path p {
@@ -1592,8 +1604,17 @@
     font-weight: 600;
   }
 
-  .map__types :global(.btn:active) {
-    transform: none;
+  /* Выключенный вид: светлее и названо словом. Включённый чип остаётся
+     обычным — тёмная плашка на каждом чипе превращает отбор в три кнопки. */
+  .map__types :global(.map__type-button--off) {
+    color: var(--ink-4);
+    border-color: var(--line);
+  }
+
+  .map__type-off {
+    font-size: var(--t-micro);
+    font-weight: 500;
+    color: var(--ink-4);
   }
 
   .map__focus {

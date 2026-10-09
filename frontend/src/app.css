@@ -694,6 +694,19 @@
   padding: var(--s1);
   border-radius: var(--r-pill);
   background: var(--surface-sunk);
+  /* Полоса фасетов не имеет права растягивать документ на узком экране:
+     она крутится сама, а элементы в ней не сжимаются в нечитаемые. */
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.seg::-webkit-scrollbar {
+  display: none;
+}
+
+.seg > .seg__item {
+  flex: none;
 }
 
 .seg__ind {
@@ -1369,28 +1382,72 @@
   inset: 0;
   z-index: var(--z-veil);
   display: grid;
-  place-items: end center;
+  place-items: center;
   background: var(--veil);
   backdrop-filter: blur(6px);
-  padding: var(--s4);
+  padding: clamp(var(--s4), 3vw, var(--s7));
+  animation: veil-in var(--dur-fast) var(--ease-soft);
 }
 
+/* Шторка — три зоны одного листа: шапка, тело, действия. Прокрутку ведёт тело,
+   поэтому заголовок и кнопки остаются на месте, пока человек читает
+   доказательство, и действие не уезжает за нижний край. */
 .sheet {
+  display: flex;
+  flex-direction: column;
   width: min(100%, 720px);
-  max-height: min(86vh, 900px);
-  overflow-y: auto;
-  padding: clamp(var(--s5), 3vw, var(--s7));
+  max-height: min(88dvh, 900px);
+  overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: var(--r-xl) var(--r-xl) var(--r-lg) var(--r-lg);
+  border-radius: var(--r-xl);
   background: var(--surface);
   box-shadow: var(--shadow-lift);
-  animation: rise var(--dur) var(--ease-enter);
+  /* Начальная точка — 98,5 % и лёгкий сдвиг: из ничего шторка не возникает. */
+  animation: sheet-in var(--dur) var(--ease-enter);
 }
 
-@keyframes rise {
+@keyframes veil-in {
   from {
-    transform: translateY(18px);
     opacity: 0;
+  }
+}
+
+@keyframes sheet-in {
+  from {
+    transform: translateY(16px) scale(0.985);
+    opacity: 0;
+  }
+}
+
+@media (max-width: 640px) {
+  /* Узкий экран — нижний лист: без полей вокруг, скругление только сверху,
+     высота от dvh, чтобы адресная строка не срезала действия. */
+  .veil {
+    place-items: end center;
+    padding: 0;
+  }
+
+  .sheet {
+    max-height: 92dvh;
+    border-inline: 0;
+    border-bottom: 0;
+    border-radius: var(--r-xl) var(--r-xl) 0 0;
+    animation: sheet-up var(--dur) var(--ease-enter);
+  }
+
+  @keyframes sheet-up {
+    from {
+      transform: translateY(24px);
+      opacity: 0;
+    }
+  }
+}
+
+/* Размытие под шторкой — украшение, а не смысл: при выключенной прозрачности
+    остаётся плотная подложка, и текст за шторкой не просвечивает. */
+@media (prefers-reduced-transparency: reduce) {
+  .veil {
+    backdrop-filter: none;
   }
 }
 

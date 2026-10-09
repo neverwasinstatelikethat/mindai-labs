@@ -18,9 +18,9 @@
   import { FAILURE_WORDS, RUN_FAILURES } from '$lib/terms';
   import type { RunFailureKind } from '$lib/terms';
   import type { AnswerHistoryItem, AnswerPayload } from '$lib/types';
-  import { stageOfNode } from '$lib/terms/research';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
+  import { stageOfNode } from '$lib/terms/research';
 
   interface StreamEvent {
     type: string;
@@ -37,6 +37,9 @@
 
   let question = $state('');
   let answer = $state<AnswerPayload | null>(null);
+  let turns = $state<AnswerPayload[]>([]);
+  let threadId: string | null = null;
+  let progressStages = $state<string[]>([]);
   let history = $state<AnswerHistoryItem[]>([]);
   let historyHasMore = $state(false);
   let historyOffset = $state(0);
@@ -48,7 +51,6 @@
   let savingConversation = $state<string | null>(null);
   let savedConversation = $state<string | null>(null);
   let historySaveError = $state('');
-  let progressStages = $state<string[]>([]);
   let historyRequest = 0;
   let running = $state(false);
   // Прежний ответ остаётся доступен в серверной истории после нового вопроса.
@@ -82,8 +84,12 @@
   function applyAnswer(payload: AnswerPayload, refreshHistory = true): void {
     delivered = true;
     answer = payload;
+    threadId = payload.conversation_id ?? threadId;
+    if (refreshHistory && !turns.some((turn) => turn.query_id === payload.query_id)) {
+      turns = [...turns, payload];
+    }
     question = payload.question;
-    openClaimId = payload.findings[0]?.id ?? null;
+    openClaimId = null;
     focusKey = null;
     historySelection = payload.query_id;
     if (refreshHistory) void loadAnswerHistory(0);
@@ -117,7 +123,10 @@
     historyError = '';
     failure = null;
     try {
-      applyAnswer(await api.savedAnswer(item.query_id), false);
+      const payload = await api.savedAnswer(item.query_id);
+      turns = [payload];
+      threadId = payload.conversation_id ?? null;
+      applyAnswer(payload, false);
     } catch (reason) {
       historyError = reasonText(reason, 'Этот ответ больше недоступен.');
     } finally {
@@ -288,7 +297,6 @@
     if (running) return;
     question = asked;
     running = true;
-    progressStages = [];
     delivered = false;
     failure = null;
     notice = null;
@@ -296,6 +304,8 @@
     openClaimId = null;
 
     controller = new AbortController();
+    threadId ??= crypto.randomUUID();
+    progressStages = [];
     const signal = controller.signal;
 
     try {
@@ -303,7 +313,7 @@
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: asked, language: 'ru', mode: 'hybrid' }),
+        body: JSON.stringify({ thread_id: threadId, question: asked, language: 'ru', mode: 'hybrid' }),
         signal,
       });
 
@@ -351,11 +361,11 @@
             question = event.question;
           } else if (event.type === 'answer' && event.answer) {
             applyAnswer(event.answer);
-          } else if (event.type === 'step' && event.step?.agent) {
-            const label = stageOfNode(event.step.agent)?.label;
-            if (label && !progressStages.includes(label)) progressStages = [...progressStages, label];
           } else if (event.type === 'error') {
             failure = failureFromStream(event.code, event.message ?? '', asked);
+          } else if (event.type === 'step' && event.step?.agent) {
+            const stage = stageOfNode(event.step.agent)?.label;
+            if (stage && progressStages.at(-1) !== stage) progressStages = [...progressStages, stage];
           }
         }
       }
@@ -390,6 +400,9 @@
   // Прежний ответ уходит с экрана только по явному действию человека: сервер не
   // отдаёт список прошлых ответов, и second try чужой работы не вернёт.
   function clearAnswer(): void {
+    turns = [];
+    threadId = null;
+    progressStages = [];
     answer = null;
     question = '';
     failure = null;
@@ -576,6 +589,7 @@
       {answer}
       {question}
       {running}
+      {turns}
       {progressStages}
       error={failure}
       {openClaimId}

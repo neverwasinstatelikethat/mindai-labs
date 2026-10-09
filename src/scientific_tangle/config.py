@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     # Транспортные повторы внутри SDK; поверх — не больше двух попыток schema-repair.
     gigachat_max_retries: int = Field(default=3, ge=0, le=10)
 
+    # Без ключа доступны научные публикации Europe PMC; Tavily расширяет поиск на веб.
+    tavily_api_key: str | None = Field(default=None, repr=False)
+
     embedding_dimensions: int = Field(default=1024, ge=8)
 
     # Бюджет одного агентного запроса: общий дедлайн ограничивает и LLM, и retrieval.

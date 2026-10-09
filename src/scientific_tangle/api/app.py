@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from httpx import TransportError as HttpxTransportError
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from neo4j.exceptions import DriverError as Neo4jDriverError
 from neo4j.exceptions import TransientError as Neo4jTransientError
@@ -307,7 +308,7 @@ class AppDependencies:
         # раньше StateGraph собирался в конструкторе и тут же пересобирался в
         # lifespan, то есть двойная компиляция на каждый старт процесса.
         self._workflow: ResearchWorkflow | None = None
-        self.checkpointer: object | None = None
+        self.checkpointer: object | None = InMemorySaver()
         # Учётные записи: пул Postgres здесь только конструируется, открытие и
         # создание схемы — в lifespan (см. _prepare_accounts).
         self.accounts: AccountsStore = build_accounts(self.settings)
@@ -1753,6 +1754,7 @@ async def research_query(
             )
 
         answer = await _await_or_client_gone(request, _run_research)
+        answer = answer.model_copy(update={"conversation_id": query.thread_id})
         filtered, evaluation = await _finalize_answer(
             request, deps, answer, allowed, account, audit_action="query.run"
         )
@@ -1982,7 +1984,8 @@ async def stream_query(
                 )
                 return
             filtered, _ = await _finalize_answer(
-                request, deps, answer, allowed, account, audit_action="query.stream"
+                request, deps, answer.model_copy(update={"conversation_id": query.thread_id}),
+                allowed, account, audit_action="query.stream"
             )
             yield _sse(
                 {

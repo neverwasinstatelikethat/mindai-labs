@@ -24,6 +24,7 @@ from scientific_tangle.domain.models import QueryPlan
 from scientific_tangle.domain.relations import resolve_relations
 from scientific_tangle.services.knowledge import KnowledgeBase, RetrievalContext
 from scientific_tangle.services.provider import redact_provider_error
+from scientific_tangle.services.public_sources import PublicSourceSearch
 from scientific_tangle.services.research_intelligence import (
     DEFAULT_GAP_LIMIT,
     MAX_VALUES_PER_DIMENSION,
@@ -44,7 +45,7 @@ OMITTED_NOTE_PREFIX = "Не показано"
 
 # Идентичность действия для дедупликации пула: одно и то же обращение к knowledge
 # считается повторным, только если совпадают и инструмент, и все его аргументы.
-ActionKey = tuple[str, str, tuple[str, ...], tuple[str, ...], int]
+ActionKey = tuple[str, tuple[str, ...], str, tuple[str, ...], tuple[str, ...], int]
 
 # Запас кооперативной отмены: действие не начинается, если остатка уже нет. Значение
 # маленькое нарочно — смысл проверки в том, чтобы не запускать новую работу в
@@ -166,8 +167,11 @@ class ResearchToolExecutor:
     действия: конфликт — это пара, и обе половины должны попасть в один анализ.
     """
 
-    def __init__(self, knowledge: KnowledgeBase) -> None:
+    def __init__(
+        self, knowledge: KnowledgeBase, public_search: PublicSourceSearch | None = None,
+    ) -> None:
         self._knowledge = knowledge
+        self._public_search = public_search or PublicSourceSearch()
         self._intelligence = ResearchIntelligenceService()
         self._registry: dict[str, Observer] = {
             "hybrid_search": self._retrieval_observation,
@@ -177,6 +181,8 @@ class ResearchToolExecutor:
             "conflict_scan": self._conflict_observation,
             "gap_scan": self._gap_observation,
             "expert_lookup": self._expert_observation,
+            "finding_lookup": self._retrieval_observation,
+            "public_search": self._retrieval_observation,
         }
 
     async def execute(
@@ -203,6 +209,7 @@ class ResearchToolExecutor:
         keys = [
             (
                 action.tool,
+                tuple(action.finding_ids),
                 action.query,
                 tuple(action.entities),
                 tuple(sorted(action.relation_types)),
@@ -281,6 +288,8 @@ class ResearchToolExecutor:
                 continue
             context = outcome.context
             observation = self._observe(action, query_plan, context, pool)
+            if action.tool == "public_search":
+                observation = observation.model_copy(update={"public_query": action.query})
             if outcome.rejected_relations:
                 # Молча исполненный «подмножество запрошенного» Planner следующего
                 # раунда прочитал бы как пустой корпус, а не как несуществующую связь.
@@ -301,11 +310,6 @@ class ResearchToolExecutor:
                 elif action.tool == "gap_scan":
                     gaps.extend(observations[-1].facts)
                     gaps_omitted += _omitted_count(observations[-1])
-            if context.no_evidence:
-                degradation.append(
-                    f"{action.tool}: доказательств по запросу не найдено — "
-                    "ответ опирается только на остальные действия."
-                )
 
         if rejected:
             degradation.append(
@@ -366,14 +370,14 @@ class ResearchToolExecutor:
                 skipped=True,
             )
         try:
-            context = await asyncio.to_thread(
-                self._retrieve_checked,
-                action,
-                query_plan,
-                allowed_data_classes,
-                relations,
-                budget,
-            )
+            if action.tool == "public_search":
+                timeout = min(20.0, budget.remaining_seconds()) if budget else 20.0
+                context = await self._public_search.search(action.query, timeout=timeout)
+            else:
+                context = await asyncio.to_thread(
+                    self._retrieve_checked, action, query_plan,
+                    allowed_data_classes, relations, budget,
+                )
         except _ActionSkippedError as error:
             # Вторая проверка — уже в worker-потоке: между диспетчеризацией и
             # вызовом драйвера задача могла ждать своей очереди на исполнителе.
@@ -408,6 +412,23 @@ class ResearchToolExecutor:
         """Точка невозврата в потоке: до неё ещё можно не идти, после — уже нет."""
         if budget is not None and budget.exhausted():
             raise _ActionSkippedError("бюджет времени прогона исчерпан")
+        if action.tool == "finding_lookup":
+            findings: dict[str, Finding] = {}
+            for identifier in action.finding_ids:
+                if budget is not None and budget.exhausted():
+                    raise _ActionSkippedError("бюджет времени прогона исчерпан")
+                # Версии читаются заново: прошлый ответ не является доказательством.
+                for finding in self._knowledge.claim_history(identifier):
+                    if finding.superseded_by is None and (
+                        allowed_data_classes is None or finding.data_class in allowed_data_classes
+                    ):
+                        findings[finding.id] = finding
+            return RetrievalContext(
+                findings=list(findings.values()),
+                graph=GraphSnapshot(nodes=[], edges=[]),
+                community_summaries=[],
+                no_evidence=not findings,
+            )
         return self._knowledge.retrieve(
             query_plan,
             self._retrieval_plan(action, query_plan, relations=relations),

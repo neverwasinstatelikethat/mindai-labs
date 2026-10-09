@@ -13,6 +13,8 @@ export type Capability =
 export interface Evidence {
   document_id: string;
   source_title: string;
+  source_url?: string | null;
+  retrieved_at?: string | null;
   page?: number | null;
   sheet?: string | null;
   cell_range?: string | null;
@@ -284,6 +286,7 @@ export type ModelMode = 'gigachat' | 'scripted' | 'unavailable';
 export type ServiceState = 'ready' | 'configured' | 'fallback' | 'disabled';
 
 export interface AnswerPayload {
+  conversation_id?: string | null;
   query_id: string;
   question: string;
   summary: string;
@@ -300,6 +303,7 @@ export interface AnswerPayload {
   model_mode: ModelMode;
   // Явный канал деградации: почему ответ собран не полностью.
   degradation_reasons: string[];
+  limitations?: string[];
 }
 
 export interface AnswerHistoryItem {
@@ -563,4 +567,13 @@ export const DATA_CLASS_LABELS: Record<DataClass, string> = {
   public: 'Открытые',
   internal: 'Внутренние',
   restricted: 'Закрытые',
+};
+
+// В строке доказательства класс данных называется существительным: одиночное
+// «Открытые» рядом со статусом читается как продолжение статуса, а не как
+// отдельный факт о материале.
+export const DATA_CLASS_PHRASES: Record<DataClass, string> = {
+  public: 'открытые данные',
+  internal: 'внутренние данные',
+  restricted: 'закрытые данные',
 };

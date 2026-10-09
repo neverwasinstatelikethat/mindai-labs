@@ -46,7 +46,7 @@ export const session = {
   },
   get initials(): string {
     const parts = (account?.display_name ?? '').trim().split(/\s+/).filter(Boolean);
-    if (parts.length === 0) return account?.email.slice(0, 1).toUpperCase() ?? '·';
+    if (parts.length === 0) return account?.email.slice(0, 1).toUpperCase() ?? '';
     return parts
       .slice(0, 2)
       .map((part) => part[0].toUpperCase())

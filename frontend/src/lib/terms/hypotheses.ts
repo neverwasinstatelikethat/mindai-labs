@@ -5,13 +5,20 @@ const HYPOTHESIS_KIND_LABELS: Record<string, string> = {
   bottleneck: 'Возможное узкое место',
   information_gap: 'Пробел в информации',
   contradiction: 'Несостыковка',
+  discrepancy: 'Расхождение',
+  dependency: 'Зависимость',
   improvement: 'Идея улучшения',
   gap: 'Пробел в данных',
   opportunity: 'Возможность',
   risk: 'Риск',
 };
 
-export function hypothesisKindLabel(kind: string): string {
+/**
+ * Русское имя типа гипотезы. Тип приходит свободным ключом модели: нет ключа в
+ * словаре — нет и имени в интерфейсе. Формулировка утверждения говорит за
+ * себя, а сырой ключ индекса остаётся служебным.
+ */
+export function hypothesisKindLabel(kind: string): string | null {
   const normalized = kind.trim().toLowerCase().replaceAll('-', '_');
-  return HYPOTHESIS_KIND_LABELS[normalized] ?? kind.replaceAll('_', ' ');
+  return HYPOTHESIS_KIND_LABELS[normalized] ?? null;
 }

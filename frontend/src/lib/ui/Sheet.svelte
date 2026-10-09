@@ -119,10 +119,6 @@
 </div>
 
 <style>
-  .veil {
-    place-items: center;
-  }
-
   .sheet {
     width: min(100%, var(--sheet-width, 720px));
   }
@@ -137,22 +133,41 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--s5);
-    margin-bottom: var(--s5);
+    gap: var(--s4);
+    padding: clamp(var(--s5), 3vw, var(--s7)) clamp(var(--s5), 3vw, var(--s7)) var(--s3);
+    border-bottom: 1px solid var(--line-soft);
   }
 
+  /* Заголовок шторки — часто полная формулировка находки: перенос по любому
+     слову, иначе крестик уезжает к середине строки. */
+  .sheet__head h2 {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .sheet__head p {
+    margin: var(--s1) 0 0;
+    max-width: var(--maxw-measure);
+  }
+
+  /* Прокрутку ведёт тело: шапка и действия остаются видимыми. */
   .sheet__body {
     display: flex;
     flex-direction: column;
     gap: var(--s4);
+    padding: clamp(var(--s4), 2.5vw, var(--s5)) clamp(var(--s5), 3vw, var(--s7));
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   .sheet__foot {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
     gap: var(--s3);
-    margin-top: var(--s6);
-    padding-top: var(--s5);
+    padding: var(--s4) clamp(var(--s5), 3vw, var(--s7))
+      calc(var(--s4) + env(safe-area-inset-bottom));
     border-top: 1px solid var(--line-soft);
   }
 </style>

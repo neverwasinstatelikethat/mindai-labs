@@ -33,6 +33,13 @@ export function duration(ms: number | null | undefined): string {
   return rest > 0 ? `${minutes} мин ${rest} с` : `${minutes} мин`;
 }
 
+// Имя для чтения: узлы и показатели приходят из графа служебной формой
+// (`Carbon_dioxide`), а подчёркивание — запись индекса, не текст.
+export function plainName(value: string | null | undefined): string {
+  const cleaned = (value ?? '').replaceAll('_', ' ').trim();
+  return cleaned.length > 0 ? cleaned : '—';
+}
+
 // Момент в времени пользователя: журнал, «обновлено», версии утверждения.
 // Секунды включаются, когда записи идут плотнее минуты. Нераспознанное значение
 // остаётся как пришло — страница не показывает вместо него пустоту.

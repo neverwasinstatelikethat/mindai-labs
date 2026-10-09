@@ -127,6 +127,10 @@ def deps() -> AppDependencies:
     provider = _provider()
     dependencies = AppDependencies()
     dependencies.knowledge = restricted_knowledge()
+    # Транспорт проверяется на согласованной цитате: seed-тезис содержит «31»,
+    # которого нет в его доказательстве, и теперь непроверенный черновик скрывается.
+    pilot = dependencies.knowledge.claim_history("finding-ro-pilot")[-1]
+    pilot.statement = pilot.evidence[0].quote
     dependencies.provider = provider
     dependencies.evolution = EvolutionService(provider)
     dependencies.ingestion = IngestionService(

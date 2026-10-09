@@ -26,14 +26,14 @@ import type {
 export const STATUS_SHORT: Record<FindingApiStatus, string> = {
   consensus: 'согласуется',
   disputed: 'оспаривается',
-  hypothesis: 'не сверено',
+  hypothesis: 'без проверки',
 };
 
 // Там, где статус читают как вывод, а не как метку в строке таблицы.
 export const STATUS_PHRASE: Record<FindingApiStatus, string> = {
   consensus: 'источники согласуются',
   disputed: 'источники расходятся',
-  hypothesis: 'не подтверждено источниками',
+  hypothesis: 'гипотеза',
 };
 
 // Заменённая версия приходит отдельным полем версии, а не статусом находки.

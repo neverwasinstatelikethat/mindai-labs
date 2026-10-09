@@ -4,9 +4,11 @@
   import { tick } from 'svelte';
   import { ApiError, api } from '$lib/api';
   import { navLabel } from '$lib/nav';
+  import { gapNotesOf, topicGroups, type GapKind } from '$lib/numbers';
   import { countOf, num, pct } from '$lib/format';
   import { observeReveals } from '$lib/reveal';
   import { session } from '$lib/sessionStore.svelte';
+  import SourceRef from '$lib/ui/SourceRef.svelte';
   import {
     FINDINGS_ACTION,
     FINDINGS_EMPTY,
@@ -29,10 +31,11 @@
     findingsShownOf,
     findingsTerm,
     headingTerm,
+    knownTerm,
     unitKey,
   } from '$lib/terms';
   import {
-    DATA_CLASS_LABELS,
+    DATA_CLASS_PHRASES,
     type ClaimHistory,
     type DocumentReceipt,
     type Evidence,
@@ -46,7 +49,6 @@
   import Field from '$lib/ui/Field.svelte';
   import Icon from '$lib/ui/Icon.svelte';
   import Notice from '$lib/ui/Notice.svelte';
-  import Panel from '$lib/ui/Panel.svelte';
   import SectionHead from '$lib/ui/SectionHead.svelte';
   import Sheet from '$lib/ui/Sheet.svelte';
   import StatusPill from '$lib/ui/StatusPill.svelte';
@@ -348,11 +350,18 @@
       ? (sourceSignal.evidence[sourceEvidenceIndex] ?? null)
       : null,
   );
-  const hypothesisKinds = $derived(
-    [...new Set(hypotheses.map((signal) => signal.kind))].sort((left, right) =>
-      hypothesisKindLabel(left).localeCompare(hypothesisKindLabel(right), 'ru'),
-    ),
-  );
+  // Типы с русским именем: ключ модели без перевода остаётся служебным и
+  // чипом фильтра не становится. Один тип — фильтра нет, выбирать не из чего.
+  const hypothesisKinds = $derived.by(() => {
+    const named = new Map<string, string>();
+    for (const signal of hypotheses) {
+      const label = hypothesisKindLabel(signal.kind);
+      if (label) named.set(signal.kind, label);
+    }
+    return [...named]
+      .map(([kind, label]) => ({ kind, label }))
+      .sort((left, right) => left.label.localeCompare(right.label, 'ru'));
+  });
   const visibleHypotheses = $derived.by(() => {
     const query = hypothesesQuery.trim().toLocaleLowerCase('ru');
     return hypotheses.filter((signal) => {
@@ -1085,15 +1094,105 @@
   const MERGE_WINDOW = 30;
   const MERGE_STEP = 6;
 
-  const pane = $derived(page.url.searchParams.get('facet') === 'merges' ? 'merges' : 'findings');
+  // Два вида находок стоят первыми: аналитический вывод важнее сырого
+  // утверждения, и переключатель даёт выбрать, что читаешь.
+  const PANES = ['hypotheses', 'findings', 'numbers', 'gaps', 'merges'] as const;
+  type Pane = (typeof PANES)[number];
+
+  const PANE_META: Record<Pane, { eyebrow: string; title: string; lead: string }> = {
+    hypotheses: {
+      eyebrow: '',
+      title: 'Аналитические гипотезы',
+      lead: 'Вывод из материалов с основанием и следующим шагом. Цитаты читаются в основаниях.',
+    },
+    findings: {
+      eyebrow: '',
+      title: 'Находки корпуса',
+      lead: 'Утверждения, которые сервис вычитал из материалов: каждое держит связь с источником и контекстом.',
+    },
+    numbers: {
+      eyebrow: '',
+      title: 'Числа',
+      lead: 'Один показатель в нескольких материалах: значения, разброс и предел из источника.',
+    },
+    gaps: {
+      eyebrow: '',
+      title: 'Пробелы',
+      lead: 'Чего не хватает, чтобы числа в материалах стали сравнимыми.',
+    },
+    merges: {
+      eyebrow: 'Проверка названий',
+      title: 'Объединение названий',
+      lead: 'Проверьте, обозначают ли два названия одно и то же. Решение повлияет на будущие материалы.',
+    },
+  };
+
+  // Пять фасетов одного экрана читаются из адреса: `?facet=findings`,
+  // `?facet=numbers`, `?facet=gaps`, `?facet=merges`. Без параметра экран
+  // открывается гипотезами; глубокая ссылка на утверждение или документ приводит
+  // список находок, иначе ссылка вела бы в фасет, где этого утверждения нет.
+  // Неизвестное значение молча возвращается к гипотезам, а редирект со старого
+  // раздела приводит в нужный фасет.
+  const pane = $derived.by((): Pane => {
+    const raw = page.url.searchParams.get('facet');
+    if (PANES.includes(raw as Pane)) return raw as Pane;
+    const deepLink = page.url.searchParams.has('claim') || page.url.searchParams.has('document');
+    return deepLink ? 'findings' : 'hypotheses';
+  });
+  const paneMeta = $derived(PANE_META[pane]);
   const canReview = $derived(session.can('proposal:review'));
 
-  function setPane(next: 'findings' | 'merges'): void {
+  function setPane(next: Pane): void {
     if (next === pane) return;
     const url = new URL(page.url);
-    if (next === 'merges') url.searchParams.set('facet', 'merges');
-    else url.searchParams.delete('facet');
+    if (next === 'hypotheses') url.searchParams.delete('facet');
+    else url.searchParams.set('facet', next);
     void goto(url, { replaceState: true, noScroll: true });
+  }
+
+  const groups = $derived(topicGroups(listed));
+  const gaps = $derived(gapNotesOf(listed));
+
+  // Число гипотез читается в шапке экрана, рядом с названием фасета.
+  const hypothesesCountText = $derived.by(() => {
+    if (hypothesesTotal === null) return '';
+    if (hypothesesServed < hypothesesTotal) {
+      return `${countOf(hypotheses.length, 'гипотеза', 'гипотезы', 'гипотез')} из ${countOf(
+        hypothesesTotal,
+        'гипотезы',
+        'гипотез',
+        'гипотез',
+      )}`;
+    }
+    return countOf(hypothesesTotal, 'гипотеза', 'гипотезы', 'гипотез');
+  });
+
+  const GAP_WORD: Record<GapKind, string> = {
+    pair: 'нет второго утверждения с этим показателем',
+    unit: 'числа приведены в разных единицах',
+    value: 'в утверждении нет числа',
+    locator: 'нет места в первоисточнике',
+  };
+
+  /** Заголовок строки списка: связка и имя объекта из словаря. Сырой ключ
+   *  онтологии заголовком не становится — для него есть формулировка находки.
+   *  Имя объекта не повторяет надзаголовок строки: когда объект и есть субъект,
+   *  в заголовке остаётся одна связка. */
+  function rowTitle(finding: FindingListItem, predicate: string, subject: string): string {
+    const named = knownTerm(SUBJECT_LABELS, finding.object);
+    if (!named) return finding.statement.trim() || predicate;
+    if (named === subject) return predicate;
+    return `${predicate}: ${named}`;
+  }
+
+  /** Число строки: показатель назван один раз. Когда он совпадает со связкой
+   *  заголовка, повтор не нужен — остаётся величина. */
+  function valueLine(observation: NumericObservation, predicate: string): string {
+    const property = propertyTerm(observation.property_name).label;
+    const value = valueLabel(observation);
+    return property.toLocaleLowerCase('ru') === predicate.toLocaleLowerCase('ru')
+      ? value
+      : `${property}: ${value}`;
   }
 
   let mergeItems = $state<EntityMergeProposal[]>([]);
@@ -1252,25 +1351,27 @@
 </script>
 
 <svelte:head>
-  <title>Факты и гипотезы — StormIdea</title>
+  <title>{paneMeta.title} — StormIdea</title>
   <meta
     name="description"
-    content="Факты из материалов с контекстом, точными цитатами и ссылками на источники; аналитические гипотезы показаны отдельно."
+    content="Аналитические гипотезы с основанием и следующим шагом; находки корпуса держат связь с источником и контекстом."
   />
 </svelte:head>
 
 <div class="page findings">
   <div class="wrap stack" style="--gap: var(--s4)">
-    <SectionHead
-      level="1"
-      eyebrow={pane === 'merges' ? 'Проверка названий' : ''}
-      title={pane === 'merges' ? 'Объединение названий' : 'Факты и гипотезы'}
-      lead={pane === 'merges'
-        ? 'Проверьте, обозначают ли два названия одно и то же. Решение повлияет на будущие материалы.'
-        : 'Факты сохраняют связь с источниками и контекстом; аналитические гипотезы показываются отдельно.'}
-    >
+    <SectionHead level="1" eyebrow={paneMeta.eyebrow} title={paneMeta.title} lead={paneMeta.lead}>
+
       <p class="micro findings__count" role="status" aria-live="polite">
-        {pane === 'merges' ? mergeCountText : listNote}
+        {#if pane === 'merges'}
+          <!-- Счётчик очереди живёт там, где очередь действительно прочитана:
+               без права разбора «0 пар» выглядело бы как подтверждённая пустота. -->
+          {#if canReview}{mergeCountText}{/if}
+        {:else if pane === 'hypotheses'}
+          {hypothesesCountText}
+        {:else}
+          {listNote}
+        {/if}
       </p>
     </SectionHead>
 
@@ -1282,10 +1383,34 @@
         <button
           class="seg__item"
           type="button"
+          aria-pressed={pane === 'hypotheses'}
+          onclick={() => setPane('hypotheses')}
+        >
+          Гипотезы
+        </button>
+        <button
+          class="seg__item"
+          type="button"
           aria-pressed={pane === 'findings'}
           onclick={() => setPane('findings')}
         >
-          Утверждения корпуса
+          Находки
+        </button>
+        <button
+          class="seg__item"
+          type="button"
+          aria-pressed={pane === 'numbers'}
+          onclick={() => setPane('numbers')}
+        >
+          Числа
+        </button>
+        <button
+          class="seg__item"
+          type="button"
+          aria-pressed={pane === 'gaps'}
+          onclick={() => setPane('gaps')}
+        >
+          Пробелы
         </button>
         <button
           class="seg__item"
@@ -1337,8 +1462,12 @@
               {#if sourceEvidence.page != null}<span>страница {sourceEvidence.page}</span>{/if}
               {#if sourceEvidence.sheet}<span>лист {sourceEvidence.sheet}</span>{/if}
               {#if sourceEvidence.cell_range}<span>ячейки {sourceEvidence.cell_range}</span>{/if}
-              {#if sourceEvidence.char_start != null || sourceEvidence.char_end != null}
-                <span>символы {sourceEvidence.char_start ?? '—'}–{sourceEvidence.char_end ?? '—'}</span>
+              {#if sourceEvidence.char_start != null && sourceEvidence.char_end != null}
+                <span>символы {sourceEvidence.char_start}–{sourceEvidence.char_end}</span>
+              {:else if sourceEvidence.char_start != null}
+                <span>символы с {sourceEvidence.char_start}</span>
+              {:else if sourceEvidence.char_end != null}
+                <span>символы до {sourceEvidence.char_end}</span>
               {/if}
             </div>
             <blockquote class="findings__source-quote">{sourceEvidence.quote}</blockquote>
@@ -1347,166 +1476,73 @@
       </section>
     {/if}
 
-    {#if pane === 'findings' && session.state === 'authenticated' && canRead}
-      <section
-        class="findings__hypotheses"
-        aria-labelledby="analytical-hypotheses-title"
-        aria-busy={hypothesesPhase === 'loading'}
-      >
-        <div class="findings__hypotheses-head">
-          <div>
-            <h2 class="h3" id="analytical-hypotheses-title">Аналитические гипотезы</h2>
-            <p class="micro muted">
-              Вывод и следующий шаг отдельно от исходных фактов. Цитаты раскрываются в основаниях.
-            </p>
-          </div>
-          <div class="findings__hypotheses-head-actions">
-            <p class="micro findings__hypotheses-count" role="status" aria-live="polite">
-              {#if hypothesesTotal !== null}
-                {countOf(hypothesesTotal, 'гипотеза', 'гипотезы', 'гипотез')}
-              {:else if hypothesesPhase === 'ready'}
-                Показано {hypotheses.length}; общее число не получено
-              {/if}
-            </p>
-            <Button
-              variant="quiet"
-              size="sm"
-              disabled={hypothesesPhase === 'loading'}
-              onclick={() => void loadHypotheses()}
-            >
-              {hypothesesPhase === 'loading' ? 'Обновляем…' : 'Обновить'}
-            </Button>
-          </div>
-        </div>
-
-        {#if hypothesesPhase === 'loading'}
-          <Panel class="findings__state">
-            <p class="small muted">Загружаем аналитические гипотезы…</p>
-            <span class="skeleton findings__skel"></span>
-          </Panel>
-        {:else if hypothesesPhase === 'failed'}
-          <Panel class="findings__state">
-            <Notice tone="warn" title="Гипотезы не загрузились">
-              {hypothesesFailure || 'Повторите запрос.'}
-              <div class="row">
-                <Button variant="quiet" size="sm" onclick={() => void loadHypotheses()}>
-                  Повторить
-                </Button>
-              </div>
-            </Notice>
-          </Panel>
-        {:else if hypotheses.length === 0}
-          <Panel class="findings__state">
-            <Empty
-              icon="layers"
-              title="Аналитических гипотез пока нет"
-              body="Факты и цитаты остаются в каталоге. Здесь появятся только аналитические выводы с основаниями и конкретным следующим шагом."
-            >
-              {#snippet action()}
-                <div class="row findings__hypotheses-actions">
-                  <Button href="/research" variant="action">Задать вопрос</Button>
-                  <Button variant="quiet" icon="upload" onclick={toggleImport}>
-                    Добавить материалы
-                  </Button>
-                </div>
-              {/snippet}
-            </Empty>
-          </Panel>
-        {:else}
-          <div class="findings__hypotheses-tools">
-            <label class="findings__hypotheses-search">
-              <span class="micro">Поиск по гипотезам</span>
-              <input
-                type="search"
-                bind:value={hypothesesQuery}
-                placeholder="Тема, вывод или источник"
-                aria-label="Поиск по загруженным аналитическим гипотезам"
-              />
-            </label>
-            <p class="micro muted">
-              Поиск по загруженным: {hypothesesServed}
-              {#if hypothesesTotal !== null && hypothesesServed < hypothesesTotal}
-                из {hypothesesTotal}
-              {/if}
-            </p>
-          </div>
-          <div
-            class="findings__hypotheses-kinds"
-            role="group"
-            aria-label="Тип аналитического сигнала"
-          >
-            <Button
-              size="sm"
-              variant={hypothesesKind === '' ? 'ink' : 'quiet'}
-              current={hypothesesKind === ''}
-              onclick={() => (hypothesesKind = '')}
-            >
-              Все типы
-            </Button>
-            {#each hypothesisKinds as kind (kind)}
-              <Button
-                size="sm"
-                variant={hypothesesKind === kind ? 'ink' : 'quiet'}
-                current={hypothesesKind === kind}
-                onclick={() => (hypothesesKind = kind)}
-              >
-                {hypothesisKindLabel(kind)}
-              </Button>
-            {/each}
-          </div>
-          {#if visibleHypotheses.length === 0}
-            <div class="findings__hypotheses-empty">
-              <p class="small muted">По этому поиску гипотезы не найдены.</p>
-              <Button
-                variant="quiet"
-                size="sm"
-                onclick={() => {
-                  hypothesesQuery = '';
-                  hypothesesKind = '';
-                }}
-              >
-                Сбросить поиск и тип
-              </Button>
-            </div>
-          {:else}
-            <div class="findings__hypotheses-grid">
-              {#each visibleHypotheses as signal (signal.id)}
-                <HypothesisCard {signal} />
-              {/each}
-            </div>
-          {/if}
-          {#if hypothesesMoreFailure}
-            <p class="micro findings__morefail" role="alert">
-              Не удалось загрузить следующие гипотезы. {hypothesesMoreFailure}
-            </p>
-          {/if}
-          {#if hypothesesTotal !== null && hypothesesServed < hypothesesTotal}
-            <div class="row findings__more">
-              <Button
-                variant="quiet"
-                size="sm"
-                disabled={hypothesesLoadingMore}
-                onclick={() => void loadMoreHypotheses()}
-              >
-                {hypothesesLoadingMore ? 'Загружаем…' : 'Показать ещё гипотезы'}
-              </Button>
-            </div>
-          {/if}
-        {/if}
-      </section>
+    {#if pane === 'numbers' && session.state === 'authenticated' && canRead}
+      {#if groups.length === 0}
+        <Empty title={FINDINGS_EMPTY.noCorpusTitle} body={FINDINGS_EMPTY.noCorpusBody} />
+      {:else}
+        <ul class="topics">
+          {#each groups as group (group.id)}
+            <li class="topic">
+              <details open={group.findings.length > 1}>
+                <summary class="topic__head">
+                  <span class="h4 topic__title">{group.topic.title}</span>
+                  <span class="micro muted">
+                    {countOf(group.findings.length, 'утверждение', 'утверждения', 'утверждений')}
+                  </span>
+                  <span class="micro muted">
+                    {countOf(group.sourceCount, 'источник', 'источника', 'источников')}
+                  </span>
+                  {#if group.headline}
+                    <span class="topic__spread">
+                      {num(group.headline.lo)}–{num(group.headline.hi)} {group.headline.unit}
+                    </span>
+                  {/if}
+                </summary>
+                <ul class="topic__points">
+                  {#each group.headline?.points ?? [] as point (point.findingId)}
+                    <li class="point">
+                      <button class="point__value" type="button" onclick={() => openSource(point.findingId)}>
+                        {point.text}
+                      </button>
+                      <span class="point__source">{point.source}</span>
+                    </li>
+                  {/each}
+                </ul>
+              </details>
+            </li>
+          {/each}
+        </ul>
+      {/if}
     {/if}
+
+    {#if pane === 'gaps' && session.state === 'authenticated' && canRead}
+      {#if gaps.length === 0}
+        <p class="micro">Здесь нет чисел, которым не хватало бы второго источника или единицы.</p>
+      {:else}
+        <ul class="gaps">
+          {#each gaps as note (note.id)}
+            <li class="gap">
+              <span class="gap__topic">{note.topic.title}</span>
+              <span class="gap__why">{GAP_WORD[note.kind]}</span>
+              {#if note.source}<span class="micro muted">{note.source}</span>{/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    {/if}
+
 
     {#if linkNote}
       <!-- Глубокая ссылка не доехала до утверждения: об этом говорится сразу,
            заголовок называет проверенный факт, а строка перечисляет причины. -->
-      <Panel class="findings__state">
+      <div class="findings__state">
         <Notice tone="warn" title={FINDINGS_LINK_MISS.title}>
           {linkNote}
           <div class="row">
             <Button variant="quiet" size="sm" onclick={() => (linkNote = '')}>К списку находок</Button>
           </div>
         </Notice>
-      </Panel>
+      </div>
     {/if}
 
     {#if pane === 'merges'}
@@ -1514,39 +1550,39 @@
            словами: пустая очередь, пустое окно при подтверждённом числе и отказ
            сервиса выглядят по-разному. -->
       {#if session.state === 'anonymous'}
-        <Panel class="findings__state">
+        <div class="findings__state">
           <Notice tone="warn" title={RESOLUTION_GATE.anonymousTitle}>
             {RESOLUTION_GATE.anonymousBody}
             <div class="row">
               <Button href={LOGIN_HREF} variant="action">{RESOLUTION_GATE.anonymousAction}</Button>
             </div>
           </Notice>
-        </Panel>
+        </div>
       {:else if !canReview}
-        <Panel class="findings__state">
+        <div class="findings__state">
           <Notice tone="warn" title={RESOLUTION_GATE.title}>
             {RESOLUTION_GATE.body}
             <div class="row">
               <Button href="/account" variant="quiet">{RESOLUTION_GATE.checkAction}</Button>
             </div>
           </Notice>
-        </Panel>
+        </div>
       {:else if mergePhase === 'loading'}
-        <Panel class="findings__state">
+        <div class="findings__state">
           <div class="row" role="status" aria-label={RESOLUTION_PAGE.loadingAria}>
             <span class="spinner"></span>
             <p class="small">{RESOLUTION_PAGE.loading}</p>
           </div>
-        </Panel>
+        </div>
       {:else if mergePhase === 'failed' && mergeFailure}
-        <Panel class="findings__state">
+        <div class="findings__state">
           <Notice tone="error" title={mergeFailure.title}>{mergeFailure.body}</Notice>
           <div class="row">
             <Button variant="action" onclick={() => void loadMerges()}>{RESOLUTION_ACTION.readAgain}</Button>
           </div>
-        </Panel>
+        </div>
       {:else if mergeItems.length === 0 && mergeTotal !== null}
-        <Panel class="findings__state">
+        <div class="findings__state">
           {#if mergeTotal > 0}
             <!-- Пустое окно при подтверждённом числе пар это сбой чтения, а не
                  «склеек нет». -->
@@ -1559,16 +1595,16 @@
           {:else}
             <Empty title={RESOLUTION_PAGE.emptyTitle} body={RESOLUTION_PAGE.emptyBody} />
           {/if}
-        </Panel>
+        </div>
       {:else if mergeItems.length === 0}
-        <Panel class="findings__state">
+        <div class="findings__state">
           <Notice tone="error" title={RESOLUTION_PAGE.notLoadedUnknownTitle}>
             {RESOLUTION_PAGE.notLoadedUnknownBody}
           </Notice>
           <div class="row">
             <Button variant="action" onclick={() => void loadMerges()}>{RESOLUTION_ACTION.readAgain}</Button>
           </div>
-        </Panel>
+        </div>
       {:else}
         <div class="stack findings__list" style="--gap: var(--s4)">
           {#if mergeNote && mergeNote.id === ''}
@@ -1647,7 +1683,7 @@
         </div>
       {/if}
     {:else if blocked === 'session'}
-      <Panel class="findings__state">
+      <div class="findings__state">
         <Empty
           icon="lock"
           title="Войдите, чтобы открыть факты"
@@ -1661,9 +1697,9 @@
             </div>
           {/snippet}
         </Empty>
-      </Panel>
+      </div>
     {:else if blocked === 'permission'}
-      <Panel class="findings__state">
+      <div class="findings__state">
         <Empty
           icon="shield"
           title="Нет доступа к материалам пространства"
@@ -1677,9 +1713,9 @@
             </div>
           {/snippet}
         </Empty>
-      </Panel>
-    {:else if phase === 'loading'}
-      <Panel class="findings__state">
+      </div>
+    {:else if pane === 'findings' && phase === 'loading'}
+      <div class="findings__state">
         <div class="row" role="status">
           <span class="spinner"></span>
               <p class="small">Загружаем факты…</p>
@@ -1689,9 +1725,9 @@
             <span class="skeleton findings__skel"></span>
           {/each}
         </div>
-      </Panel>
-    {:else if phase === 'failed'}
-      <Panel class="findings__state">
+      </div>
+    {:else if pane === 'findings' && phase === 'failed'}
+      <div class="findings__state">
         <Notice tone="error" title={FINDINGS_STATE.failedTitle}>
           {guidanceOf(failure)}
         </Notice>
@@ -1704,12 +1740,12 @@
             <Button variant="action" onclick={() => void loadIndex()}>{FINDINGS_ACTION.retry}</Button>
           </div>
         {/if}
-      </Panel>
-    {:else}
+      </div>
+    {:else if pane === 'findings'}
       <!-- Точка входа в отбор стоит над списком: сузить находки нужно до того, как
            человек начал их читать. Порядок состояний один для всего экрана. -->
       {#if querying}
-        <Panel class="findings__state">
+        <div class="findings__state">
           <div class="row" role="status">
             <span class="spinner"></span>
             <p class="small">Ищем находки по отбору…</p>
@@ -1719,7 +1755,7 @@
               <span class="skeleton findings__skel"></span>
             {/each}
           </div>
-        </Panel>
+        </div>
       {:else}
         <!-- Над списком остаётся только отбор: оговорка сервиса о неполном списке
              живёт под списком, рядом со счётчиком, и не вытесняет точку входа в
@@ -1735,12 +1771,18 @@
               disabled={querying}
             />
             <div class="row">
-              <Button type="submit" variant="action" busy={querying}>
+              <!-- Отбор — служебное действие экрана, кораловый ход занят
+                   задачей (ответ, вердикт). -->
+              <Button type="submit" variant="ink" busy={querying}>
                 {FINDINGS_ACTION.applyFilter}
               </Button>
-              <Button variant="quiet" onclick={resetAll} disabled={querying || !filtered}>
-                {FINDINGS_ACTION.resetFilter}
-              </Button>
+              {#if filtered}
+                <!-- Живой контрол: сброшенное состояние описывает уже сказанное
+                     числом, поэтому без отбора кнопки нет. -->
+                <Button variant="quiet" onclick={resetAll} disabled={querying}>
+                  {FINDINGS_ACTION.resetFilter}
+                </Button>
+              {/if}
               <Button variant="ghost" icon="list" expanded={subjectsOpen} onclick={toggleSubjects}>
                 Объекты и темы
               </Button>
@@ -1751,7 +1793,7 @@
             <p class="micro findings__status-label">Статус</p>
             <InfoDot
               title="Что значат статусы"
-              body="Согласуется: несколько источников называют одно число в сопоставимых условиях. Не сверено: утверждение пока опирается на один источник или не сопоставлено с другими. Оспаривается: источники по одному субъекту дают разные числа, и расхождение видно в доказательствах. Заменено: прежнюю версию утверждения вытеснила экспертная правка, она в истории версий."
+              body="Согласуется: несколько источников называют одно число в сопоставимых условиях. Без проверки: утверждение опирается на один источник и с другими не сопоставлено. Оспаривается: по одному субъекту источники дают разные числа, и расхождение видно в доказательствах."
               align="start"
             />
             {#each facets as facet (facet.key)}
@@ -1781,7 +1823,7 @@
         </section>
 
         {#if subjectsOpen && subjectIndex.length > 0}
-          <Panel tag="aside" class="findings__subjects reveal">
+          <aside class="panel findings__subjects reveal">
             <div class="panel__head">
               <div class="grow">
                 <h2 class="h4">Объекты и темы</h2>
@@ -1854,14 +1896,14 @@
             {:else}
               <p class="micro muted">Под это имя субъекта в списке ничего нет.</p>
             {/if}
-          </Panel>
+          </aside>
         {/if}
 
         {#if listFailed}
           <!-- Отказ владеет списком: под ним нет ни карточек, ни «пусто», иначе
                сбой прочитался бы как законный пустой результат. Применённый отбор
                виден строкой выше, поэтому здесь остаётся одно действие. -->
-          <Panel class="findings__state">
+          <div class="findings__state">
             <Notice tone="error" title={FINDINGS_STATE.failedTitle}>{guidanceOf(failure)}</Notice>
             {#if failure?.kind === 'session'}
               <!-- Повтор запроса с неподтверждённым входом даст тот же отказ:
@@ -1880,24 +1922,25 @@
                 <Button variant="action" onclick={retryList}>{FINDINGS_ACTION.retry}</Button>
               </div>
             {/if}
-          </Panel>
+          </div>
         {:else if listed.length > 0}
           <div class="stack findings__list" style="--gap: var(--s4)">
             {#each visible as finding (finding.id)}
               {@const subject = subjectTerm(finding.subject)}
               {@const predicate = predicateTerm(finding.predicate)}
               {@const place = placeOf(finding)}
+              {@const subjectShown = headingTerm(subject.label)}
               <!-- Строка целиком и есть действие: клик, Tab и Enter открывают
                    доказательство с местом в источнике. Кнопка лежит на заголовке
                    утверждения, поэтому доступное имя строки читается как текст
                    находки, а не как «кнопка» без смысла. -->
               <article class="card-note finding">
                 <p class="micro finding__subject">
-                  {headingTerm(subject.label)}
+                  {subjectShown}
                 </p>
                 <h3 class="h4 finding__title">
                   <button class="finding__open" type="button" onclick={() => openSource(finding.id)}>
-                    {predicate.label}: {finding.object ?? finding.statement}
+                    {rowTitle(finding, predicate.label, subjectShown)}
                   </button>
                 </h3>
                 {#if finding.context}
@@ -1906,7 +1949,7 @@
                 {#if finding.observations.length > 0}
                   <ul class="finding__values" aria-label="Числовые значения из источника">
                     {#each finding.observations as observation, index (index)}
-                      <li class="micro">{observation.property_name}: {valueLabel(observation)}</li>
+                      <li class="micro">{valueLine(observation, predicate.label)}</li>
                     {/each}
                   </ul>
                 {/if}
@@ -2062,8 +2105,114 @@
       {/if}
     {/if}
 
+    {#if pane === 'hypotheses' && session.state === 'authenticated' && canRead}
+      <!-- Название фасета и его число читает заголовок экрана: второй заголовок
+           внутри фасета повторял бы его. -->
+      <section
+        class="findings__hypotheses"
+        aria-label="Аналитические гипотезы"
+        aria-busy={hypothesesPhase === 'loading'}
+      >
+        {#if hypothesesPhase === 'loading'}
+          <!-- Состояния лежат в плоской зоне раздела: панель под ними добавила
+               бы вторую рамку внутрь одного экрана. -->
+          <p class="small muted">Загружаем аналитические гипотезы…</p>
+          <span class="skeleton findings__skel"></span>
+        {:else if hypothesesPhase === 'failed'}
+          <Notice tone="warn" title="Гипотезы не загрузились">
+            {hypothesesFailure || 'Повторите запрос.'}
+            <div class="row">
+              <Button variant="quiet" size="sm" onclick={() => void loadHypotheses()}>
+                Повторить
+              </Button>
+            </div>
+          </Notice>
+        {:else if hypotheses.length === 0}
+          <Empty
+            icon="layers"
+            title="Аналитических гипотез пока нет"
+            body="Факты и цитаты остаются в каталоге. Здесь появятся только аналитические выводы с основаниями и конкретным следующим шагом."
+          >
+            {#snippet action()}
+              <Button href="/research" variant="action">Задать вопрос</Button>
+            {/snippet}
+          </Empty>
+        {:else}
+          <label class="findings__hypotheses-search">
+            <span class="micro">Поиск по гипотезам</span>
+            <input
+              type="search"
+              bind:value={hypothesesQuery}
+              placeholder="Тема, вывод или источник"
+              aria-label="Поиск по загруженным аналитическим гипотезам"
+            />
+          </label>
+          {#if hypothesisKinds.length > 1}
+            <div class="findings__hypotheses-kinds" role="group" aria-label="Тип гипотезы">
+              <Button
+                size="sm"
+                variant={hypothesesKind === '' ? 'ink' : 'quiet'}
+                current={hypothesesKind === ''}
+                onclick={() => (hypothesesKind = '')}
+              >
+                Все типы
+              </Button>
+              {#each hypothesisKinds as { kind, label } (kind)}
+                <Button
+                  size="sm"
+                  variant={hypothesesKind === kind ? 'ink' : 'quiet'}
+                  current={hypothesesKind === kind}
+                  onclick={() => (hypothesesKind = kind)}
+                >
+                  {label}
+                </Button>
+              {/each}
+            </div>
+          {/if}
+          {#if visibleHypotheses.length === 0}
+            <div class="findings__hypotheses-empty">
+              <p class="small muted">По этому поиску гипотезы не найдены.</p>
+              <Button
+                variant="quiet"
+                size="sm"
+                onclick={() => {
+                  hypothesesQuery = '';
+                  hypothesesKind = '';
+                }}
+              >
+                Сбросить поиск и тип
+              </Button>
+            </div>
+          {:else}
+            <div class="findings__hypotheses-grid">
+              {#each visibleHypotheses as signal (signal.id)}
+                <HypothesisCard {signal} />
+              {/each}
+            </div>
+          {/if}
+          {#if hypothesesMoreFailure}
+            <p class="micro findings__morefail" role="alert">
+              Не удалось загрузить следующие гипотезы. {hypothesesMoreFailure}
+            </p>
+          {/if}
+          {#if hypothesesTotal !== null && hypothesesServed < hypothesesTotal}
+            <div class="row findings__more">
+              <Button
+                variant="quiet"
+                size="sm"
+                disabled={hypothesesLoadingMore}
+                onclick={() => void loadMoreHypotheses()}
+              >
+                {hypothesesLoadingMore ? 'Загружаем…' : 'Показать ещё гипотезы'}
+              </Button>
+            </div>
+          {/if}
+        {/if}
+      </section>
+    {/if}
+
     {#if importOpen}
-      <Panel tone="sunk" class="findings__import">
+      <section class="panel panel--sunk findings__import">
         <div>
           <div class="panel__head">
             <div class="grow">
@@ -2156,7 +2305,7 @@
             </ul>
           {/if}
         </div>
-      </Panel>
+      </section>
     {/if}
   </div>
 </div>
@@ -2181,25 +2330,31 @@
   {@const chain = chainOf(finding.id)}
   {@const subject = subjectTerm(finding.subject)}
   {@const predicate = predicateTerm(finding.predicate)}
+  {@const objectLabel = knownTerm(SUBJECT_LABELS, finding.object)}
 
   <h3 class="h4">{finding.statement}</h3>
 
-  <dl class="kv">
-    <dt>Субъект</dt>
-    <dd>{subject.label}</dd>
-    <dt>Связь</dt>
-    <dd>{predicate.label}</dd>
-    <dt>Значение или объект</dt>
-    <dd>{finding.object ?? 'Не указано'}</dd>
-    {#if finding.context}
-      <dt>Контекст</dt>
-      <dd>{finding.context}</dd>
-    {/if}
-    <dt>Статус</dt>
-    <dd><StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} /></dd>
-    <dt>Доступ</dt>
-    <dd>{DATA_CLASS_LABELS[finding.data_class]}</dd>
-  </dl>
+  {#if finding.evidence.length > 0}
+    <div class="interval__quotes">
+      {#each finding.evidence as ev, position (`${finding.id}-ev-${position}`)}
+        <SourceRef evidence={ev} quote />
+      {/each}
+    </div>
+  {:else}
+    <Notice tone="warn" title="Доказательств нет">
+      Утверждение не трассируется до источника.
+    </Notice>
+  {/if}
+
+  <p class="interval__meta">
+    <span>{subject.label}</span>
+    <!-- Объект называют одной связкой: когда он и есть субъект строки, второе
+         имя повторяет первое. -->
+    <span>{predicate.label}{#if objectLabel && objectLabel !== subject.label}: {objectLabel}{/if}</span>
+    {#if finding.context}<span class="muted">{finding.context}</span>{/if}
+    <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
+    <span class="micro muted">{DATA_CLASS_PHRASES[finding.data_class]}</span>
+  </p>
 
   <!-- Версия извлечения и код утверждения нужны, когда сверяешь запись с
        сервером: они под раскрытием, человеческие имена на виду. Дробная
@@ -2217,94 +2372,29 @@
     </section>
   {/if}
 
-  <section class="interval__block">
-    <p class="field__label">
-      Числовые наблюдения
-      <span class="tag">{countOf(finding.observations.length, 'наблюдение', 'наблюдения', 'наблюдений')}</span>
-    </p>
-    {#if finding.observations.length > 0}
-      {#each finding.observations as obs, i (`${finding.id}-obs-${i}`)}
-        {@const m = measureOf(obs)}
-        {@const property = propertyTerm(obs.property_name)}
-        <div class="measure">
-          <div class="measure__caption">
+  {#if finding.observations.length > 0}
+    <section class="interval__block">
+      <p class="field__label">Числовые наблюдения</p>
+      <!-- Полоса-шкала здесь не рисуется: одно значение не с чем сравнивать, а
+           разбой показывает фасет «Числа», где у показателя несколько
+           источников. -->
+      <ul class="measures">
+        {#each finding.observations as obs, i (`${finding.id}-obs-${i}`)}
+          {@const property = propertyTerm(obs.property_name)}
+          <li class="measure">
             <span class="measure__prop">{headingTerm(property.label)}</span>
             <!-- Единица уже внутри `m.raw`: словарь собирает «не меньше 95 %» и
                  «95–97 %» целиком, второй подписью единицу не дублируем. -->
-            <span class="measure__value">{m.raw}</span>
-          </div>
-          {#if m.band && m.scale}
-            <div class="measure__track">
-              <span class="bar">
-                <span
-                  class="bar__fill {bandClass(finding.status)}"
-                  style="left:{m.band.left}%;width:{m.band.width}%"
-                ></span>
-              </span>
-              {#each m.limits as limit, li (`${finding.id}-lim-${li}`)}
-                <span
-                  class="measure__limit"
-                  style="left:{limit.at}%"
-                  data-at={limit.label}
-                  aria-hidden="true"></span>
-              {/each}
-            </div>
-            <p class="micro measure__scale">
-              <span class="num">{num(m.scale.min)}</span>
-              <span>{findingsScaleSpread(obs.normalized_unit, m.scale.count)}</span>
-              <span class="num">{num(m.scale.max)}</span>
-            </p>
-          {:else}
-            <p class="micro measure__note">{m.note}</p>
-          {/if}
-          <!-- Приведённая единица та, по которой построена шкала, а единица и
-               исходная формулировка из источника остаются для сверки с
-               документом под раскрытием. Сырое имя показателя из онтологии в
-               поддержке не называют, поэтому оно в ответе сервиса. -->
-        </div>
-      {/each}
-    {:else}
-      <p class="micro">Числовых наблюдений у этого утверждения нет.</p>
-    {/if}
-  </section>
+            <span class="measure__value">{measureOf(obs).raw}</span>
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
 
-  <section class="interval__block">
-    <div class="history__head">
-      <p class="field__label">Доказательства: где именно в источнике</p>
-      <!-- Правка оформляется на месте: отдельного раздела для отзыва нет, а
-           уходить за действием значит потерять находку, по которой решение
-           принимается. -->
-      <Button variant="quiet" size="sm" onclick={() => openVerdict(finding)}>
-        Записать вердикт по находке
-      </Button>
-    </div>
-
-    {#if verdictNote}
-      <p class="micro" role="status">{verdictNote}</p>
-    {/if}
-
-    {#if finding.evidence.length > 0}
-      {#each finding.evidence as ev, position (`${finding.id}-ev-${position}`)}
-        <figure class="evidence">
-          <blockquote class="quote">{ev.quote}</blockquote>
-          <figcaption class="evidence__loc">
-            <b class="small">{ev.source_title}</b>
-            {#each locatorParts(ev) as place (place)}
-              <span class="locator"><Icon name="pin" size={14} /> {place}</span>
-            {/each}
-          </figcaption>
-        </figure>
-      {/each}
-      <!-- Коды источников нужны для сверки с сервисом: они в служебном блоке,
-           а не в подписи доказательства. Символьные позиции фрагмента в
-           поддержке не называют, поэтому они остаются в ответе сервиса. -->
-    {:else}
-      <Notice tone="warn" title="Доказательств нет">
-        Утверждение не трассируется до источника, поэтому как подтверждённое число оно не
-        считается.
-      </Notice>
-    {/if}
-  </section>
+  {#if verdictNote}
+    <p class="micro" role="status">{verdictNote}</p>
+  {/if}
 
   <section class="interval__block">
     <div class="history__head">
@@ -2333,10 +2423,7 @@
            прочитался бы как подтверждённое отсутствие замен. -->
       <p class="micro">Версий этого утверждения не найдено.</p>
     {:else if chain.versions.length === 1}
-      <p class="micro">
-        Версия одна (<span class="num">{num(chain.versions[0].version)}</span>), экспертных
-        замен этого утверждения ещё не было.
-      </p>
+      <p class="micro">Версия одна.</p>
     {:else}
       <div class="table-wrap">
         <table class="table">
@@ -2384,21 +2471,19 @@
           </tbody>
         </table>
       </div>
-      <!-- В обращении в поддержку называют цепочку и текущую версию: коды
-       заменённых версий и ссылки на замену остаются в ответе сервиса. -->
     {/if}
   </section>
 {/snippet}
 
 {#if activeFinding}
-  <Sheet
-    title="Источник находки"
-    description="Доказательство с местом в источнике и версии этого утверждения."
-    width="840px"
-    onclose={closeSource}
-  >
+  <Sheet title="Источник находки" width="840px" onclose={closeSource}>
     {#snippet footer()}
-      <Button variant="quiet" onclick={closeSource}>Закрыть</Button>
+      <Button variant="ghost" onclick={closeSource}>Закрыть</Button>
+      <Button
+        variant="quiet"
+        onclick={() => {
+          if (activeFinding) openVerdict(activeFinding);
+        }}>Записать вердикт</Button>
     {/snippet}
 
     {@render interval(activeFinding)}
@@ -2406,6 +2491,157 @@
 {/if}
 
 <style>
+  .interval__quotes {
+    display: grid;
+    gap: var(--s4);
+  }
+
+  .interval__meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s3);
+    margin: 0;
+    font-size: var(--t-small);
+    color: var(--ink-2);
+  }
+
+  /* ── Фасеты «Числа» и «Пробелы»: плоские строки, ряды разделены одной
+     линией, карточек нет: тема и её точки это один объект, а не вложенные. ── */
+  .topics,
+  .gaps {
+    display: grid;
+    gap: 0;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .topic,
+  .gap {
+    border-top: 1px solid var(--line-soft);
+  }
+
+  .topic__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--s3);
+    min-width: 0;
+    padding: var(--s4) 0;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .topic__head::-webkit-details-marker {
+    display: none;
+  }
+
+  .topic__head:focus-visible {
+    outline: 2px solid var(--action-ink);
+    outline-offset: 3px;
+    border-radius: var(--r-xs);
+  }
+
+  /* Раскрытие обозначено остриём: без него список тем выглядит законченным. */
+  .topic__head::after {
+    content: '';
+    flex: none;
+    width: 8px;
+    height: 8px;
+    margin-inline-start: auto;
+    border-right: 1.6px solid var(--ink-3);
+    border-bottom: 1.6px solid var(--ink-3);
+    transform: rotate(45deg);
+    transition: transform var(--dur-fast) var(--ease-soft);
+  }
+
+  details[open] > .topic__head::after {
+    transform: rotate(-135deg);
+  }
+
+  .topic__title {
+    margin: 0;
+    min-width: 0;
+    color: var(--ink);
+  }
+
+  .topic__spread {
+    font-family: var(--font-data);
+    font-size: var(--t-small);
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+
+  .topic__points {
+    display: grid;
+    gap: var(--s2);
+    margin: 0 0 var(--s4);
+    padding: 0;
+    list-style: none;
+  }
+
+  .point {
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+    gap: var(--s4);
+    align-items: baseline;
+  }
+
+  .point__value {
+    display: inline-flex;
+    align-items: center;
+    min-height: 34px;
+    padding: var(--s1) var(--s3);
+    border: 0;
+    border-radius: var(--r-pill);
+    background: none;
+    font-family: var(--font-data);
+    font-size: var(--t-small);
+    color: var(--ink);
+    text-align: start;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-soft);
+  }
+
+  .point__value:hover {
+    background: var(--surface-sunk);
+  }
+
+  .point__value:active {
+    transform: scale(0.98);
+  }
+
+  .point__value:focus-visible {
+    outline: 2px solid var(--action-ink);
+    outline-offset: 2px;
+  }
+
+  .point__source {
+    font-size: var(--t-small);
+    color: var(--ink-3);
+    overflow-wrap: anywhere;
+  }
+
+  .gap {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+    gap: var(--s2) var(--s4);
+    align-items: baseline;
+    padding: var(--s3) 0;
+  }
+
+  .gap__topic {
+    font-size: var(--t-body);
+    color: var(--ink);
+    min-width: 0;
+  }
+
+  .gap__why {
+    font-size: var(--t-small);
+    color: var(--ink-2);
+  }
+
   .findings__filters :global(.seg__item:active) {
     transform: none;
   }
@@ -2420,53 +2656,18 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* Фасет гипотез плоский: рамка здесь была бы третьей коробкой на экране
+     после панели отбора и карточек списка. */
   .findings__hypotheses {
     display: flex;
     flex-direction: column;
     gap: var(--s4);
-    padding: var(--s5);
-    border: 1px solid var(--line-strong);
-    border-radius: var(--r-lg);
-    background: var(--surface-raised);
-  }
-
-  .findings__hypotheses-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--s4);
-    flex-wrap: wrap;
-  }
-
-  .findings__hypotheses-head .micro {
-    margin-top: var(--s1);
-  }
-
-  .findings__hypotheses-head-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--s3);
-  }
-
-  .findings__hypotheses-count {
-    color: var(--ink-3);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .findings__hypotheses-tools {
-    display: grid;
-    grid-template-columns: minmax(14rem, 28rem) 1fr;
-    align-items: end;
-    gap: var(--s3) var(--s4);
-  }
-
-  .findings__hypotheses-tools p {
-    margin: 0 0 var(--s2);
   }
 
   .findings__hypotheses-search {
     display: grid;
     gap: var(--s1);
+    max-width: min(100%, 26rem);
   }
 
   .findings__hypotheses-search input {
@@ -2487,7 +2688,7 @@
   .findings__hypotheses-kinds {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--s2);
+    gap: var(--s3) var(--s2);
   }
 
   .findings__hypotheses-empty {
@@ -2533,28 +2734,9 @@
     flex-wrap: wrap;
   }
 
-  .findings__hypotheses-actions {
-    flex-wrap: wrap;
-  }
-
   .findings__hypotheses-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr));
-    gap: var(--s4);
-  }
-
-  @media (max-width: 640px) {
-    .findings__hypotheses {
-      padding: var(--s4);
-    }
-
-    .findings__hypotheses-tools {
-      grid-template-columns: 1fr;
-    }
-
-    .findings__hypotheses-tools p {
-      margin-bottom: 0;
-    }
+    gap: var(--s5);
   }
 
   .findings__import {
@@ -2567,7 +2749,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--s4);
-    margin-bottom: var(--s6);
   }
 
   .findings__skel {
@@ -2700,11 +2881,12 @@
     flex-wrap: wrap;
   }
 
-  /* Поле субъекта тянется, кнопки держат свою ширину: на 1280 строка остаётся
-     одной строкой, а не уезжает под список. */
+  /* Поле субъекта тянется, но держит свою меру: растянутый на всю ширину поиск
+     делает из инструмента главный объект экрана, а кнопки уезжают на край. */
   .findings__form :global(.field) {
     flex: 1 1 260px;
     min-width: 0;
+    max-width: 46ch;
   }
 
   .findings__statuses {
@@ -2748,10 +2930,6 @@
   .findings__applied-value {
     min-width: 0;
     text-align: left;
-  }
-
-  .findings__applied-svc {
-    margin-top: var(--s3);
   }
 
   .findings__applied-item strong {
@@ -3002,21 +3180,21 @@
     color: var(--ink-2);
   }
 
-  .measure {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s2);
-    padding: var(--s4);
-    border: 1px solid var(--line-soft);
-    border-radius: var(--r-md);
-    background: var(--surface-raised);
+  /* Наблюдения — строки списка, а не карточки: внутри шторки источника
+     рамка на рамке и читается то, что под ней. */
+  .measures {
+    display: grid;
+    gap: var(--s3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
   }
 
-  .measure__caption {
+  .measure {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: var(--s3);
+    gap: var(--s3) var(--s4);
     flex-wrap: wrap;
   }
 
@@ -3030,73 +3208,7 @@
     font-family: var(--font-data);
     font-size: var(--t-h4);
     color: var(--ink);
-  }
-
-  .measure__track {
-    position: relative;
-    padding-bottom: var(--s6);
-  }
-
-  .measure__limit {
-    position: absolute;
-    top: -4px;
-    width: 2px;
-    height: 16px;
-    border-radius: var(--r-pill);
-    background: var(--ink-2);
-    transform: translateX(-50%);
-  }
-
-  .measure__limit::after {
-    content: attr(data-at);
-    position: absolute;
-    top: 18px;
-    left: 50%;
-    transform: translateX(-50%);
-    font-family: var(--font-data);
-    font-size: var(--t-micro);
-    color: var(--ink-3);
-    white-space: nowrap;
-  }
-
-  .measure__scale {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--s3);
-    /* Подпись шкалы живёт между двумя числами: на узком экране она переносится,
-       а не растягивает шторку. */
-    flex-wrap: wrap;
-    /* Подпись шкалы — текст с числами: моно остаётся самим числам (`.num`). */
-    font-variant-numeric: tabular-nums;
-  }
-
-  .measure__note {
-    text-wrap: pretty;
-  }
-
-  .evidence {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s2);
-    margin: 0;
-  }
-
-  .evidence blockquote {
-    margin: 0;
-  }
-
-  .evidence__loc {
-    display: flex;
-    align-items: center;
-    gap: var(--s4);
-    flex-wrap: wrap;
-  }
-
-  /* Коды и значения из источника печатаем целиком: перенос вместо обрезки,
-     иначе полное значение негде прочесть. */
-  .kv dd {
-    overflow-wrap: anywhere;
+    text-align: end;
   }
 
   .history__head {

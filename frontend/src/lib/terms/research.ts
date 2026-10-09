@@ -139,8 +139,8 @@ export const FAILURE_WORDS: [RegExp, string][] = [
 export const ASK_SOURCE = {
   findings: 'К находке и её источнику',
   graph: 'Посмотреть на карте связей',
-  closeQuote: 'скрыть цитату',
-  openQuote: 'прочитать цитату',
+  closeQuote: 'Скрыть цитату',
+  openQuote: 'Прочитать цитату',
   esc: 'Esc закрывает раскрытие.',
 };
 
@@ -150,7 +150,7 @@ export const ASK_SOURCE = {
 // события потока, на экран они не попадают. Больше одного словаря про один
 // процесс нет: `CONTOUR_ROLES` и `RUN_STAGES` здесь объединены, роль узла
 // читается из стадии.
-export type RunStage = 'question' | 'search' | 'assembly' | 'review' | 'result' | 'other';
+export type RunStage = 'question' | 'planning' | 'search' | 'assessment' | 'assembly' | 'review' | 'revision' | 'result' | 'other';
 
 export const RUN_STAGES: { key: RunStage; label: string; hint: string; nodes: string[] }[] = [
   {
@@ -159,14 +159,17 @@ export const RUN_STAGES: { key: RunStage; label: string; hint: string; nodes: st
     hint: 'сущности, условия, период',
     nodes: ['planning_agent', 'intent_router'],
   },
+  { key: 'planning', label: 'Выбор следующей проверки', hint: 'какой вопрос ещё открыт', nodes: ['action_planner'] },
   {
     key: 'search',
-    label: 'Поиск по корпусу',
-    hint: 'что нашлось и чего не хватает',
-    nodes: ['action_planner', 'tool_executor', 'controller'],
+    label: 'Чтение источников и связей',
+    hint: 'цитаты, значения и связанные находки',
+    nodes: ['tool_executor'],
   },
-  { key: 'assembly', label: 'Сборка ответа', hint: 'тезисы ответа', nodes: ['reasoner'] },
-  { key: 'review', label: 'Проверка и правка', hint: 'проверка ответа и ревизии', nodes: ['critic', 'improver'] },
+  { key: 'assessment', label: 'Оценка полноты материалов', hint: 'что ещё нужно проверить', nodes: ['controller'] },
+  { key: 'assembly', label: 'Анализ и подготовка ответа', hint: 'факты, гипотезы и аргументы', nodes: ['reasoner'] },
+  { key: 'review', label: 'Проверка выводов', hint: 'ссылки и обоснование', nodes: ['critic'] },
+  { key: 'revision', label: 'Уточнение ответа', hint: 'исправление замечаний', nodes: ['improver'] },
   { key: 'result', label: 'Итог', hint: 'готовый ответ', nodes: ['synthesizer', 'finalize'] },
   { key: 'other', label: 'Другие шаги', hint: 'события вне стадий', nodes: [] },
 ];
@@ -346,12 +349,8 @@ export const TERM_FALLBACKS = {
 // нет: эти числа читались дублём списков ниже.
 export const ANSWER_HEAD = {
   eyebrow: 'Ответ StormIdea',
-  pillAssembled: 'ответ собран',
-  pillIncomplete: 'ответ неполный',
-  summaryMissing: 'Краткий вывод не появился. Ниже — найденные тезисы и их источники.',
-  exportLabel: 'выгрузка этого ответа',
+  summaryMissing: 'Краткий вывод не появился. Ниже приведены найденные тезисы и их источники.',
   // Идентификатор ответа живёт в «Служебных данных».
-  queryIdLabel: 'идентификатор ответа',
   // Новый вопрос не обязан стирать прежний ответ: история ответов на сервере не
   // хранится. Пока нового ответа нет, прежний остаётся на экране и назван.
   staleTitle: 'Это ответ на прежний вопрос',
@@ -364,6 +363,17 @@ export const ANSWER_HEAD = {
 export function moreThesesText(count: number): string {
   return `Показать ещё ${countOf(count, 'тезис', 'тезиса', 'тезисов')}`;
 }
+
+// Хвост ответа: расхождение, пробел и совет различаются заголовками. Склеенные в
+// один список без имён, они читаются как одна простыня текста.
+export const ANSWER_TAIL = {
+  summary: 'Что ещё увидели в материалах',
+  conflicts: 'Расхождения',
+  gaps: 'Пробелы в данных',
+  next: 'Что проверить дальше',
+  // Модель ссылается на тезис его служебным id; человек читает имя источника.
+  refsLead: 'Находки: ',
+};
 
 // Неполный ответ: причина называется один раз и с одним действием.
 export const DEGRADED = {
@@ -379,35 +389,37 @@ export const ASK_VERDICT = {
 export const ASK_NO_MATCH = {
   title: 'Совпадений нет',
   body: 'Поиск завершён, подходящих тезисов нет.',
-  gapsLabel: 'пробелы, которые отметил ответ',
   hint:
     'Снимите числовое условие, расширьте период или переформулируйте вопрос ближе к формулировкам источников.',
   aside: 'Ответ вернул расхождения и рекомендации: они ниже.',
 };
 
+// Заглавными открываются подписи, которые стоят строкой сами по себе (заголовок
+// группы, термин в определении). Строчными остаются подписи-продолжения,
+// поясняющие значение над или рядом с собой.
 export const SHEET_LABELS = {
   title: 'Разбор тезиса',
   description:
-    'Числовые наблюдения, цитаты с местом в источнике и история версий этого тезиса.',
+    'Цитаты и контекст источника, данные тезиса и история его версий.',
   close: 'Закрыть разбор',
   open: 'Открыть разбор',
   measures: 'Числа из источника',
-  bare: 'числовых наблюдений нет, тезис держится только на цитате',
   source: 'в источнике',
-  documentLabel: 'источник',
-  scale: 'шкала',
-  normalized: 'нормализовано',
+  documentLabel: 'Источник',
   outsideFilter: 'наблюдение вне условия вопроса',
   planCondition: 'условие вопроса',
-  rivalsLabel: 'расхождение на одном интервале',
+  rivalsLabel: 'Расхождение на одном интервале',
   rivalsSelf: 'этот тезис',
-  rivalsDelta: 'числа расходятся на',
-  rivalsNote: 'Другие сопоставимые значения — в разделе «Числа».',
-  traceLabel: 'доказательство',
+  rivalsDelta: 'Числа расходятся на',
+  rivalsNote: 'Другие сопоставимые значения читаются в разделе «Числа».',
+  // Кнопка называет действие и цель тем же именем, что и вкладка на экране
+  // находок: подпись про раздел не совпадала с тем, куда вела ссылка.
+  rivalsAction: 'Открыть «Числа»',
+  traceLabel: 'Доказательство',
   untrackedTitle: 'Тезис не трассируется',
   untrackedBody:
     'У тезиса нет ни одного места в источнике: проверить его по первоисточнику нельзя, пока разбор не добавит доказательство.',
-  historyLabel: 'история версий тезиса',
+  historyLabel: 'История версий тезиса',
   historyAsk: 'Показать историю версий',
   historyRefresh: 'Обновить версии',
   historyBusy: 'Читаем версии…',
@@ -415,9 +427,9 @@ export const SHEET_LABELS = {
   historyError: 'История версий не получена',
   historyRetry: 'Повторить запрос',
   reviewNone: 'разбор не проводился',
-  page: 'страница',
-  sheet: 'лист',
-  cells: 'ячейки',
+  page: 'Страница',
+  sheet: 'Лист',
+  cells: 'Ячейки',
   noLocator: 'места в источнике нет',
   versionLabel: 'версия',
 };
