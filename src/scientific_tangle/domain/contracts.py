@@ -243,6 +243,9 @@ class Finding(BaseModel):
     superseded_by: str | None = None
     subject: str | None = None
     predicate: str | None = None
+    object: str | None = None
+    fact_kind: str | None = None
+    context: str | None = None
     scope: dict[str, str] = Field(default_factory=dict)
     # Единственный источник истины для классификации доступа. Статус finding
     # (consensus/disputed/hypothesis) — про степень консенсуса, а не про права,
@@ -601,6 +604,8 @@ class ExtractedClaim(LlmForm):
     statement: str
     confidence: float = Field(ge=0, le=1)
     evidence_quote: str = Field(min_length=1)
+    fact_kind: str = Field(default="fact", min_length=1, max_length=80)
+    context: str | None = Field(default=None, max_length=1000)
     observations: list[NumericObservation] = Field(default_factory=list)
 
     @field_validator("predicate", mode="before")

@@ -58,6 +58,9 @@ export interface Finding {
   superseded_by?: string | null;
   subject?: string | null;
   predicate?: string | null;
+  object?: string | null;
+  fact_kind?: string | null;
+  context?: string | null;
   scope?: Record<string, string>;
   // Класс доступа приходит из контракта и не выводится из статуса: consensus /
   // disputed / hypothesis — про степень консенсуса источников, а не про права.

@@ -1229,10 +1229,10 @@
 </script>
 
 <svelte:head>
-  <title>Гипотезы — StormIdea</title>
+  <title>Факты и гипотезы — StormIdea</title>
   <meta
     name="description"
-    content="Гипотезы и находки с подтверждениями, условиями и ссылками на исходные материалы."
+    content="Факты из материалов с контекстом, точными цитатами и ссылками на источники; аналитические гипотезы показаны отдельно."
   />
 </svelte:head>
 
@@ -1241,10 +1241,10 @@
     <SectionHead
       level="1"
       eyebrow={pane === 'merges' ? 'Проверка названий' : ''}
-      title={pane === 'merges' ? 'Объединение названий' : 'Находки и гипотезы'}
+      title={pane === 'merges' ? 'Объединение названий' : 'Факты и гипотезы'}
       lead={pane === 'merges'
         ? 'Проверьте, обозначают ли два названия одно и то же. Решение повлияет на будущие материалы.'
-        : 'Аналитические выводы опираются на документы и показываются отдельно от извлечённых утверждений.'}
+        : 'Факты сохраняют связь с источниками и контекстом; аналитические гипотезы показываются отдельно.'}
     >
       <p class="micro findings__count" role="status" aria-live="polite">
         {pane === 'merges' ? mergeCountText : listNote}
@@ -1560,8 +1560,8 @@
       <Panel class="findings__state">
         <Empty
           icon="lock"
-          title="Войдите, чтобы открыть гипотезы"
-          body="Гипотезы и материалы доступны участникам рабочего пространства."
+          title="Войдите, чтобы открыть факты"
+          body="Факты и материалы доступны участникам рабочего пространства."
         >
           {#snippet action()}
             <!-- Второго действия здесь нет: повторный запрос с неподтверждённым
@@ -1577,7 +1577,7 @@
         <Empty
           icon="shield"
           title="Нет доступа к материалам пространства"
-          body="Попросите владельца пространства открыть доступ к гипотезам и связанным материалам."
+          body="Попросите владельца пространства открыть доступ к фактам и связанным материалам."
         >
           {#snippet action()}
             <!-- Одно действие и здесь: повторный запрос ничего не меняет, а
@@ -1592,7 +1592,7 @@
       <Panel class="findings__state">
         <div class="row" role="status">
           <span class="spinner"></span>
-              <p class="small">Загружаем гипотезы…</p>
+              <p class="small">Загружаем факты…</p>
         </div>
         <div class="stack" style="--gap: var(--s3)">
           {#each [0, 1, 2, 3] as line (line)}
@@ -1795,6 +1795,7 @@
           <div class="stack findings__list" style="--gap: var(--s4)">
             {#each visible as finding (finding.id)}
               {@const subject = subjectTerm(finding.subject)}
+              {@const predicate = predicateTerm(finding.predicate)}
               {@const place = placeOf(finding)}
               <!-- Строка целиком и есть действие: клик, Tab и Enter открывают
                    доказательство с местом в источнике. Кнопка лежит на заголовке
@@ -1803,13 +1804,22 @@
               <article class="card-note finding">
                 <p class="micro finding__subject">
                   {headingTerm(subject.label)}
-                  <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
                 </p>
                 <h3 class="h4 finding__title">
                   <button class="finding__open" type="button" onclick={() => openSource(finding.id)}>
-                    {finding.statement}
+                    {predicate.label}: {finding.object ?? finding.statement}
                   </button>
                 </h3>
+                {#if finding.context}
+                  <p class="micro muted">{finding.context}</p>
+                {/if}
+                {#if finding.observations.length > 0}
+                  <ul class="finding__values" aria-label="Числовые значения из источника">
+                    {#each finding.observations as observation, index (index)}
+                      <li class="micro">{observation.property_name}: {valueLabel(observation)}</li>
+                    {/each}
+                  </ul>
+                {/if}
                 <!-- Место в источнике видно самой строкой: где лежит доказательство,
                    видно до открытия шторки. Полное трассирование и фрагмент в ней. -->
                 <p class="finding__trail">
@@ -2089,6 +2099,12 @@
     <dd>{subject.label}</dd>
     <dt>Связь</dt>
     <dd>{predicate.label}</dd>
+    <dt>Значение или объект</dt>
+    <dd>{finding.object ?? 'Не указано'}</dd>
+    {#if finding.context}
+      <dt>Контекст</dt>
+      <dd>{finding.context}</dd>
+    {/if}
     <dt>Статус</dt>
     <dd><StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} /></dd>
     <dt>Доступ</dt>

@@ -11,7 +11,7 @@ from scientific_tangle.domain.contracts import (
     IngestionBundle,
 )
 from scientific_tangle.domain.relations import relations_for_extraction
-from scientific_tangle.services.knowledge import KnowledgeBase
+from scientific_tangle.services.knowledge import KnowledgeBase, quote_offsets
 from scientific_tangle.services.ontology import OntologyValidator
 from scientific_tangle.services.provider import ModelProvider
 from scientific_tangle.services.resolution import EntityResolutionWorkbench
@@ -21,6 +21,12 @@ from scientific_tangle.services.resolution import EntityResolutionWorkbench
 # дорого: на реальном прогоне GigaChat додумывал STARTED_WITH и EQUIVALENT_TO,
 # импорт уходил в repair-раунд и падал уже после него.
 EXTRACTION_SYSTEM = f"""Ты Extractor Agent платформы MindAI.
+Каждый claim — короткий атомарный факт с субъектом, отношением, значением,
+общим fact_kind и контекстом (условия, даты, единицы и ограничения).
+Извлекай определения, свойства, числа, отношения, события, процессы, ограничения
+и решения. Пропускай заголовки, оглавления, учебные цели, биографии, списки людей,
+рекламу и фрагменты без проверяемого знания. Мнения, рекомендации и предположения
+не выдавай за факты. evidence_quote — дословная непрерывная цитата из источника.
 Извлеки только явно поддержанные текстом сущности и утверждения.
 Сохрани исходную формулировку evidence_quote. Не додумывай факты.
 Типы сущностей ограничены JSON Schema. Confidence оценивает качество evidence, а не красоту текста.
@@ -91,6 +97,29 @@ class IngestionService:
         )
         bundle = await self._complete(EXTRACTION_SYSTEM, user_text)
         extraction = self._apply_resolutions(bundle)
+        source_texts = [document.text, *(item.text for item in document.fragments)]
+        supported_claims = [
+            claim
+            for claim in extraction.claims
+            if any(
+                quote_offsets(source, claim.evidence_quote) is not None
+                for source in source_texts
+            )
+        ]
+        if len(supported_claims) != len(extraction.claims):
+            supported_subjects = {claim.subject.casefold() for claim in supported_claims}
+            extraction = extraction.model_copy(
+                update={
+                    "claims": supported_claims,
+                    "entities": [
+                        entity
+                        for entity in extraction.entities
+                        if entity.name.casefold() in supported_subjects
+                        or entity.canonical_name.casefold() in supported_subjects
+                        or any(alias.casefold() in supported_subjects for alias in entity.aliases)
+                    ],
+                }
+            )
         try:
             await asyncio.to_thread(self._ontology.validate, extraction)
         except ValueError as error:

@@ -351,6 +351,8 @@ class Neo4jElasticsearchKnowledgeBase:
                 # «осмос» в «обратный осмос-М». Потолок — ignore_above: значение
                 # длиннее потолка в фильтр не попадёт.
                 "subject": {"type": "keyword", "ignore_above": SUBJECT_FILTER_KEYWORD_MAX},
+                "predicate": {"type": "keyword"},
+                "object": {"type": "keyword", "ignore_above": SUBJECT_FILTER_KEYWORD_MAX},
                 # Версия формы документа: по ней починка старых записей понимает,
                 # что доводить нечего, и не перебирает индекс на каждом старте.
                 "schema": {"type": "short"},
@@ -1604,6 +1606,8 @@ class Neo4jElasticsearchKnowledgeBase:
                 "statement": finding.statement,
                 "status": finding.status,
                 "subject": _subject_filter_value(finding.subject),
+                "predicate": finding.predicate,
+                "object": finding.object,
                 "schema": FINDING_DOC_SCHEMA,
                 "data_class": finding.data_class.value,
                 "confidence": finding.confidence,
@@ -2170,6 +2174,108 @@ class Neo4jElasticsearchKnowledgeBase:
             offset=start,
             limit=size,
             note=note,
+        )
+
+    def facts_window(
+        self,
+        *,
+        limit: int = FINDINGS_WINDOW_DEFAULT,
+        offset: int = 0,
+        allowed_data_classes: set[DataClass] | None = None,
+        status: str | None = None,
+        subject: str | None = None,
+    ) -> FindingWindow:
+        """Окно только для подтверждённых источниками структурированных фактов."""
+        self._ensure_ready()
+        size, start = normalize_window(limit, offset, max_limit=FINDINGS_WINDOW_MAX)
+        filters: list[dict[str, Any]] = list(_class_filter(allowed_data_classes))
+        filters.extend(
+            [
+                {"exists": {"field": "subject"}},
+                {"exists": {"field": "predicate"}},
+                {"exists": {"field": "object"}},
+                {"exists": {"field": "evidence"}},
+            ]
+        )
+        if status:
+            filters.append({"term": {"status": status}})
+        if subject:
+            escaped = _subject_filter_value(subject).replace("\\", "\\\\").replace(
+                "*", "\\*"
+            ).replace("?", "\\?")
+            filters.append(
+                {"wildcard": {"subject": {"value": f"*{escaped}*", "case_insensitive": True}}}
+            )
+        query = {
+            "bool": {
+                "filter": filters,
+                "must_not": [
+                    {"exists": {"field": "superseded_by"}},
+                    {"term": {"scope.origin": DEMO_ORIGIN}},
+                ],
+            }
+        }
+        try:
+            response = self._search.search(
+                index=FINDING_INDEX,
+                size=size,
+                from_=start,
+                query=query,
+                sort=[{"_seq_no": {"order": "asc"}}],
+                source={"includes": ["finding_json"]},
+                track_total_hits=True,
+            )
+        except Exception as error:  # noqa: BLE001 - сохраняем доступность каталога при деградации поиска
+            failure = str(self._note_degradation("facts_window", error))
+            allowed = None if allowed_data_classes is None else set(allowed_data_classes)
+            selected = sorted(
+                (
+                    item
+                    for item in self._snapshot_findings().values()
+                    if item.superseded_by is None
+                    and not is_demo_finding(item)
+                    and item.subject
+                    and item.predicate
+                    and item.object
+                    and item.evidence
+                    and (allowed is None or item.data_class in allowed)
+                    and (status is None or item.status == status)
+                    and (subject is None or subject.casefold() in item.subject.casefold())
+                ),
+                key=lambda item: item.id,
+            )
+            return FindingWindow(
+                findings=[item.model_copy(deep=True) for item in selected[start : start + size]],
+                total=len(selected),
+                offset=start,
+                limit=size,
+                note=f"{failure} Окно фактов взято из RAM-каталога процесса.",
+            )
+        hits = response.get("hits", {})
+        findings: list[Finding] = []
+        for hit in hits.get("hits", []):
+            payload = (hit.get("_source") or {}).get("finding_json")
+            if not payload:
+                continue
+            finding = Finding.model_validate_json(payload)
+            if not (
+                finding.subject and finding.predicate and finding.object and finding.evidence
+                and finding.superseded_by is None
+                and (allowed_data_classes is None or finding.data_class in allowed_data_classes)
+                and (status is None or finding.status == status)
+                and (subject is None or subject.casefold() in finding.subject.casefold())
+                and not is_demo_finding(finding)
+            ):
+                continue
+            findings.append(finding)
+        total = hits.get("total", 0)
+        total_value = int(total.get("value", 0)) if isinstance(total, dict) else int(total)
+        return FindingWindow(
+            findings=findings,
+            total=total_value,
+            offset=start,
+            limit=size,
+            note=None,
         )
 
     def _findings_window_from_catalog(

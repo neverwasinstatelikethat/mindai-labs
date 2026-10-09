@@ -50,6 +50,7 @@ from scientific_tangle.domain.contracts import (
     EntityResolutionProposal,
     EvaluationMetrics,
     EvaluationRun,
+    EvidenceLocator,
     EvolutionDraft,
     EvolutionExperiment,
     EvolutionProposal,
@@ -2003,6 +2004,7 @@ def _break_graph_reads(monkeypatch: pytest.MonkeyPatch, deps: AppDependencies) -
         "full_graph",
         "all_findings",
         "findings_window",
+        "facts_window",
         "corpus_stats",
         "claim_history",
     ):
@@ -2098,7 +2100,7 @@ def test_application_bug_is_not_disguised_as_a_storage_outage(
         raise ValueError("граф вернул структуру вне схемы")
 
     monkeypatch.setattr(deps.knowledge, "all_findings", broken)
-    monkeypatch.setattr(deps.knowledge, "findings_window", broken)
+    monkeypatch.setattr(deps.knowledge, "facts_window", broken)
 
     with pytest.raises(ValueError):
         client.get("/api/v1/findings", headers=base)
@@ -2114,7 +2116,16 @@ def _finding_window(count: int, disputed: int = 0) -> list[Finding]:
             subject="Обессоливание",
             statement=f"Тезис {index} для проверки окна выдачи.",
             confidence=0.7,
-            evidence=[],
+            evidence=[
+                EvidenceLocator(
+                    document_id=UUID(int=index + 1),
+                    source_title=f"Источник {index}",
+                    page=1,
+                    quote=f"Тезис {index} для проверки окна выдачи.",
+                )
+            ],
+            predicate="HAS_PROPERTY",
+            object=f"значение {index}",
             status="disputed" if index < disputed else "consensus",
         )
         for index in range(count)
@@ -2161,6 +2172,11 @@ def test_findings_and_conflicts_are_paginated_with_a_total_header(
     Считается полное число подходящих записей, а не длина окна.
     """
     monkeypatch.setattr(deps.knowledge, "all_findings", lambda allowed=None: _finding_window(5, 2))
+    monkeypatch.setattr(
+        deps.knowledge,
+        "facts_window",
+        _window_reader(_finding_window(5, 2)),
+    )
     monkeypatch.setattr(
         deps.knowledge,
         "findings_window",
@@ -2367,7 +2383,7 @@ def test_findings_list_reads_the_window_from_the_store(
     def no_catalog_read(allowed: object = None) -> list[Finding]:
         raise AssertionError("список без фильтров не обязан читать весь каталог")
 
-    monkeypatch.setattr(deps.knowledge, "findings_window", window_read)
+    monkeypatch.setattr(deps.knowledge, "facts_window", window_read)
     monkeypatch.setattr(deps.knowledge, "all_findings", no_catalog_read)
 
     response = client.get("/api/v1/findings", headers=base, params={"limit": 2, "offset": 1})
@@ -2593,7 +2609,7 @@ def test_findings_page_ceiling_is_reported_when_request_is_larger(
             note=None,
         )
 
-    monkeypatch.setattr(deps.knowledge, "findings_window", capped)
+    monkeypatch.setattr(deps.knowledge, "facts_window", capped)
     monkeypatch.setattr(deps.knowledge, "all_findings", lambda allowed=None: _finding_window(3))
 
     response = client.get("/api/v1/findings", headers=base, params={"limit": 1000})

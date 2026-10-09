@@ -1289,6 +1289,33 @@ def test_neo4j_findings_window_pushes_filters_into_the_query(
     assert wildcard["case_insensitive"] is True
 
 
+def test_neo4j_facts_window_reads_only_structured_supported_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fact = make_finding("f-fact", "Обессоливание задерживает 97 процентов солей.").model_copy(
+        update={
+            "subject": "Обессоливание",
+            "predicate": "HAS_PROPERTY",
+            "object": "97 процентов",
+        }
+    )
+    harness = build_backend(monkeypatch)
+    harness.es.hits = {FINDING_INDEX: [{"_id": fact.id, "_source": as_source(fact)}]}
+    harness.es.total = 1
+
+    window = harness.knowledge.facts_window(limit=10, offset=0, subject="обесс")
+    call = harness.es.searches[-1]
+    filters = call["query"]["bool"]["filter"]
+
+    assert call["index"] == FINDING_INDEX
+    assert {"exists": {"field": "subject"}} in filters
+    assert {"exists": {"field": "predicate"}} in filters
+    assert {"exists": {"field": "object"}} in filters
+    assert {"exists": {"field": "evidence"}} in filters
+    assert [item.id for item in window.findings] == [fact.id]
+    assert window.total == 1
+
+
 def test_subject_filter_ignores_case_on_both_sides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

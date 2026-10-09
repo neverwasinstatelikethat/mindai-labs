@@ -750,6 +750,16 @@ class KnowledgeBase(Protocol):
         subject: str | None = None,
     ) -> FindingWindow: ...
 
+    def facts_window(
+        self,
+        *,
+        limit: int = FINDINGS_WINDOW_DEFAULT,
+        offset: int = 0,
+        allowed_data_classes: set[DataClass] | None = None,
+        status: str | None = None,
+        subject: str | None = None,
+    ) -> FindingWindow: ...
+
     def warmup(self) -> None:
         """Прогрев хранилища до первого запроса (схема, индексы, каталог)."""
         ...
@@ -1060,6 +1070,10 @@ class InMemoryKnowledgeBase:
                     data_class=document.data_class,
                     metadata={
                         "knowledge_status": "extracted",
+                        "subject": claim.subject,
+                        "predicate": claim.predicate,
+                        "object": claim.object,
+                        "fact_kind": claim.fact_kind,
                         "observations": json.dumps(
                             [item.model_dump(mode="json") for item in claim.observations],
                             ensure_ascii=False,
@@ -1067,6 +1081,8 @@ class InMemoryKnowledgeBase:
                     },
                 )
             )
+            if claim.context:
+                self._graph.nodes[-1].metadata["context"] = claim.context
             self._graph.edges.extend(
                 [
                     GraphEdge(
@@ -1106,6 +1122,9 @@ class InMemoryKnowledgeBase:
                 observations=claim.observations,
                 subject=claim.subject,
                 predicate=claim.predicate,
+                object=claim.object,
+                fact_kind=claim.fact_kind,
+                context=claim.context,
                 # Год и территория источника — условия применимости тезиса: без них
                 # ограничения плана «с 2015 года» и «Россия» нечем исполнять.
                 scope=document_scope(document),
@@ -1649,6 +1668,42 @@ class InMemoryKnowledgeBase:
                 and (allowed is None or finding.data_class in allowed)
                 and (status is None or finding.status == status)
                 and (needle is None or needle in (finding.subject or "").lower())
+            ),
+            key=lambda finding: finding.id,
+        )
+        return FindingWindow(
+            findings=[finding.model_copy(deep=True) for finding in selected[start : start + size]],
+            total=len(selected),
+            offset=start,
+            limit=size,
+            note=None,
+        )
+
+    @_synchronized
+    def facts_window(
+        self,
+        *,
+        limit: int = FINDINGS_WINDOW_DEFAULT,
+        offset: int = 0,
+        allowed_data_classes: set[DataClass] | None = None,
+        status: str | None = None,
+        subject: str | None = None,
+    ) -> FindingWindow:
+        size, start = normalize_window(limit, offset, max_limit=FINDINGS_WINDOW_MAX)
+        allowed = None if allowed_data_classes is None else set(allowed_data_classes)
+        needle = subject.casefold() if subject else None
+        selected = sorted(
+            (
+                finding
+                for finding in self._findings.values()
+                if finding.superseded_by is None
+                and finding.subject
+                and finding.predicate
+                and finding.object
+                and finding.evidence
+                and (allowed is None or finding.data_class in allowed)
+                and (status is None or finding.status == status)
+                and (needle is None or needle in finding.subject.casefold())
             ),
             key=lambda finding: finding.id,
         )

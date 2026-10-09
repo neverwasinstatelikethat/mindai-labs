@@ -4,6 +4,7 @@ import pytest
 from openpyxl import Workbook
 
 from scientific_tangle.domain.contracts import (
+    DocumentFragment,
     DocumentRequest,
     ExtractedClaim,
     ExtractedEntity,
@@ -39,6 +40,8 @@ def extraction() -> ExtractionResult:
                 statement="Шахтная вода очищается обратным осмосом.",
                 confidence=0.91,
                 evidence_quote="Обратный осмос применён для очистки шахтной воды.",
+                fact_kind="process_relationship",
+                context="В рамках пилотного процесса очистки.",
             )
         ],
     )
@@ -63,7 +66,68 @@ async def test_ingestion_writes_extracted_claim_and_provenance_to_graph() -> Non
     assert any(node.label == "Пилот" for node in graph.nodes)
     assert any(node.metadata.get("knowledge_status") == "extracted" for node in graph.nodes)
     assert any(edge.relation == "SUPPORTED_BY" for edge in graph.edges)
-    assert any(finding.evidence[0].source_title == "Пилот" for finding in knowledge.all_findings())
+    assert any(edge.relation == "TREATED_BY" for edge in graph.edges)
+    fact = next(
+        item
+        for item in knowledge.all_findings()
+        if item.subject.casefold() == "шахтная вода"
+    )
+    assert fact.evidence[0].source_title == "Пилот"
+    assert fact.object.casefold() == "обратный осмос"
+    assert fact.fact_kind == "process_relationship"
+    assert fact.context == "В рамках пилотного процесса очистки."
+    facts = knowledge.facts_window(limit=20, offset=0)
+    assert facts.total == 1
+    assert facts.findings[0].id == fact.id
+
+
+@pytest.mark.asyncio
+async def test_ingestion_drops_claims_without_an_exact_source_quote() -> None:
+    knowledge = InMemoryKnowledgeBase()
+    unsupported = extraction().model_copy(
+        update={
+            "claims": [
+                extraction().claims[0].model_copy(
+                    update={"evidence_quote": "Эта цитата отсутствует в источнике."}
+                )
+            ]
+        }
+    )
+    service = IngestionService(
+        knowledge,
+        ScriptedProvider(IngestionBundle(extraction=unsupported)),
+    )
+
+    receipt = await service.ingest(
+        DocumentRequest(
+            title="Пилот",
+            text="Обратный осмос применён для очистки шахтной воды.",
+        )
+    )
+
+    assert receipt.extracted_claims == 0
+    assert not any(item.id.startswith("finding-claim-") for item in knowledge.all_findings())
+
+
+def test_facts_window_excludes_retrieval_chunks() -> None:
+    knowledge = InMemoryKnowledgeBase()
+    document = DocumentRequest(
+        title="Пилот",
+        text=("Обратный осмос применён для очистки шахтной воды; " * 30) + "процесс завершён.",
+        fragments=[
+            DocumentFragment(
+                text=("Обратный осмос применён для очистки шахтной воды; " * 30)
+                + "процесс завершён.",
+                page=1,
+            )
+        ],
+    )
+    knowledge.index_document(document, "pilot.txt")
+
+    window = knowledge.facts_window(limit=20, offset=0)
+
+    assert window.total == 0
+    assert window.findings == []
 
 
 @pytest.mark.asyncio

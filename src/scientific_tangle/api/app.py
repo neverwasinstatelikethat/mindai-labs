@@ -2084,7 +2084,7 @@ async def get_findings(
     limit: Annotated[int, Query(ge=1, le=AUDIT_LIMIT_MAX)] = AUDIT_LIMIT_DEFAULT,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[dict[str, object]]:
-    """Возвращает находки с доказательствами и наблюдениями.
+    """Возвращает только структурированные факты с доказательствами.
 
     Список режется окном ``[offset:offset+limit]``: находок в корпусе сотни, и
     отдавать их целиком на каждый экран — гонять один и тот же массив через
@@ -2092,15 +2092,13 @@ async def get_findings(
     подходящих записей — в ``X-Total-Count``, а явная оговорка окна — в
     ``X-Window-Note``.
 
-    Окно читается из хранилища вместе с фильтрами: ``status`` и ``subject`` уходят
-    предикатами запроса (поля индексуются обоими индексами), поэтому страница
-    перестала быть вырезкой из поднятого в память каталога и не упирается в
-    ``CATALOG_RESTORE_LIMIT``.
+    Текстовые чанки остаются в retrieval, но не считаются готовыми фактами.
+    ``status`` и ``subject`` применяются хранилищем до пагинации.
     """
     deps = dependencies(request)
     async with _storage_or_unavailable(request, "Находки"):
         window = await asyncio.to_thread(
-            deps.knowledge.findings_window,
+            deps.knowledge.facts_window,
             limit=limit,
             offset=offset,
             allowed_data_classes=_allowed_classes(request),
