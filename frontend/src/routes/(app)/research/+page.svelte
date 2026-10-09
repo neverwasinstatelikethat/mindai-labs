@@ -550,7 +550,9 @@
                   disabled={savingConversation !== null}
                   onclick={() => void saveConversation(item)}
                 >
-                  {savedConversation === item.query_id ? 'Сохранено' : 'Сохранить диалог'}
+                  <span class="sr-only">
+                    {savedConversation === item.query_id ? 'Диалог сохранён' : 'Сохранить диалог'}
+                  </span>
                 </Button>
               </li>
             {/each}
