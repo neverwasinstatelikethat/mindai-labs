@@ -1,0 +1,10 @@
+[Unit]
+Description=StormIdea hypothesis analysis
+After=docker.service
+Requires=docker.service
+
+[Service]
+WorkingDirectory=/opt/mindai-labs/repo
+ExecStart=/usr/bin/docker compose --profile tools run --name mindai-hypothesis-analysis-job --rm -T preload python -m scientific_tangle.preload --hypotheses-only
+ExecStop=-/usr/bin/docker stop -t 15 mindai-hypothesis-analysis-job
+TimeoutStopSec=30

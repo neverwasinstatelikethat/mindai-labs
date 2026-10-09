@@ -1,0 +1,10 @@
+[Unit]
+Description=StormIdea full semantic ingest
+After=docker.service
+Requires=docker.service
+
+[Service]
+WorkingDirectory=/opt/mindai-labs/repo
+ExecStart=/usr/bin/docker compose --profile tools run --name mindai-semantic-ingest-job --rm -T preload python -m scientific_tangle.preload --semantic-corpus
+ExecStop=-/usr/bin/docker stop -t 15 mindai-semantic-ingest-job
+TimeoutStopSec=30
