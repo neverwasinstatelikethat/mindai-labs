@@ -589,7 +589,7 @@ class ResearchWorkflow:
     def _fit_findings(
         self, state: ResearchState, *, budget_tokens: int
     ) -> tuple[list[Finding], int]:
-        """Крупнейший по релевантности префикс доказательств, влезающий в бюджет.
+        """Набор целых доказательств по релевантности, влезающий в бюджет.
 
         ``fit_sections`` при переполнении сбрасывает целые нижние секции, и FINDINGS
         уходил целиком — синтез получал три оплаченных обращения заведомо по
@@ -604,7 +604,7 @@ class ResearchWorkflow:
         others = sum(
             estimate_tokens(f"{label}\n{body}")
             for label, body in self._evidence_sections(state, [])
-            if label != "FINDINGS"
+            if label in {"ВОПРОС", "ИСТОРИЯ ВЕТКИ", "QUERY PLAN"}
         )
         remaining = budget_tokens - others - 1
         if remaining <= 0:
@@ -614,7 +614,7 @@ class ResearchWorkflow:
         for finding in ranked:
             cost = estimate_tokens(to_prompt_json(finding)) + 1
             if cost > remaining - spent:
-                break
+                continue
             fitted.append(finding)
             spent += cost
         return fitted, len(ranked)

@@ -1735,7 +1735,10 @@ class Neo4jElasticsearchKnowledgeBase:
                 """
                 MATCH (node:Entity)
                 WHERE node.type <> 'chunk'
-                WITH node, COUNT { (node)--() } AS degree
+                WITH node, COUNT {
+                    (node)-[relation]-(neighbor:Entity)
+                    WHERE neighbor.type <> 'chunk' AND type(relation) <> 'HAS_CHUNK'
+                } AS degree
                 ORDER BY degree DESC, coalesce(node.label, node.id), node.id
                 WITH collect(properties(node)) AS nodes, count(node) AS total
                 RETURN nodes, total
@@ -1745,7 +1748,10 @@ class Neo4jElasticsearchKnowledgeBase:
                 """
                 MATCH (node:Entity)
                 WHERE node.type <> 'chunk'
-                WITH node, COUNT { (node)--() } AS degree
+                WITH node, COUNT {
+                    (node)-[relation]-(neighbor:Entity)
+                    WHERE neighbor.type <> 'chunk' AND type(relation) <> 'HAS_CHUNK'
+                } AS degree
                 ORDER BY degree DESC, coalesce(node.label, node.id), node.id
                 WITH collect(properties(node)) AS nodes, count(node) AS total
                 RETURN nodes[0..$limit] AS nodes, total

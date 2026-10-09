@@ -98,6 +98,35 @@ async def test_planning_discloses_discarded_numeric_filter() -> None:
     assert result["action_plan"].actions
 
 
+def test_large_tool_observations_do_not_displace_source_evidence() -> None:
+    from scientific_tangle.domain.contracts import Finding, ToolObservation
+    from scientific_tangle.domain.models import EvidenceLocator
+
+    workflow = ResearchWorkflow(provider=ScriptedProvider())
+    finding = Finding(
+        id="finding-short",
+        statement="Керамический фильтр снижает влажность продукта.",
+        confidence=0.9,
+        evidence=[EvidenceLocator(document_id=uuid4(), page=1, quote="Фильтр снижает влажность.")],
+    )
+    state = {
+        "question": "Как фильтр снижает влажность?",
+        "query_plan": query_plan(),
+        "findings": [finding],
+        "observations": [
+            ToolObservation(
+                action_id="search", tool="hybrid_search", status="success", summary="x" * 20000
+            )
+        ],
+    }
+
+    context = workflow._evidence_context(state, budget_tokens=1400)
+
+    assert "finding-short" in context.text
+    assert "TOOL OBSERVATIONS" in context.dropped
+    assert not context.truncated
+
+
 @pytest.mark.asyncio
 async def test_llm_driven_workflow_reaches_grounded_answer() -> None:
     provider = ScriptedProvider(

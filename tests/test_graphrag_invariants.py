@@ -1132,7 +1132,10 @@ def test_graph_snapshot_slices_by_connectivity_not_by_alphabet() -> None:
     assert "ORDER BY degree DESC, coalesce(node.label, node.id), node.id" in source, (
         "узы среза снова идут по алфавиту метки: снимок смещён к началу алфавита"
     )
-    assert "COUNT { (node)--() } AS degree" in source, "степень узла больше не считается"
+    assert "(node)-[relation]-(neighbor:Entity)" in source
+    assert "WHERE neighbor.type <> 'chunk' AND type(relation) <> 'HAS_CHUNK'" in source, (
+        "структурные чанки вытесняют семантические узлы из среза графа"
+    )
     assert "UNWIND $ids AS id" in source and "b.id IN $ids" in source, (
         "рёбра снова читаются независимо от выбранного набора узлов: снимок "
         "перестаёт быть подграфом"
