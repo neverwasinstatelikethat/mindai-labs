@@ -7,10 +7,16 @@ from uuid import UUID
 from scientific_tangle.domain.contracts import (
     DocumentReceipt,
     DocumentRequest,
+    ExtractedEntity,
     ExtractionResult,
     IngestionBundle,
+    NodeType,
 )
-from scientific_tangle.domain.relations import relations_for_extraction
+from scientific_tangle.domain.relations import (
+    RelationContractError,
+    relations_for_extraction,
+    spec_for,
+)
 from scientific_tangle.services.knowledge import KnowledgeBase, quote_offsets
 from scientific_tangle.services.ontology import OntologyValidator
 from scientific_tangle.services.provider import ModelProvider
@@ -46,6 +52,41 @@ EXTRACTION_REPAIR_SYSTEM = f"""{EXTRACTION_SYSTEM}
 У каждого claim.subject и claim.object должна быть соответствующая entity.
 Используй только типы из JSON Schema.
 """
+
+
+def _complete_claim_endpoints(extraction: ExtractionResult) -> ExtractionResult:
+    """Добавляет пропущенные endpoints с типом, разрешённым подписью отношения."""
+    entities = list(extraction.entities)
+    known = {
+        value.casefold()
+        for entity in entities
+        for value in (entity.name, entity.canonical_name, *entity.aliases)
+    }
+    for claim in extraction.claims:
+        try:
+            relation = spec_for(claim.predicate)
+        except RelationContractError:
+            continue
+        for term, allowed_types in (
+            (claim.subject, relation.source_types),
+            (claim.object, relation.target_types),
+        ):
+            key = term.casefold()
+            if key in known:
+                continue
+            # If a relation permits several endpoint types, prefer material when
+            # allowed; otherwise use a stable allowed type (e.g. LOCATED_IN → location).
+            choices = allowed_types or frozenset({NodeType.MATERIAL})
+            entity_type = (
+                NodeType.MATERIAL
+                if NodeType.MATERIAL in choices
+                else min(choices, key=lambda value: value.value)
+            )
+            entities.append(
+                ExtractedEntity(name=term, canonical_name=term, type=entity_type)
+            )
+            known.add(key)
+    return extraction.model_copy(update={"entities": entities})
 
 
 class IngestionService:
@@ -125,6 +166,7 @@ class IngestionService:
                     ],
                 }
             )
+        extraction = _complete_claim_endpoints(extraction)
         try:
             await asyncio.to_thread(self._ontology.validate, extraction)
         except ValueError as error:
@@ -137,6 +179,7 @@ class IngestionService:
                 ),
             )
             extraction = self._apply_resolutions(bundle)
+            extraction = _complete_claim_endpoints(extraction)
             await asyncio.to_thread(self._ontology.validate, extraction)
         receipt = await asyncio.to_thread(
             self._knowledge.ingest,

@@ -176,6 +176,34 @@ async def test_ingestion_keeps_supported_claim_object_entities() -> None:
     assert provider.calls == ["IngestionBundle"]
 
 
+@pytest.mark.asyncio
+async def test_ingestion_infers_missing_endpoint_type_from_relation_signature() -> None:
+    knowledge = InMemoryKnowledgeBase()
+    source_entity = ExtractedEntity(
+        name="Шахтная вода",
+        canonical_name="Шахтная вода",
+        type=NodeType.MATERIAL,
+    )
+    claim = extraction().claims[0]
+    bundle = IngestionBundle(
+        extraction=ExtractionResult(entities=[source_entity], claims=[claim])
+    )
+    provider = ScriptedProvider(bundle)
+
+    receipt = await IngestionService(knowledge, provider).ingest(
+        DocumentRequest(
+            title="Пилот",
+            text="Обратный осмос применён для очистки шахтной воды.",
+        )
+    )
+
+    graph = knowledge.full_graph()
+    target = next(node for node in graph.nodes if node.label.casefold() == "обратный осмос")
+    assert receipt.extracted_claims == 1
+    assert target.type == NodeType.PROCESS
+    assert provider.calls == ["IngestionBundle"]
+
+
 def test_facts_window_excludes_retrieval_chunks() -> None:
     knowledge = InMemoryKnowledgeBase()
     document = DocumentRequest(
