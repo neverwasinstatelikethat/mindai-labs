@@ -1259,8 +1259,30 @@ def test_chunk_id_and_locator_are_computed_once_for_both_backends() -> None:
 
     assert finding.id == pieces[0].id
     assert finding.evidence[0].char_start == 0
-    assert finding.evidence[0].char_end == len(pieces[0].text[:1200])
+    assert finding.evidence[0].char_end == len(finding.evidence[0].quote)
     assert finding.scope == {SCOPE_YEAR: "2019", SCOPE_GEOGRAPHY: "Мурманская область"}
+
+
+def test_chunk_quote_supports_numbers_beyond_the_old_excerpt_limit() -> None:
+    from scientific_tangle.agents.workflow import _ungrounded_answer_numbers, _ungrounded_numbers
+    from scientific_tangle.domain.contracts import DocumentFragment, ReasoningResult
+
+    text = "Описание процесса. " * 90 + "Температура сушки составляет 110 °C."
+    document = structural_document().model_copy(
+        update={"text": text, "fragments": [DocumentFragment(text=text, page=1)]}
+    )
+    piece = chunk_document(document, UUID(int=1))[0]
+    finding = chunk_finding(document, UUID(int=1), piece)
+
+    assert finding.evidence[0].quote == finding.statement
+    assert finding.evidence[0].char_end == len(finding.statement)
+    assert _ungrounded_numbers([finding]) == {}
+    assert _ungrounded_answer_numbers(
+        ReasoningResult(summary="Температура сушки — 110 °C."), [finding]
+    ) == []
+    assert _ungrounded_answer_numbers(
+        ReasoningResult(summary="Температура сушки — 111 °C."), [finding]
+    ) == ["111"]
 
 
 # ─ 6. Каталог читается окном, а не целиком (узкое место 4) ─────────────────

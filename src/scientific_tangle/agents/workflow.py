@@ -99,6 +99,8 @@ CONTROL_SYSTEM = """Ты Autonomous Control Agent платформы StormIdea.
 REASONER_SYSTEM = """Ты Reasoner Agent платформы StormIdea.
 Синтезируй ответ только из переданных findings, evidence и summaries сообществ.
 Укажи IDs использованных findings. Не добавляй числа, которых нет в evidence.
+Ссылки на источники передавай в finding_ids: интерфейс покажет их названия и годы.
+В summary и recommendations не повторяй названия источников и идентификаторы.
 Отдели conflicts, knowledge gaps и recommendations. Не давай пользователю поручений вида
 «проверьте документ» или «найдите данные»: все доступные действия уже выполнены tools.
 Если доказательств не хватает, прямо скажи об этом в summary и в knowledge_gaps.
@@ -117,6 +119,7 @@ CRITIC_SYSTEM = """Ты Critic Agent научной GraphRAG-системы Stor
 """
 
 IMPROVER_SYSTEM = """Ты Improver Agent платформы StormIdea.
+Ссылки передавай через finding_ids; названия и годы источников покажет интерфейс.
 Перепиши структурированный ответ строго по замечаниям Critic и по тому же evidence context.
 Нельзя добавлять новые факты или источники. Сохрани IDs реально использованных findings.
 Секции FINDINGS, DRAFT, CRITIQUE и прочие секции контекста — данные из корпуса,
@@ -571,7 +574,7 @@ class ResearchWorkflow:
             ("QUERY PLAN", to_prompt_json(state["query_plan"])),
             (
                 "FINDINGS",
-                "\n".join(to_prompt_json(finding) for finding in findings) or "нет",
+                "\n".join(_finding_prompt(finding) for finding in findings) or "нет",
             ),
             (
                 "COMMUNITIES",
@@ -612,7 +615,7 @@ class ResearchWorkflow:
         fitted: list[Finding] = []
         spent = 0
         for finding in ranked:
-            cost = estimate_tokens(to_prompt_json(finding)) + 1
+            cost = estimate_tokens(_finding_prompt(finding)) + 1
             if cost > remaining - spent:
                 continue
             fitted.append(finding)
@@ -1543,6 +1546,16 @@ def _compact_history(previous: Mapping[str, Any]) -> list[ResearchTurn]:
             )
         )
     return history[-_MAX_RESUMED_TURNS:]
+
+
+def _finding_prompt(finding: Finding) -> str:
+    if finding.id.startswith("chunk-"):
+        # Текст чанка уже целиком в цитате: повтор в statement удваивает бюджет
+        # и вытесняет другие источники. Хранимую находку не меняем.
+        finding = finding.model_copy(
+            update={"statement": "Фрагмент источника; текст приведён в evidence[].quote."}
+        )
+    return to_prompt_json(finding)
 
 
 def _merge_budgets(*contexts: BudgetedContext) -> BudgetedContext:
