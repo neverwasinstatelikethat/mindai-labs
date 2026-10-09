@@ -154,6 +154,23 @@ async def test_malformed_json_is_repaired_and_second_attempt_returns_result() ->
 
 
 @pytest.mark.asyncio
+async def test_long_malformed_response_is_regenerated_without_cutting_its_json() -> None:
+    broken = '{"summary": "' + "x" * 4100 + '" "finding_ids": []}'
+    subject, prompts = _provider(
+        [_completion(broken), _completion('{"summary": "готово", "finding_ids": []}')]
+    )
+
+    result = await subject.complete_model("система", "исходный вопрос", Answer)
+
+    repair = prompts[1][-1].content
+    assert result.summary == "готово"
+    assert "исходный вопрос" in repair
+    assert "Expecting ',' delimiter" in repair
+    assert broken[:4000] not in repair
+    assert "заново" in repair
+
+
+@pytest.mark.asyncio
 async def test_schema_violation_retries_and_succeeds() -> None:
     subject, prompts = _provider(
         [_completion('{"finding_ids": []}'), _completion('{"summary": "есть", "finding_ids": []}')]

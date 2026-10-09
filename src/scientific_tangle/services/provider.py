@@ -724,7 +724,7 @@ class GigaChatProvider:
                     )
                 if attempt == _SCHEMA_REPAIR_ATTEMPTS - 1:
                     break
-                messages = self._repair_messages(instruction, user, content, None)
+                messages = self._repair_messages(instruction, user, content, last_defect)
                 self._metrics.observe_llm_retry(schema.__name__)
             raise ModelUnavailableError(
                 f"GigaChat: structured output retry исчерпан ({schema.__name__}): {last_defect}"
@@ -852,15 +852,23 @@ class GigaChatProvider:
         previous: str,
         errors: str | None,
     ) -> list[Messages]:
-        hint = f"Нарушения схемы: {errors}" if errors else "Ответ не является JSON-объектом."
+        hint = f"Ошибка ответа: {errors}" if errors else "Ответ не является JSON-объектом."
+        # Обрезанный префикс скрывает место ошибки и заставляет модель чинить
+        # JSON, которого она не видит целиком. Исходная задача достаточна для
+        # повторной генерации; передавать частичный ответ как полный нельзя.
+        previous_section = (
+            f"Исправь ответ и верни только data object, без пояснений:\n{previous}"
+            if len(previous) <= 4000
+            else "Предыдущий ответ слишком большой для ремонта. Сформируй JSON "
+            "заново по исходной задаче и форме, без пояснений."
+        )
         return [
             Messages(role=MessagesRole.SYSTEM, content=instruction),
             Messages(
                 role=MessagesRole.USER,
                 content=(
                     f"Исходная задача:\n{user}\n\n{hint}\n"
-                    "Исправь ответ и верни только data object, без пояснений:\n"
-                    f"{previous[:4000]}"
+                    f"{previous_section}"
                 ),
             ),
         ]
