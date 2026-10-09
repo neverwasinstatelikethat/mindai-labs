@@ -80,6 +80,24 @@ def planning_bundle() -> PlanningBundle:
     )
 
 
+@pytest.mark.parametrize("language", ["ru", "en"])
+@pytest.mark.asyncio
+async def test_unapproved_answer_shows_open_issue_before_draft(language: str) -> None:
+    workflow = ResearchWorkflow(provider=ScriptedProvider())
+    issue = "Связь с выбранным оборудованием не подтверждена."
+    draft = "Размагничивание может снизить энергозатраты."
+    result = await workflow.finalize({
+        "run_id": str(uuid4()), "question": "Какая гипотеза?",
+        "language": language, "query_plan": query_plan(),
+        "reasoning": ReasoningResult(summary=draft),
+        "critique": CritiqueResult(approved=False, issues=[issue]),
+        "revision_count": 1,
+    })
+    summary = result["answer"].summary
+    assert summary.index(issue) < summary.index(draft)
+    assert summary.startswith("Предварительный" if language == "ru" else "Preliminary")
+
+
 @pytest.mark.asyncio
 async def test_planning_discloses_discarded_numeric_filter() -> None:
     payload = planning_bundle().model_dump()
