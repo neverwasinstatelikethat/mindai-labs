@@ -13,7 +13,11 @@ from scientific_tangle.domain.contracts import (
     NodeType,
 )
 from scientific_tangle.services.document_parser import parse_document
-from scientific_tangle.services.ingestion import IngestionService
+from scientific_tangle.services.ingestion import (
+    EXTRACTION_REPAIR_SYSTEM,
+    EXTRACTION_SYSTEM,
+    IngestionService,
+)
 from scientific_tangle.services.knowledge import InMemoryKnowledgeBase
 from tests.fakes import ScriptedProvider
 
@@ -45,6 +49,12 @@ def extraction() -> ExtractionResult:
             )
         ],
     )
+
+
+def test_extraction_prompts_require_entities_for_both_claim_endpoints() -> None:
+    for prompt in (EXTRACTION_SYSTEM, EXTRACTION_REPAIR_SYSTEM):
+        assert "claim.subject и claim.object" in prompt
+        assert "entities" in prompt
 
 
 @pytest.mark.asyncio

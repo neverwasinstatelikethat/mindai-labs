@@ -34,8 +34,8 @@ Predicate — ровно одно имя из закрытого словаря 
 буквами через подчёркивание, без склонений и пояснений. Отношение вне словаря
 отклоняется проверкой, и импорт не состоится:
 {relations_for_extraction()}
-У каждого claim.subject обязана быть сущность в entities — по name, canonical_name
-или alias. Иначе утверждение считается неподдержанным.
+У каждого claim.subject и claim.object обязана быть сущность в entities — по name,
+canonical_name или alias. Иначе утверждение считается неподдержанным.
 Для каждой сущности сформируй resolution proposal: link только при высокой уверенности,
 иначе create. Русские и английские синонимы своди к одному canonical_name.
 """
@@ -43,7 +43,8 @@ Predicate — ровно одно имя из закрытого словаря 
 EXTRACTION_REPAIR_SYSTEM = f"""{EXTRACTION_SYSTEM}
 Ты исправляешь schema/ontology violation предыдущего extraction result.
 Верни полный исправленный IngestionBundle. Не удаляй корректные evidence-backed claims.
-У каждого claim.subject должна быть соответствующая entity. Используй только типы из JSON Schema.
+У каждого claim.subject и claim.object должна быть соответствующая entity.
+Используй только типы из JSON Schema.
 """
 
 
