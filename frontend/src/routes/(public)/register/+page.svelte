@@ -247,8 +247,7 @@
   /* Согласие стоит над кнопкой: человек соглашается до отправки данных. */
   .auth__consent {
     max-width: var(--maxw-measure);
-    padding-top: var(--s1);
-    border-top: 1px solid var(--line);
+    margin-top: var(--s5);
   }
 
   .notice__actions {

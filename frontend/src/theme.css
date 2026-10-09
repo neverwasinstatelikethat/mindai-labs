@@ -1,0 +1,151 @@
+/* Мост между токенами Softly и утилитами Tailwind.
+   `inline` означает, что утилита компилируется в var(--токен), а не в копию
+   значения: единственным источником цвета, кегля и радиуса остаётся tokens.css,
+   а `prefers-reduced-motion` продолжает гасить движение через --dur-*. */
+
+@theme inline {
+  /* Шаг сетки совпадает с --s1 (4px), поэтому весь ритм Softly лежит на шкале
+     Tailwind: p-4 = 16px = --s4, gap-8 = 32px = --s6, mt-12 = 48px = --s7. */
+  --spacing: 0.25rem;
+
+  /* Поверхности и сцена. */
+  --color-paper: var(--paper);
+  --color-paper-deep: var(--paper-deep);
+  --color-surface: var(--surface);
+  --color-sunk: var(--surface-sunk);
+  --color-raised: var(--surface-raised);
+  --color-sage: var(--sage);
+  --color-sage-deep: var(--sage-deep);
+  --color-lav: var(--lavender);
+  --color-lav-deep: var(--lavender-deep);
+  --color-lav-mist: var(--lav-mist);
+  --color-coral-mist: var(--coral-mist);
+  --color-peach: var(--peach-wash);
+
+  /* Чернила: три рабочих уровня и один мета. */
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-ink-4: var(--ink-4);
+  --color-ink-inv: var(--ink-inverse);
+  --color-ink-inv-2: var(--ink-inverse-2);
+  --color-stone-deep: var(--stone-deep);
+  --color-stone-deeper: var(--stone-deeper);
+
+  /* Край: только для полей ввода, фокуса, плотной таблицы и модального слоя. */
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-line-strong: var(--line-strong);
+  --color-line-inv: var(--line-inverse);
+  --color-edge: var(--edge);
+  --color-edge-soft: var(--edge-soft);
+  --color-edge-active: var(--edge-active);
+
+  /* Действие и техника. */
+  --color-action: var(--action);
+  --color-action-deep: var(--action-deep);
+  --color-action-ink: var(--action-ink);
+  --color-code: var(--field-code);
+  --color-veil: var(--veil);
+  --color-sheen: var(--sheen);
+
+  /* Статусы данных — чернила; wash — поле сцены. */
+  --color-consensus: var(--consensus);
+  --color-consensus-wash: var(--consensus-wash);
+  --color-hypo: var(--hypothesis);
+  --color-hypo-wash: var(--hypothesis-wash);
+  --color-disputed: var(--disputed);
+  --color-disputed-wash: var(--disputed-wash);
+  --color-superseded: var(--superseded);
+  --color-superseded-wash: var(--superseded-wash);
+
+  /* Аура маскота и композера. */
+  --color-aura-cyan: var(--aura-cyan);
+  --color-aura-blue: var(--aura-blue);
+  --color-aura-violet: var(--aura-violet);
+  --color-aura-deep: var(--aura-deep);
+  --color-aura-glow: var(--aura-glow);
+  --color-aura-ring: var(--aura-ring);
+
+  /* Гарнитуры. */
+  --font-sans: var(--font-ui);
+  --font-ui: var(--font-ui);
+  --font-hand: var(--font-hand);
+  --font-data: var(--font-data);
+
+  /* Кегль и ведущая одной утилитой: text-body несёт и размер, и межстрочный. */
+  --text-display: var(--t-display);
+  --text-display--line-height: var(--lh-tight);
+  --text-display--letter-spacing: var(--tr-display);
+  --text-h1: var(--t-h1);
+  --text-h1--line-height: var(--lh-head);
+  --text-h1--letter-spacing: var(--tr-head);
+  --text-h2: var(--t-h2);
+  --text-h2--line-height: var(--lh-head);
+  --text-h2--letter-spacing: var(--tr-head);
+  --text-h3: var(--t-h3);
+  --text-h3--line-height: var(--lh-head);
+  --text-h3--letter-spacing: var(--tr-head);
+  --text-h4: var(--t-h4);
+  --text-lead: var(--t-lead);
+  --text-lead--line-height: var(--lh-body);
+  --text-body: var(--t-body);
+  --text-body--line-height: var(--lh-body);
+  --text-body--letter-spacing: var(--tr-body);
+  --text-small: var(--t-small);
+  --text-small--line-height: var(--lh-dense);
+  --text-micro: var(--t-micro);
+  --text-micro--line-height: var(--lh-dense);
+  --text-hand: var(--t-hand);
+  --text-num: var(--t-num);
+  --text-num--line-height: var(--lh-tight);
+
+  --leading-tight: var(--lh-tight);
+  --leading-head: var(--lh-head);
+  --leading-body: var(--lh-body);
+  --leading-dense: var(--lh-dense);
+  --tracking-display: var(--tr-display);
+  --tracking-head: var(--tr-head);
+  --tracking-body: var(--tr-body);
+
+  /* Геометрия: control всегда pill, объект — lg или xl. */
+  --radius-xs: var(--r-xs);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+  --radius-full: var(--r-pill);
+
+  /* Имена ступеней подъёма нарочно не совпадают с токенами: `--shadow-soft` в
+     :root и в пространстве имён Tailwind столкнулись бы, и утилита начала бы
+     ссылаться сама на себя. */
+  --shadow-object: var(--shadow-soft);
+  --shadow-float: var(--shadow-lift);
+
+  --max-width-measure: var(--maxw-measure);
+  --max-width-narrow: var(--maxw-narrow);
+  --max-width-page: var(--maxw-page);
+
+  /* Ширина, на которой содержимое перестаёт влезать: 640 — телефон, 900 —
+     поле связей схлопывается в колонки, 1120 — появляется правая колонка
+     инспектора. Совпадают с медиазапросами app.css, а не с дефолтами Tailwind. */
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 900px;
+  --breakpoint-lg: 1120px;
+  --breakpoint-xl: 1280px;
+  --breakpoint-2xl: 1560px;
+
+  /* Любая `transition` без явной длительности берёт темп из токена, поэтому
+     reduced-motion гасит и утилитарные переходы. */
+  --default-transition-duration: var(--dur);
+  --default-transition-timing-function: var(--ease-soft);
+}
+
+/* Отклик контрола: короче обычного перехода, тоже из токена. */
+@utility press {
+  transition-duration: var(--dur-fast);
+}
+
+@utility enter {
+  transition-timing-function: var(--ease-enter);
+}

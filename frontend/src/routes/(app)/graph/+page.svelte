@@ -1,11 +1,9 @@
 <script lang="ts">
-  // Карта связей: обзор областей, цепочки выбранной области (GraphMap) и
-  // инспектор выбранной записи с доказательствами. Инспектор показывается,
-  // только когда выбрана запись или связь: до выбора экран принадлежит карте,
-  // и держать под ней пустую панель на весь экран нечего.
+  // Карта связей: поле связей открыто сразу, поиск стоит строкой над ним, а
+  // сведения о выбранной записи или выбранной связи живёт в одной колонке
+  // рядом с полем. Колонка заполняется на месте выбора: до деталей не нужно
+  // прокручивать экран, и они не прячутся в модалке.
   import { page } from '$app/state';
-  import { goto } from '$app/navigation';
-  import { tick } from 'svelte';
   import { api, ApiError } from '$lib/api';
   import GraphMap from '$lib/GraphMap.svelte';
   import SourceRef from '$lib/ui/SourceRef.svelte';
@@ -14,11 +12,11 @@
   import { session } from '$lib/sessionStore.svelte';
   import {
     ASK_SOURCE,
+    MAP_INSPECTOR,
+    MAP_LABEL_DENSITY,
     MAP_LINK_MISS,
-    MAP_MODES,
     MAP_NAME_FALLBACK,
     MAP_NOUN,
-    MAP_SEARCH,
     PROPERTY_LABELS,
     STATUS_SHORT,
     SUBJECT_LABELS,
@@ -28,18 +26,15 @@
     mapAreaName,
     mapNodeType,
     mapRelationLabel,
-    mapSearchEmptyBody,
-    mapSearchShownOf,
   } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
   import Empty from '$lib/ui/Empty.svelte';
-  import Field from '$lib/ui/Field.svelte';
   import Icon from '$lib/ui/Icon.svelte';
   import Notice from '$lib/ui/Notice.svelte';
   import Panel from '$lib/ui/Panel.svelte';
   import SectionHead from '$lib/ui/SectionHead.svelte';
+  import Segmented from '$lib/ui/Segmented.svelte';
   import Sheet from '$lib/ui/Sheet.svelte';
-  import StatusPill from '$lib/ui/StatusPill.svelte';
   import type {
     FindingListItem,
     GraphEdge,
@@ -65,17 +60,10 @@
   // Выбранная связь живёт на экране: поле подсвечивает её, инспектор описывает
   // словами и ведёт к обеим записям.
   let pickedEdge = $state<GraphEdge | null>(null);
-  // Два целевых сценария одного экрана. Поиск отвечает на «где это и что про это
-  // сказано» простым списком и карточкой сведений; карта отвечает на «как это
-  // связано» и требует чтения поля. Раньше экран начинался с поля, и человек,
-  // пришедший за одним фактом, получал стрелки.
-  let mode = $state<'search' | 'map'>(
-    page.url.searchParams.get('mode') === 'map' ? 'map' : 'search',
-  );
   // Подписи связей по умолчанию только у выбранной записи; человек может
-  // включить их для всего поля.
-  let labelsAll = $state(false);
-  let query = $state('');
+  // включить их для всего поля. Это единственный переключатель вида на экране:
+  // режимов «поиск» и «карта» больше нет, поле связей открыто сразу.
+  let labelMode = $state<'focus' | 'all'>('focus');
   // Доказательства берутся из настоящих находок корпуса: /api/v1/findings отдаёт
   // тот же Finding, что и ответ запроса, уже срезанный по классу данных сессии.
   // Список приходит страницей, а полное число подходит заголовком сервера: без
@@ -221,20 +209,6 @@
    * Числа той области, на которую смотрит человек: выбранная запись лежит в
    * своей области, и знаменатель счётчика берётся из неё, а не из всего корпуса.
    */
-  const focusArea = $derived.by<{ name: string; records: number; links: number } | null>(() => {
-    if (!selected) return null;
-    const name = areaOf(selected);
-    const ids = new Set<string>();
-    for (const node of graph.nodes) {
-      if (areaOf(node) === name) ids.add(node.id);
-    }
-    let links = 0;
-    for (const edge of graph.edges) {
-      if (ids.has(edge.source) && ids.has(edge.target)) links += 1;
-    }
-    return { name, records: ids.size, links };
-  });
-
   /**
    * Находки, которым принадлежит запись карты: только совпадение идентификаторов.
    * claim-узел `claim-…` и находка `finding-claim-…`, узел документа
@@ -274,38 +248,6 @@
   }
 
   const nodeIndex = $derived(new Map(graph.nodes.map((node) => [node.id, node])));
-
-  /**
-   * Результат поиска по карте: запись, её тип и одна строка сведений. Ищется по
-   * имени и по названию типа, поэтому «документ» находит источники, а «95» не
-   * находит ничего лишнего. Поле в поиске не участвует: оно перечитывает срез
-   * целиком, а не рисует новый граф.
-   */
-  const searchMatches = $derived.by<GraphNode[]>(() => {
-    const q = query.trim().toLowerCase();
-    if (q === '') return [];
-    return graph.nodes.filter((node) => {
-      const label = node.label.toLowerCase();
-      const type = mapNodeType(node.type).toLowerCase();
-      return label.includes(q) || type.includes(q);
-    });
-  });
-
-  /** На экране помещается первые строки, остальное называется числом. */
-  const SEARCH_WINDOW = 40;
-  const searchShown = $derived(searchMatches.slice(0, SEARCH_WINDOW));
-
-  function setMode(next: 'search' | 'map'): void {
-    if (mode === next) return;
-    mode = next;
-    const params = new URLSearchParams(page.url.searchParams);
-    params.set('mode', next);
-    void goto(`?${params.toString()}`, {
-      keepFocus: true,
-      noScroll: true,
-      replaceState: true,
-    }).catch(() => undefined);
-  }
 
   /** Связи выбранной записи: направление и вторая сторона берутся из этого же среза. */
   const connections = $derived.by<Connection[]>(() => {
@@ -375,6 +317,39 @@
   function pickEdge(edge: GraphEdge | null): void {
     pickedEdge = edge;
   }
+
+  /** Единственное «Снять выбор» на экране: оно гасит и связь, и запись. */
+  function clearSelection(): void {
+    pickedEdge = null;
+    pick(null);
+  }
+
+  /**
+   * Концы выбранной связи: записи берутся из этого же среза, а если конца в
+   * срезе нет, строка называется словами, а не служебным кодом.
+   */
+  const edgeEnds = $derived.by<{ from: GraphNode | null; to: GraphNode | null }>(() => {
+    if (!pickedEdge) return { from: null, to: null };
+    return {
+      from: nodeIndex.get(pickedEdge.source) ?? null,
+      to: nodeIndex.get(pickedEdge.target) ?? null,
+    };
+  });
+
+  /**
+   * Заголовок колонки сведений: он один и для записи, и для связи, поэтому
+   * человек понимает, что открыто, не сравнивая два разных контейнера.
+   */
+  const inspectorTitle = $derived(
+    pickedEdge
+      ? mapRelationLabel(pickedEdge.relation)
+      : (selected?.label ?? ''),
+  );
+
+  /** Подпись над заголовком: что именно выбрано. */
+  const inspectorKind = $derived(
+    pickedEdge ? MAP_INSPECTOR.link : MAP_INSPECTOR.record,
+  );
 
   let requestSeq = 0;
   async function load(): Promise<void> {
@@ -498,14 +473,10 @@
     const node = nodeByFindingCode(code);
     linkMiss = node === null;
     if (!node) return;
+    // Переход просит детали прямо: колонка сведений заполняется выбором на
+    // месте, и прокручивать к ней экран больше не нужно.
     pick(node);
-    // Переход просит детали прямо: инспектор показывается сразу, а не тогда,
-    // когда человек докрутит поле до него.
-    void tick().then(() => {
-      document.getElementById('evidence')?.scrollIntoView({ block: 'start' });
-    });
   });
-
 
   /**
    * Числовые условия могут лежать и в самой записи (`metadata.observations`:
@@ -541,9 +512,9 @@
 {#snippet nodeBody()}
   {#if selected}
     <div class="stack map__node-facts">
+      <!-- Вид записи назван подписью над заголовком колонки: вторая строка с
+           тем же словом внутри колонки только повторяла бы его. -->
       <dl class="kv">
-        <dt>вид записи</dt>
-        <dd>{mapNodeType(selected.type)}</dd>
         <dt>область на карте</dt>
         <dd>{areaOf(selected)}</dd>
       </dl>
@@ -731,7 +702,9 @@
                   <span>версия <span class="num">{num(finding.version)}</span></span>
                 {/if}
               </p>
-              <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
+              <span class="micro status-word" data-status={finding.status}>
+                {STATUS_SHORT[finding.status]}
+              </span>
             </div>
 
             <h4 class="h4 map__claim-title">
@@ -779,25 +752,87 @@
   {/if}
 {/snippet}
 
-{#snippet edgeCard()}
+{#snippet edgeBody()}
   {#if pickedEdge}
-    {@const fromNode = nodeIndex.get(pickedEdge.source) ?? null}
-    {@const toNode = nodeIndex.get(pickedEdge.target) ?? null}
-    <div class="map__edge-card">
-      <p class="h3 map__edge-kind">
-        <span>{mapRelationLabel(pickedEdge.relation)}</span>
-      </p>
-      <p class="small map__edge-line">
-        <button type="button" class="map__jump" onclick={() => fromNode && pick(fromNode)}>
-          {fromNode?.label ?? 'запись вне этой карты'}
-        </button>
-        <span class="micro muted">ведёт к</span>
-        <button type="button" class="map__jump" onclick={() => toNode && pick(toNode)}>
-          {toNode?.label ?? 'запись вне этой карты'}
-        </button>
-      </p>
+    <div class="stack map__edge-card">
+      <dl class="kv">
+        <dt>отношение</dt>
+        <dd>{mapRelationLabel(pickedEdge.relation)}</dd>
+        <dt>область на карте</dt>
+        <dd>{edgeEnds.from ? areaOf(edgeEnds.from) : MAP_NAME_FALLBACK.offDictionary}</dd>
+      </dl>
+
+      <!-- Оба конца связи живут в той же колонке, что и выбранная запись:
+           отдельного модального окна для связи на широком экране больше нет. -->
+      <div class="map__conn">
+        <h3 class="h4">{MAP_INSPECTOR.linkOf}</h3>
+        <ul class="map__edge-ends">
+          <li>
+            <span class="micro muted">исходит</span>
+            {#if edgeEnds.from}
+              {@const start = edgeEnds.from}
+              <button type="button" class="map__jump" onclick={() => pick(start)}>
+                {start.label}
+                <span class="micro muted">{mapNodeType(start.type)}</span>
+              </button>
+            {:else}
+              <span class="small">{MAP_NAME_FALLBACK.record}</span>
+            {/if}
+          </li>
+          <li>
+            <span class="micro muted">входит</span>
+            {#if edgeEnds.to}
+              {@const finish = edgeEnds.to}
+              <button type="button" class="map__jump" onclick={() => pick(finish)}>
+                {finish.label}
+                <span class="micro muted">{mapNodeType(finish.type)}</span>
+              </button>
+            {:else}
+              <span class="small">{MAP_NAME_FALLBACK.record}</span>
+            {/if}
+          </li>
+        </ul>
+      </div>
+
+      {#if selected}
+        <p class="small muted map__edge-back">
+          {MAP_INSPECTOR.linkInRecord}:
+          <button type="button" class="map__jump" onclick={() => pick(selected)}>
+            {selected.label}
+          </button>
+        </p>
+      {/if}
     </div>
   {/if}
+{/snippet}
+
+{#snippet inspectorHead()}
+  <div class="map__insp-head">
+    <div class="map__insp-name">
+      <p class="eyebrow">
+        <Icon name="pin" size={16} />
+        {inspectorKind}
+        {#if !pickedEdge && selected}
+          <span>{mapNodeType(selected.type)}</span>
+        {/if}
+      </p>
+      <h2 class="h3">{inspectorTitle}</h2>
+    </div>
+    <div class="row">
+      {#if !pickedEdge && findingHref}
+        <Button href={findingHref} variant="quiet" size="sm">
+          {ASK_SOURCE.findings}
+        </Button>
+      {/if}
+      <!-- «Снять выбор» на экране один: он живёт здесь, а повторный клик по
+           выбранной строке поля делает то же самое. -->
+      {#if selected || pickedEdge}
+        <Button variant="ghost" size="sm" onclick={clearSelection}>
+          {MAP_INSPECTOR.clear}
+        </Button>
+      {/if}
+    </div>
+  </div>
 {/snippet}
 
 <div class="page map-page">
@@ -810,27 +845,18 @@
       {#if status === 'ready'}
         <div class="map__head-tools">
           {#if graph.nodes.length > 0}
-            <!-- Режимы карты — та же сегментная полоса, что и фасеты находок:
-                 две кнопки с заливкой читались как два отдельных действия,
-                 хотя выбирают они один и тот же вид. -->
-            <div class="seg map__modes" role="group" aria-label={MAP_MODES.group}>
-              <button
-                class="seg__item"
-                type="button"
-                aria-pressed={mode === 'search'}
-                onclick={() => setMode('search')}
-              >
-                {MAP_MODES.search}
-              </button>
-              <button
-                class="seg__item"
-                type="button"
-                aria-pressed={mode === 'map'}
-                onclick={() => setMode('map')}
-              >
-                {MAP_MODES.analysis}
-              </button>
-            </div>
+            <!-- Единственный переключатель вида на экране: плотность подписей
+                 на линиях. Режимов «поиск» и «карта» больше нет, поэтому
+                 переключать сюда нечего. -->
+            <Segmented
+              class="map__density-mode"
+              label={MAP_LABEL_DENSITY.group}
+              items={[
+                { value: 'focus', label: MAP_LABEL_DENSITY.focus },
+                { value: 'all', label: MAP_LABEL_DENSITY.all },
+              ]}
+              bind:value={labelMode}
+            />
           {/if}
           <Button variant="quiet" size="sm" icon="refresh" onclick={() => void load()}>
             Обновить
@@ -851,7 +877,6 @@
       <Panel tone="lav">
         <div class="panel__head">
           <h2 class="h3">Нет доступа к материалам</h2>
-          <StatusPill status="off" label="нет доступа" />
         </div>
         <p class="lead small">
           Попросите владельца пространства открыть доступ к материалам.
@@ -900,135 +925,64 @@
         <Notice tone="warn" title={MAP_LINK_MISS.title}>{MAP_LINK_MISS.body}</Notice>
       {/if}
 
-      {#if mode === 'search'}
-        <!-- Поиск: список и сведения простым форматом. Ни стрелок, ни поля
-             рисования здесь нет, потому что за этим сценарием приходят за
-             одной записью, а не за обзором связей. -->
-        <Panel tone="sunk">
-          <div class="map__search">
-          <div class="map__search-form">
-            <Field
-              label={MAP_MODES.searchLabel}
-              name="map-search"
-              type="search"
-              bind:value={query}
-              placeholder={MAP_MODES.searchPlaceholder}
-            />
-          </div>
-
-          {#if query.trim() === ''}
-            <p class="micro muted map__search-idle">{MAP_MODES.idle}</p>
-          {:else if searchMatches.length === 0}
-            <p class="small map__search-empty">{mapSearchEmptyBody(query.trim())}</p>
-          {:else}
-            <p class="micro muted map__search-count">
-              {mapSearchShownOf(searchShown.length, searchMatches.length, query.trim())}
-            </p>
-            <ul class="map__results" aria-label={MAP_MODES.search}>
-              {#each searchShown as node (node.id)}
-                <li class="map__result">
-                  <button
-                    type="button"
-                    class="map__result-row"
-                    data-active={selected?.id === node.id ? 'true' : undefined}
-                    onclick={() => pick(node)}
-                  >
-                    <span class="map__result-type">{mapNodeType(node.type)}</span>
-                    <span class="map__result-label">{node.label}</span>
-                  </button>
-                  {#if selected?.id === node.id}
-                    <div class="map__result-go">
-                      <Button variant="quiet" size="sm" onclick={() => setMode('map')}>
-                        {MAP_MODES.toMap}
-                      </Button>
-                    </div>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          {/if}
-          </div>
-        </Panel>
-      {:else}
-        <div class="map__density">
-          <!-- Режим подписей — подписанный control-элемент: он переключает поле,
-               а не описывает себя текстом рядом. Кораловый ход на экране занят
-               задачей, настройка поля darker не требует. -->
-          <Button
-            variant={labelsAll ? 'ink' : 'quiet'}
-            size="sm"
-            current={labelsAll}
-            onclick={() => (labelsAll = !labelsAll)}
-          >
-            {MAP_SEARCH.labelsAll}
-          </Button>
+      <div class="map-lab">
+        <div class="map-lab__field">
+          <GraphMap
+            {graph}
+            {narrow}
+            labelMode={labelMode}
+            selectedId={selected ? selected.id : undefined}
+            edgeId={pickedEdge ? pickedEdge.id : undefined}
+            onselect={pick}
+            onpickEdge={pickEdge}
+          />
         </div>
-        <GraphMap
-          {graph}
-          {narrow}
-          labelMode={labelsAll ? 'all' : 'focus'}
-          selectedId={selected ? selected.id : undefined}
-          edgeId={pickedEdge ? pickedEdge.id : undefined}
-          onselect={pick}
-          onpickEdge={pickEdge}
-        />
-      {/if}
 
-      {#if selected}
-        <section id="evidence" class="map__inspector">
-          {#if narrow}
-            <Sheet
-              title="Запись карты: {selected.label}"
-              onclose={() => pick(null)}
-              width="760px"
-            >
-              {@render edgeCard()}
+        <!-- Колонка сведений: на широком экране справа от поля и прилипшая, на
+             среднем становится нижней, но остаётся в том же контейнере с тем же
+             заголовком. Пустое состояние говорит, куда нажать. -->
+        {#if !narrow}
+          <aside id="inspector" class="panel map-lab__insp">
+            {#if pickedEdge}
+              {@render inspectorHead()}
+              {@render edgeBody()}
+            {:else if selected}
+              {@render inspectorHead()}
+              <div class="stack map__insp-body">
+                {@render nodeBody()}
+                {@render evidenceBlock()}
+              </div>
+            {:else}
+              <div class="map__insp-empty">
+                <h2 class="h4">{MAP_INSPECTOR.emptyTitle}</h2>
+                <p class="small muted">{MAP_INSPECTOR.emptyBody}</p>
+                <p class="micro muted">{MAP_INSPECTOR.emptyLink}</p>
+              </div>
+            {/if}
+          </aside>
+        {/if}
+      </div>
+
+      <!-- На узком экране сведений справа нет места: они приходят шторкой
+         снизу, тем же содержимым и тем же заголовком. -->
+      {#if narrow && (selected || pickedEdge)}
+        <Sheet
+          title={pickedEdge ? inspectorTitle : (selected?.label ?? '')}
+          onclose={clearSelection}
+          width="760px"
+        >
+          <p class="eyebrow map__sheet-kind">
+            <Icon name="pin" size={16} />
+            {inspectorKind}
+          </p>
+          {#if pickedEdge}
+            {@render edgeBody()}
+          {:else}
+            <div class="stack map__insp-body">
               {@render nodeBody()}
               {@render evidenceBlock()}
-            </Sheet>
-          {:else}
-            <Panel tone="default" raised>
-              <div class="panel__head">
-                <div>
-                  <p class="eyebrow">
-                    <Icon name="pin" size={16} />
-                    выбранная запись
-                    <span>{mapNodeType(selected.type)}</span>
-                  </p>
-                  <h2 class="h3">{selected.label}</h2>
-                </div>
-                <div class="row">
-                  {#if findingHref}
-                    <Button href={findingHref} variant="quiet" size="sm">
-                      {ASK_SOURCE.findings}
-                    </Button>
-                  {/if}
-                  <Button variant="ghost" size="sm" onclick={() => pick(null)}>Снять выбор</Button>
-                </div>
-              </div>
-
-              <div class="split map__split">
-                <div class="stack" style="--gap: var(--s5)">
-                  {@render nodeBody()}
-                </div>
-                <div class="stack" style="--gap: var(--s4)">
-                  {@render evidenceBlock()}
-                </div>
-              </div>
-            </Panel>
+            </div>
           {/if}
-        </section>
-      {/if}
-      {#if pickedEdge && (!narrow || !selected)}
-        <Sheet
-          title={`Связь: ${mapRelationLabel(pickedEdge.relation)}`}
-          onclose={() => pickEdge(null)}
-          width="640px"
-        >
-          {@render edgeCard()}
-          <div class="row map__edge-actions">
-            <Button variant="quiet" size="sm" onclick={() => pickEdge(null)}>Закрыть</Button>
-          </div>
         </Sheet>
       {/if}
     {/if}
@@ -1049,161 +1003,82 @@
     flex-wrap: wrap;
   }
 
-  /* Переключатель сценариев: две кнопки в одной строке, активная читается и
-     заполнением, и `aria-current`. */
-  .map__search {
+  /* Поле связей и колонка сведений — один контейнер на две роли. При 1120 px
+     колонка встаёт справа и прилипает: выбор заполняет её на месте, и за
+     деталями не надо прокручивать экран. Ниже этой ширины колонка становится
+     нижней, но не меняет ни заголовка, ни содержания. */
+  .map-lab {
+    display: grid;
+    gap: var(--s5);
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .map-lab__field,
+  .map-lab__insp {
+    min-width: 0;
+  }
+
+  @media (min-width: 1120px) {
+    .map-lab {
+      grid-template-columns: minmax(0, 1fr) minmax(340px, 400px);
+      gap: var(--s6);
+    }
+
+    .map-lab__insp {
+      position: sticky;
+      top: calc(var(--topbar-h) + var(--s4));
+      max-height: calc(100dvh - var(--topbar-h) - var(--s8));
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+  }
+
+  /* Шапка колонки одна и для записи, и для связи: два выбора выглядят
+     одинаково, и человек понимает, что открыто. */
+  .map__insp-head {
     display: flex;
-    flex-direction: column;
+    align-items: flex-start;
+    justify-content: space-between;
     gap: var(--s4);
+    flex-wrap: wrap;
     margin-bottom: var(--s5);
   }
 
-  /* Плотность подписей: настройка поля, а не сценария, поэтому стоит над
-     полем и в одну строку с пояснением. */
-  .map__density {
-    display: flex;
-    align-items: baseline;
-    gap: var(--s3);
-    flex-wrap: wrap;
-    margin-bottom: var(--s3);
-  }
-
-  .map__search-form {
-    max-width: var(--maxw-narrow);
-  }
-
-  .map__search-idle,
-  .map__search-empty,
-  .map__search-count {
-    margin: 0;
-  }
-
-  .map__search-empty {
-    color: var(--ink-2);
-  }
-
-  /* Результат поиска: одна строка на запись, тип слева, имя справа. Никаких
-     стрелок: список отвечает на «где это», связи смотрят в другом сценарии. */
-  .map__results {
+  .map__insp-name {
     display: flex;
     flex-direction: column;
     gap: var(--s1);
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-
-  .map__result {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s2);
-  }
-
-  /* Найденное живёт в утопленной панели: рамка вокруг каждой строки превращала
-     список из тринадцати записей в тринадцать карточек. Строка остаётся
-     строкой, отклик появляется под курсором и на выбранной записи. */
-  .map__result-row {
-    display: flex;
-    align-items: baseline;
-    gap: var(--s3);
-    width: 100%;
-    padding: var(--s3) var(--s4);
-    border: 0;
-    border-radius: var(--r-sm);
-    background: none;
-    color: var(--ink);
-    font: inherit;
-    text-align: start;
-    cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-soft);
-  }
-
-  .map__result-row:hover {
-    background: var(--surface);
-  }
-
-  .map__result-row[data-active='true'] {
-    background: var(--sage);
-  }
-
-  .map__result-type {
-    flex: none;
-    font-size: var(--t-micro);
-    color: var(--ink-3);
-  }
-
-  .map__result-label {
-    overflow-wrap: anywhere;
-  }
-
-  .map__result-go {
-    padding-left: var(--s4);
-  }
-
-  /* Связь раскрывается отдельно: человек сохраняет контекст карты за модалкой. */
-  .map__edge-card {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s2);
-    margin-block: var(--s4) 0;
-    padding: var(--s4);
-    border-radius: var(--r-md);
-    background: var(--surface-sunk);
-    align-items: flex-start;
-  }
-
-  .map__edge-card p {
-    margin: 0;
-  }
-
-  .map__edge-card .map__edge-kind {
-    margin-block-end: var(--s3);
-  }
-
-  .map__edge-actions {
-    margin-top: var(--s3);
-  }
-
-  .map__edge-line {
-    display: flex;
-    align-items: baseline;
-    gap: var(--s2);
-    flex-wrap: wrap;
-  }
-
-  /* Субъект, отношение и версия находки — три подписанных элемента, а не одна
-     склеенная строка: длинное имя переносится, не сминая соседей. */
-  .map__claim-tags {
-    flex-wrap: wrap;
-    row-gap: var(--s1);
     min-width: 0;
-    font-weight: 400;
   }
 
-  .map__claim-tags > span {
-    display: inline-flex;
-    align-items: center;
-    min-height: 28px;
-    padding-inline: var(--s3);
-    border-radius: var(--r-pill);
-    color: var(--ink);
-    font-size: var(--t-micro);
-  }
-
-  .map__claim-tags > span:nth-child(1) { background: var(--sage); }
-  .map__claim-tags > span:nth-child(2) { background: var(--lavender); }
-  .map__claim-tags > span:nth-child(3) { background: var(--surface-sunk); }
-
-  .map__claim-tags .num {
-    padding: 0;
-    background: transparent;
-    color: inherit;
-  }
-
-  .map__claim-tags span {
+  .map__insp-name h2 {
+    margin: 0;
     overflow-wrap: anywhere;
   }
 
+  .map__insp-body {
+    --gap: var(--s5);
+  }
+
+  /* Пустая колонка обязана сказать, куда нажать: без этой строки она
+     выглядела бы сломанной панелью. */
+  .map__insp-empty {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+  }
+
+  .map__insp-empty h2,
+  .map__insp-empty p {
+    margin: 0;
+  }
+
+  .map__sheet-kind {
+    margin: 0 0 var(--s4);
+  }
+
+  /* ── Состояния экрана ───────────────────────────────────────────────────── */
   .map__skeleton {
     display: flex;
     flex-direction: column;
@@ -1231,14 +1106,7 @@
     border-radius: var(--r-xl);
   }
 
-  .map__inspector {
-    min-height: 260px;
-  }
-
-  .map__split {
-    --gap: var(--s6);
-  }
-
+  /* ── Колонка сведений: запись ───────────────────────────────────────────── */
   .map__node-facts {
     --gap: var(--s4);
   }
@@ -1259,10 +1127,12 @@
     flex-direction: column;
   }
 
+  /* Плотный список связей: линия между строками работает здесь разделителем
+     колонок, а не рамкой блока. За его пределами рамок на экране нет. */
   .map__conn-list li {
     display: grid;
-    grid-template-columns: 66px minmax(96px, 0.9fr) minmax(0, 1.4fr) 52px;
-    gap: var(--s3);
+    grid-template-columns: 62px minmax(90px, 0.9fr) minmax(0, 1.4fr);
+    gap: var(--s2) var(--s3);
     align-items: baseline;
     padding: var(--s2) 0;
     border-top: 1px solid var(--line-soft);
@@ -1285,16 +1155,14 @@
     white-space: nowrap;
   }
 
-  /* Отношение связи — действие: с клавиатуры оно выбирает связь и раскрывает её
-     карточку, а не только перескакивает на вторую запись. Русское имя сверху,
-     техническое подписью под ним. */
+  /* Отношение связи — действие: с клавиатуры оно выбирает связь и раскрывает
+     её в этой же колонке, а не только перескакивает на вторую запись. */
   .map__rel {
     display: inline-flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 0;
+    align-items: baseline;
+    gap: var(--s2);
     min-width: 0;
-    padding: 0 var(--s2);
+    padding: var(--s1) var(--s2);
     border: 0;
     border-radius: var(--r-xs);
     background: none;
@@ -1311,9 +1179,10 @@
     background: var(--surface-sunk);
   }
 
+  /* Выбор связи читается тоном: обводка внутри плашки была вторым контуром. */
   .map__rel[aria-pressed='true'] {
     color: var(--ink);
-    box-shadow: inset 0 0 0 1px var(--action-ink);
+    background: var(--sage);
   }
 
   .map__jump {
@@ -1338,25 +1207,57 @@
     color: var(--action-ink);
   }
 
+  /* ── Колонка сведений: связь ────────────────────────────────────────────── */
+  .map__edge-card {
+    --gap: var(--s4);
+  }
+
+  /* Оба конца связи читаются плотным списком: направление слева, запись
+     справа, тот же разделитель, что и у связей записи. */
+  .map__edge-ends {
+    list-style: none;
+    margin: var(--s2) 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .map__edge-ends li {
+    display: grid;
+    grid-template-columns: 62px minmax(0, 1fr);
+    gap: var(--s2) var(--s3);
+    align-items: baseline;
+    padding: var(--s2) 0;
+    border-top: 1px solid var(--line-soft);
+  }
+
+  /* ── Доказательства выбранной записи ────────────────────────────────────── */
   .map__evidence {
     display: flex;
     flex-direction: column;
     gap: var(--s4);
   }
 
-  /* Находка — плоская строка панели: заполнение остаётся цитате, иначе блок
-     ложится на блок и в панели из трёх слоёв ничего не читается. */
+  /* Находка — плоская строка: блок от блока отделяется расстоянием, а не
+     линией, и заполнение остаётся цитате. */
   .map__claim {
     display: flex;
     flex-direction: column;
     gap: var(--s3);
-    padding-top: var(--s4);
-    border-top: 1px solid var(--line-soft);
   }
 
-  .map__claim:first-of-type {
-    padding-top: 0;
-    border-top: 0;
+  /* Субъект, отношение и версия находки читаются подписями одной строки:
+     плашка вокруг каждого слова удваивала бы форму там, где нужно слово. */
+  .map__claim-tags {
+    flex-wrap: wrap;
+    min-width: 0;
+    gap: var(--s1) var(--s4);
+    color: var(--ink-3);
+    font-weight: 400;
+  }
+
+  .map__claim-tags span {
+    overflow-wrap: anywhere;
   }
 
   .map__claim-title {
@@ -1405,9 +1306,10 @@
       flex: none;
     }
 
-    /* Строка связи перестраивается в текучую: трёхколоночная сетка на ширине
-       шторки оставляла метке ~30 px, и слово разваливалось по буквам. */
-    .map__conn-list li {
+    /* Строка связи перестраивается в текучую: сетка на ширине шторки оставляла
+       метке ~30 px, и слово разваливалось по буквам. */
+    .map__conn-list li,
+    .map__edge-ends li {
       display: flex;
       flex-wrap: wrap;
       align-items: baseline;

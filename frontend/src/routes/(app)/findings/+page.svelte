@@ -45,13 +45,14 @@
     type NumericObservation,
   } from '$lib/types';
   import Button from '$lib/ui/Button.svelte';
+  import Disclosure from '$lib/ui/Disclosure.svelte';
   import Empty from '$lib/ui/Empty.svelte';
   import Field from '$lib/ui/Field.svelte';
   import Icon from '$lib/ui/Icon.svelte';
   import Notice from '$lib/ui/Notice.svelte';
   import SectionHead from '$lib/ui/SectionHead.svelte';
+  import Segmented from '$lib/ui/Segmented.svelte';
   import Sheet from '$lib/ui/Sheet.svelte';
-  import StatusPill from '$lib/ui/StatusPill.svelte';
   import { goto } from '$app/navigation';
   import InfoDot from '$lib/ui/InfoDot.svelte';
   import VerdictSheet from '$lib/ui/VerdictSheet.svelte';
@@ -339,12 +340,13 @@
   let uploads = $state<UploadItem[]>([]);
   let dragDepth = $state(0);
 
-  const facets = $derived(
-    STATUS_ORDER.map((key) => ({
-      key,
-      label: STATUS_SHORT[key],
-    })),
-  );
+  // Отбор по статусу — тот же жест, что и смена фасета: полоса с явно названным
+  // «любой статус». Прежние кнопки quiet↔ink требовали догадаться, что повторное
+  // нажатие снимает отбор.
+  const statusTabs = $derived<{ value: string; label: string }[]>([
+    { value: '', label: 'Любой статус' },
+    ...STATUS_ORDER.map((key) => ({ value: key as string, label: STATUS_SHORT[key] })),
+  ]);
   const sourceEvidence = $derived(
     sourceSignal && sourceEvidenceIndex !== null
       ? (sourceSignal.evidence[sourceEvidenceIndex] ?? null)
@@ -362,6 +364,12 @@
       .map(([kind, label]) => ({ kind, label }))
       .sort((left, right) => left.label.localeCompare(right.label, 'ru'));
   });
+  // Полоса типов гипотезы: «все» называется явно, а не остаётся отсутствием
+  // заливы на кнопке.
+  const kindTabs = $derived<{ value: string; label: string }[]>([
+    { value: '', label: 'Все типы' },
+    ...hypothesisKinds.map(({ kind, label }) => ({ value: kind, label })),
+  ]);
   const visibleHypotheses = $derived.by(() => {
     const query = hypothesesQuery.trim().toLocaleLowerCase('ru');
     return hypotheses.filter((signal) => {
@@ -961,10 +969,6 @@
     void runQuery('', appliedStatus);
   }
 
-  function pickFacet(value: FindingApiStatus): void {
-    void runQuery(appliedSubject, appliedStatus === value ? '' : value);
-  }
-
   // Выбор субъекта из списка берёт его служебный ключ для запроса, но не подставляет
   // ключ в поле: сырое имя онтологии на экран не выходит, условие видно чипом отбора.
   function pickSubject(name: string): void {
@@ -1126,6 +1130,24 @@
       lead: 'Проверьте, обозначают ли два названия одно и то же. Решение повлияет на будущие материалы.',
     },
   };
+
+  // Короткие имена фасетов для полосы: заголовок экрана называет раздел целиком,
+  // переключатель — одним словом, чтобы пять пилюль читались за беглый взгляд.
+  const PANE_TAB_LABELS: Record<Pane, string> = {
+    hypotheses: 'Гипотезы',
+    findings: 'Находки',
+    numbers: 'Числа',
+    gaps: 'Пробелы',
+    merges: 'Проверка названий',
+  };
+
+  // Подписи полосы фасетов живут в одном месте: раньше пять литералов стояли в
+  // разметке и расходились с PANE_META при первом же переименовании раздела.
+  const PANE_TABS: { value: Pane; label: string; hint: string }[] = PANES.map((key) => ({
+    value: key,
+    label: PANE_TAB_LABELS[key],
+    hint: PANE_META[key].lead,
+  }));
 
   // Пять фасетов одного экрана читаются из адреса: `?facet=findings`,
   // `?facet=numbers`, `?facet=gaps`, `?facet=merges`. Без параметра экран
@@ -1368,7 +1390,9 @@
                без права разбора «0 пар» выглядело бы как подтверждённая пустота. -->
           {#if canReview}{mergeCountText}{/if}
         {:else if pane === 'hypotheses'}
-          {hypothesesCountText}
+          <!-- «0 гипотез» в шапке повторял пустое состояние под списком: счётчик
+               называет только то, чего не видно, а ноль видно по самому экрану. -->
+          {#if hypotheses.length > 0}{hypothesesCountText}{/if}
         {:else}
           {listNote}
         {/if}
@@ -1379,48 +1403,13 @@
          того, как человек начал читать список. Методика экрана за «i», а не
          абзацем под заголовком. -->
     <section class="row reveal" aria-label="Фасет экрана">
-      <div class="seg findings__filters" role="group" aria-label="Раздел находок">
-        <button
-          class="seg__item"
-          type="button"
-          aria-pressed={pane === 'hypotheses'}
-          onclick={() => setPane('hypotheses')}
-        >
-          Гипотезы
-        </button>
-        <button
-          class="seg__item"
-          type="button"
-          aria-pressed={pane === 'findings'}
-          onclick={() => setPane('findings')}
-        >
-          Находки
-        </button>
-        <button
-          class="seg__item"
-          type="button"
-          aria-pressed={pane === 'numbers'}
-          onclick={() => setPane('numbers')}
-        >
-          Числа
-        </button>
-        <button
-          class="seg__item"
-          type="button"
-          aria-pressed={pane === 'gaps'}
-          onclick={() => setPane('gaps')}
-        >
-          Пробелы
-        </button>
-        <button
-          class="seg__item"
-          type="button"
-          aria-pressed={pane === 'merges'}
-          onclick={() => setPane('merges')}
-        >
-          Объединить названия
-        </button>
-      </div>
+      <Segmented
+        class="findings__filters"
+        items={PANE_TABS}
+        label="Раздел находок"
+        value={pane}
+        onchange={(next) => setPane(next as Pane)}
+      />
       <!-- Пояснения стоят у того, что объясняют: у статусов, у счёта покрытия и
            у очереди пар, а не рядом с переключателем фасетов. -->
     </section>
@@ -1483,9 +1472,13 @@
         <ul class="topics">
           {#each groups as group (group.id)}
             <li class="topic">
-              <details open={group.findings.length > 1}>
-                <summary class="topic__head">
-                  <span class="h4 topic__title">{group.topic.title}</span>
+              <Disclosure
+                id={`topic-${group.id}`}
+                size="h4"
+                title={group.topic.title}
+                open={group.findings.length > 1}
+              >
+                {#snippet aside()}
                   <span class="micro muted">
                     {countOf(group.findings.length, 'утверждение', 'утверждения', 'утверждений')}
                   </span>
@@ -1497,7 +1490,7 @@
                       {num(group.headline.lo)}–{num(group.headline.hi)} {group.headline.unit}
                     </span>
                   {/if}
-                </summary>
+                {/snippet}
                 <ul class="topic__points">
                   {#each group.headline?.points ?? [] as point (point.findingId)}
                     <li class="point">
@@ -1508,7 +1501,7 @@
                     </li>
                   {/each}
                 </ul>
-              </details>
+              </Disclosure>
             </li>
           {/each}
         </ul>
@@ -1627,10 +1620,9 @@
             <article class="card-note finding">
               <p class="micro finding__subject">
                 {RESOLUTION_WORDS.canonicalMark}
-                <StatusPill
-                  status={MERGE_STATUS_TONE[proposal.status]}
-                  label={MERGE_STATUS_LABELS[proposal.status]}
-                />
+                <span class="status-word" data-status={MERGE_STATUS_TONE[proposal.status]}>
+                  {MERGE_STATUS_LABELS[proposal.status]}
+                </span>
               </p>
               <h3 class="h4 finding__title">{nameOr(proposal.target)}</h3>
               <p class="small">
@@ -1789,24 +1781,19 @@
             </div>
           </form>
 
-          <div class="findings__statuses" role="group" aria-label="Статус находок">
+          <div class="findings__statuses">
             <p class="micro findings__status-label">Статус</p>
+            <Segmented
+              items={statusTabs}
+              label="Статус находок"
+              value={appliedStatus}
+              onchange={(next) => void runQuery(appliedSubject, next as '' | FindingApiStatus)}
+            />
             <InfoDot
               title="Что значат статусы"
               body="Согласуется: несколько источников называют одно число в сопоставимых условиях. Без проверки: утверждение опирается на один источник и с другими не сопоставлено. Оспаривается: по одному субъекту источники дают разные числа, и расхождение видно в доказательствах."
               align="start"
             />
-            {#each facets as facet (facet.key)}
-              <Button
-                size="sm"
-                variant={appliedStatus === facet.key ? 'ink' : 'quiet'}
-                current={appliedStatus === facet.key}
-                disabled={querying}
-                onclick={() => pickFacet(facet.key)}
-              >
-                {facet.label}
-              </Button>
-            {/each}
           </div>
 
           {#if appliedParts.length > 0}
@@ -1964,10 +1951,6 @@
                   {:else}
                     <span class="finding__noev">Доказательств нет</span>
                   {/if}
-                  <span class="finding__cta">
-                    {FINDINGS_ACTION.openSource}
-                    <Icon name="arrowRight" size={16} />
-                  </span>
                 </p>
               </article>
             {/each}
@@ -2138,35 +2121,21 @@
             {/snippet}
           </Empty>
         {:else}
-          <label class="findings__hypotheses-search">
-            <span class="micro">Поиск по гипотезам</span>
-            <input
-              type="search"
-              bind:value={hypothesesQuery}
-              placeholder="Тема, вывод или источник"
-              aria-label="Поиск по загруженным аналитическим гипотезам"
-            />
-          </label>
+          <Field
+            label="Поиск по гипотезам"
+            name="hypothesesQuery"
+            type="search"
+            placeholder="Тема, вывод или источник"
+            bind:value={hypothesesQuery}
+          />
           {#if hypothesisKinds.length > 1}
-            <div class="findings__hypotheses-kinds" role="group" aria-label="Тип гипотезы">
-              <Button
-                size="sm"
-                variant={hypothesesKind === '' ? 'ink' : 'quiet'}
-                current={hypothesesKind === ''}
-                onclick={() => (hypothesesKind = '')}
-              >
-                Все типы
-              </Button>
-              {#each hypothesisKinds as { kind, label } (kind)}
-                <Button
-                  size="sm"
-                  variant={hypothesesKind === kind ? 'ink' : 'quiet'}
-                  current={hypothesesKind === kind}
-                  onclick={() => (hypothesesKind = kind)}
-                >
-                  {label}
-                </Button>
-              {/each}
+            <div class="findings__hypotheses-kinds">
+              <Segmented
+                items={kindTabs}
+                label="Тип гипотезы"
+                value={hypothesesKind}
+                onchange={(next) => (hypothesesKind = next)}
+              />
             </div>
           {/if}
           {#if visibleHypotheses.length === 0}
@@ -2346,15 +2315,34 @@
     </Notice>
   {/if}
 
-  <p class="interval__meta">
-    <span>{subject.label}</span>
-    <!-- Объект называют одной связкой: когда он и есть субъект строки, второе
-         имя повторяет первое. -->
-    <span>{predicate.label}{#if objectLabel && objectLabel !== subject.label}: {objectLabel}{/if}</span>
-    {#if finding.context}<span class="muted">{finding.context}</span>{/if}
-    <StatusPill status={finding.status} label={STATUS_SHORT[finding.status]} />
-    <span class="micro muted">{DATA_CLASS_PHRASES[finding.data_class]}</span>
-  </p>
+  <!-- Четыре разных факта одной строкой читались как одно перечисление: у каждого
+       своя подпись, и состояние проверки — слово, а не плашка. -->
+  <dl class="facts">
+    <div class="fact">
+      <dt>О чём</dt>
+      <dd>{subject.label}</dd>
+    </div>
+    <div class="fact">
+      <dt>Показатель</dt>
+      <!-- Объект называют одной связкой: когда он и есть субъект строки, второе
+           имя повторяет первое. -->
+      <dd>{predicate.label}{#if objectLabel && objectLabel !== subject.label}: {objectLabel}{/if}</dd>
+    </div>
+    {#if finding.context}
+      <div class="fact">
+        <dt>Контекст</dt>
+        <dd>{finding.context}</dd>
+      </div>
+    {/if}
+    <div class="fact">
+      <dt>Проверка</dt>
+      <dd><span class="status-word" data-status={finding.status}>{STATUS_SHORT[finding.status]}</span></dd>
+    </div>
+    <div class="fact">
+      <dt>Доступ</dt>
+      <dd>{DATA_CLASS_PHRASES[finding.data_class]}</dd>
+    </div>
+  </dl>
 
   <!-- Версия извлечения и код утверждения нужны, когда сверяешь запись с
        сервером: они под раскрытием, человеческие имена на виду. Дробная
@@ -2363,7 +2351,7 @@
 
   {#if describeScope(finding.scope).length > 0}
     <section class="interval__block">
-      <p class="field__label">Условия применения</p>
+      <h4 class="interval__name">Условия применения</h4>
       <ul class="scope">
         {#each describeScope(finding.scope) as line (line)}
           <li>{line}</li>
@@ -2374,7 +2362,7 @@
 
   {#if finding.observations.length > 0}
     <section class="interval__block">
-      <p class="field__label">Числовые наблюдения</p>
+      <h4 class="interval__name">Числовые наблюдения</h4>
       <!-- Полоса-шкала здесь не рисуется: одно значение не с чем сравнивать, а
            разбой показывает фасет «Числа», где у показателя несколько
            источников. -->
@@ -2398,7 +2386,7 @@
 
   <section class="interval__block">
     <div class="history__head">
-      <p class="field__label">История версий утверждения</p>
+      <h4 class="interval__name">История версий утверждения</h4>
       <Button
         size="sm"
         variant="quiet"
@@ -2449,9 +2437,9 @@
                   {/if}
                 </td>
                 <td>
-                  <StatusPill status={version.status} label={statusLabel(version.status)} />
+                  <span class="status-word" data-status={version.status}>{statusLabel(version.status)}</span>
                   {#if version.superseded_by}
-                    <StatusPill status="superseded" label={STATUS_SUPERSEDED} />
+                    <span class="status-word" data-status="superseded">{STATUS_SUPERSEDED}</span>
                   {/if}
                 </td>
                 <td>
@@ -2496,16 +2484,6 @@
     gap: var(--s4);
   }
 
-  .interval__meta {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--s3);
-    margin: 0;
-    font-size: var(--t-small);
-    color: var(--ink-2);
-  }
-
   /* ── Фасеты «Числа» и «Пробелы»: плоские строки, ряды разделены одной
      линией, карточек нет: тема и её точки это один объект, а не вложенные. ── */
   .topics,
@@ -2517,53 +2495,11 @@
     list-style: none;
   }
 
+  /* Темы разделены расстоянием, а не линией: отделитель здесь только поднимал
+     вторую рамку там, где ряд и так назван заголовком. */
   .topic,
   .gap {
-    border-top: 1px solid var(--line-soft);
-  }
-
-  .topic__head {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: var(--s3);
-    min-width: 0;
-    padding: var(--s4) 0;
-    cursor: pointer;
-    list-style: none;
-  }
-
-  .topic__head::-webkit-details-marker {
-    display: none;
-  }
-
-  .topic__head:focus-visible {
-    outline: 2px solid var(--action-ink);
-    outline-offset: 3px;
-    border-radius: var(--r-xs);
-  }
-
-  /* Раскрытие обозначено остриём: без него список тем выглядит законченным. */
-  .topic__head::after {
-    content: '';
-    flex: none;
-    width: 8px;
-    height: 8px;
-    margin-inline-start: auto;
-    border-right: 1.6px solid var(--ink-3);
-    border-bottom: 1.6px solid var(--ink-3);
-    transform: rotate(45deg);
-    transition: transform var(--dur-fast) var(--ease-soft);
-  }
-
-  details[open] > .topic__head::after {
-    transform: rotate(-135deg);
-  }
-
-  .topic__title {
-    margin: 0;
-    min-width: 0;
-    color: var(--ink);
+    padding-block: var(--s2);
   }
 
   .topic__spread {
@@ -2642,10 +2578,6 @@
     color: var(--ink-2);
   }
 
-  .findings__filters :global(.seg__item:active) {
-    transform: none;
-  }
-
   /* (app)-layout уже отступил на высоту pill-навигации: верх не удваиваем. */
   .page.findings {
     padding-top: var(--s5);
@@ -2664,31 +2596,8 @@
     gap: var(--s4);
   }
 
-  .findings__hypotheses-search {
-    display: grid;
-    gap: var(--s1);
-    max-width: min(100%, 26rem);
-  }
-
-  .findings__hypotheses-search input {
-    width: 100%;
-    min-height: 2.75rem;
-    padding: var(--s2) var(--s3);
-    border: 1px solid var(--line-strong);
-    border-radius: var(--r-sm);
-    background: var(--surface);
-    color: var(--ink);
-  }
-
-  .findings__hypotheses-search input:focus-visible {
-    outline: 2px solid var(--action-ink);
-    outline-offset: 2px;
-  }
-
   .findings__hypotheses-kinds {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--s3) var(--s2);
+    min-width: 0;
   }
 
   .findings__hypotheses-empty {
@@ -2813,12 +2722,14 @@
     padding: 0;
   }
 
+  /* Строка загруженного файла стоит на утопленной панели приёма, поэтому её
+     собственный тон — светлее, а не обведена: рамка добавляла второй край там,
+     где достаточно ступени поверхности. */
   .upload {
     display: flex;
     align-items: flex-start;
     gap: var(--s4);
     padding: var(--s4);
-    border: 1px solid var(--line);
     border-radius: var(--r-md);
     background: var(--surface);
   }
@@ -2864,12 +2775,13 @@
     margin-bottom: var(--s4);
   }
 
+  /* Панель отбора уже названа утопленным тоном: обводка вокруг неё рисовала
+     рамку ради рамки и спорила с панелью, внутри которой она стоит. */
   .findings__bar {
     display: flex;
     flex-direction: column;
     gap: var(--s4);
     padding: var(--s4) var(--s5);
-    border: 1px solid var(--line-soft);
     border-radius: var(--r-lg);
     background: var(--surface-sunk);
   }
@@ -2889,13 +2801,14 @@
     max-width: 46ch;
   }
 
+  /* Строка отбора статуса отделена расстоянием: линия над ней рисовала границу
+     там, где группа и так названа подписью «Статус». */
   .findings__statuses {
     display: flex;
     align-items: center;
     gap: var(--s3);
     flex-wrap: wrap;
-    padding-top: var(--s4);
-    border-top: 1px solid var(--line-soft);
+    margin-top: var(--s2);
   }
 
   .findings__status-label {
@@ -2914,8 +2827,6 @@
 
   .findings__applied--below {
     margin-top: var(--s5);
-    padding-top: var(--s4);
-    border-top: 1px solid var(--line);
   }
 
   .findings__applied-item {
@@ -2983,6 +2894,9 @@
     gap: var(--s2);
   }
 
+  /* Строка субъекта — строка списка: отклик и выбор держатся тоном поля. Рамка
+     вокруг каждой строки превращала перечень в стопку карточек, а усиление рамки
+     на наведении было бы второй декорацией поверх первой. */
   .subject {
     display: flex;
     align-items: flex-start;
@@ -2990,24 +2904,20 @@
     width: 100%;
     min-height: 44px;
     padding: var(--s3) var(--s4);
-    border: 1px solid var(--line-soft);
     border-radius: var(--r-md);
-    background: var(--surface-raised);
+    background: none;
     color: var(--ink-2);
     text-align: left;
     cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-soft),
-      border-color var(--dur-fast) var(--ease-soft);
+    transition: background var(--dur-fast) var(--ease-soft);
   }
 
   .subject:hover:not(:disabled) {
-    border-color: var(--line-strong);
     background: var(--surface-sunk);
     color: var(--ink);
   }
 
   .subject[aria-current='true'] {
-    border-color: var(--sage-deep);
     background: var(--sage);
     color: var(--ink);
   }
@@ -3075,21 +2985,28 @@
     cursor: pointer;
   }
 
+  /* Заголовок находки — единственный вход в её разбор, и читаться он должен
+     как вход, а не как статичный текст строки: тот же приём, что на карте. */
+  .finding__open:hover {
+    color: var(--action-ink);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
   .finding__open::after {
     content: '';
     position: absolute;
     inset: 0;
   }
 
-  /* След находки в источнике: документ, место и подсказка действия. */
+  /* След находки в источнике: документ и место. От отделительной линии ряд
+     выиграл бы меньше, чем потерял: строка и так стоит последней в карточке. */
   .finding__trail {
     display: flex;
     align-items: baseline;
     gap: var(--s3);
     flex-wrap: wrap;
     margin: 0;
-    padding-top: var(--s3);
-    border-top: 1px solid var(--line-soft);
   }
 
   .finding__source {
@@ -3097,22 +3014,6 @@
     font-weight: 600;
     color: var(--ink-2);
     overflow-wrap: anywhere;
-  }
-
-  .finding__cta {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--s2);
-    margin-inline-start: auto;
-    color: var(--action-ink);
-    font-size: var(--t-micro);
-    font-weight: 600;
-  }
-
-  @media (hover: hover) {
-    .finding:hover .finding__cta {
-      text-decoration: underline;
-    }
   }
 
   /* Находка без доказательства не считается подтверждённым числом: карточка
@@ -3136,8 +3037,7 @@
     justify-content: space-between;
     gap: var(--s3);
     flex-wrap: wrap;
-    padding-top: var(--s4);
-    border-top: 1px solid var(--line);
+    margin-top: var(--s4);
   }
 
   /* Счётчик и подпись неполноты это отдельные строки, а не склейка в одну. */
@@ -3158,12 +3058,23 @@
 
   /* ── Шторка источника утверждения ───────────────────────────────────────── */
 
+  /* Блоки шторки разведены расстоянием и подписаны своими заголовками: линия над
+     каждым блоком была бы второй структурой поверх типографской. */
   .interval__block {
     display: flex;
     flex-direction: column;
     gap: var(--s3);
-    padding-top: var(--s4);
-    border-top: 1px solid var(--line-soft);
+    margin-top: var(--s5);
+  }
+
+  /* Заголовок блока шторки — настоящий h4, а не подпись поля: он делит содержимое
+     слоя, и экрану чтения нужно опираться на порядок заголовков. */
+  .interval__name {
+    margin: 0;
+    color: var(--ink);
+    font-size: var(--t-small);
+    font-weight: 600;
+    line-height: var(--lh-dense);
   }
 
   .scope {
@@ -3225,10 +3136,12 @@
 
   @media (max-width: 640px) {
     /* На мобильном строка отбора и применённые условия встают в столбик: поле
-       поиска, фильтры и действия не толкаются друг с другом. */
+       поиска, фильтры и действия не толкаются друг с другом. Выравнивание —
+       stretch, а не flex-start: при flex-start дочерний ряд берёт ширину своего
+       max-content, и полоса переключателя растягивала документ за вьюпорт. */
     .findings__bar,
     .findings__applied {
-      align-items: flex-start;
+      align-items: stretch;
       flex-direction: column;
       gap: var(--s3);
     }

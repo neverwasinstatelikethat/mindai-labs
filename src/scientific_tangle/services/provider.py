@@ -618,12 +618,14 @@ class GigaChatProvider:
         try:
             for attempt in range(_SCHEMA_REPAIR_ATTEMPTS):
                 try:
-                    # Лимит передаём только когда он поднят: базовый вызов
-                    # `_request` остаётся одноаргументным.
+                    # Базовый лимит берётся из настроек; явный max_tokens нужен
+                    # при повторной генерации с увеличенным потолком.
                     response = (
-                        await self._request(messages, model=model)
+                        await self._request(messages, model=model, response_schema=schema)
                         if output_limit == base_limit
-                        else await self._request(messages, max_tokens=output_limit, model=model)
+                        else await self._request(
+                            messages, max_tokens=output_limit, model=model, response_schema=schema,
+                        )
                     )
                 except (GigaChatException, httpx.TransportError) as exc:
                     # Транспортная ошибка и таймаут обязаны попасть в отдельный
@@ -786,12 +788,19 @@ class GigaChatProvider:
         *,
         max_tokens: int | None = None,
         model: str | None = None,
+        response_schema: type[BaseModel] | None = None,
     ) -> ChatCompletion:
         request = Chat(
             model=model or self._settings.gigachat_agent_model,
             messages=list(messages),
             temperature=0.1,
             max_tokens=max_tokens or self._settings.gigachat_max_output_tokens,
+            # SDK передаёт additional_fields в корень HTTP-запроса. Схему проверяет
+            # API GigaChat, затем результат всё равно проходит нашу Pydantic-валидацию.
+            additional_fields={"response_format": {
+                "type": "json_schema", "schema": response_schema.model_json_schema(),
+                "strict": True,
+            }} if response_schema is not None else None,
         )
         logger.debug("GigaChat: запрос к модели %s", model or self._settings.gigachat_agent_model)
         # Ожидание слота считается один раз на обращение: инкремент на каждое

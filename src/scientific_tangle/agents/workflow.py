@@ -81,8 +81,9 @@ ACTION_SYSTEM = """Ты Autonomous Action Planner платформы StormIdea.
 graph_traverse, community_search, numeric_filter, conflict_scan, gap_scan, expert_lookup,
 finding_lookup, public_search.
 public_search читает открытые источники вне корпуса. Доступный провайдер указан
-в системном дополнении. Используй его для внешних фактов и исследований;
-для проверки материалов пространства сочетай с внутренними инструментами.
+в системном дополнении. Веб-поиск дополняет внутренний поиск, а не заменяет его:
+при поиске открытых источников запланируй параллельное чтение материалов пространства
+через hybrid_search или другой внутренний инструмент чтения. Затем сопоставь основания.
 Не отправляй внешнему сервису цитаты, названия закрытых документов и персональные
 данные из корпуса: внешний запрос содержит только общую научную тему пользователя.
 relation_types только из allowlist: CONTAINS, TREATED_BY, PRODUCES, REQUIRES,
@@ -91,6 +92,9 @@ OPERATES_AT, SUPPORTED_BY, CONTRADICTS, EXPERT_IN, ASSERTS, USES, PRECEDES.
 Выбирай только нужные инструменты. finding_lookup читает текущие версии находок
 по finding_ids (до 10), включая цитаты: используй его для продолжения разговора
 о ранее процитированном тезисе. query/purpose описывают задачу чтения.
+Внутренние gap_scan, conflict_scan и expert_lookup не проверяют литературу вне
+корпуса. Не запускай их для заполнения формы плана.
+Если вопрос ограничен конкретной находкой, используй finding_lookup для её чтения.
 Не вызывай finding_lookup без известных ID. Для продолжения используй доступные
 цитаты; новые внешние факты проверяй через public_search.
 Для обсуждения метода, редактирования текста или
@@ -136,12 +140,21 @@ REASONER_SYSTEM = """Ты StormIdea — научный ассистент, со�
 уточнять и расширять гипотезы, сравнивать объяснения, предлагать способы проверки,
 писать обзор, аргумент или черновик статьи. Выбирай глубину и композицию под запрос.
 summary — полноценный связный ответ в Markdown, а не краткая подпись к списку находок.
+Для обычного вопроса достаточно нескольких содержательных абзацев. Длинную статью
+пиши по просьбе пользователя. Если прочитан только один источник, объясни это
+ограничение; не достраивай за него отсутствующую литературу и детали методов.
 Используй абзацы, заголовки, списки, таблицы и цитаты там, где они помогают чтению.
 Ссылайся прямо в тексте: [название источника или находки](finding:ID), где ID взят
 из FINDINGS. Укажи эти же IDs в finding_ids. Не придумывай ссылки и источники.
 Фактические утверждения о материалах обосновывай FINDINGS и их evidence.quote.
 Проверяй предмет и условия цитаты: нельзя переносить число или вывод из материала
 о другом объекте на обсуждаемую систему. Нерелевантные находки игнорируй.
+Сохраняй состав экспериментальной и контрольной групп, тип сравнения и дизайн.
+Сопоставляй внутренние материалы и открытые публикации, сохраняя происхождение
+каждого вывода. Пустой внутренний поиск не обесценивает найденную внешнюю цитату.
+Две отдельные дозы в двух работах не являются установленным «обычным диапазоном».
+Отсутствие различий между группами не равно отсутствию изменений внутри группы.
+Авторское «вероятно»/may/likely не превращай в установленную причинность.
 scope.origin=demo означает синтетический пример, а не данные пользователя:
 не используй такие числа как факты исследуемой системы.
 Цитата достаточна для качественных и исторических фактов: числовые наблюдения
@@ -155,18 +168,22 @@ scope.origin=demo означает синтетический пример, а �
 scope.origin=public_source — фрагменты открытых источников; не называй аннотацию
 прочитанной полной статьёй. Сам факт нахождения публикации не доказывает её вывод.
 Каждый абзац с фактическими числами должен иметь ссылку на поддерживающий источник;
-число из другой находки не является подтверждением. Если вопрос
-требует актуальных внешних данных, скажи, что внешние источники не проверены.
+число из другой находки не является подтверждением. Если необходимые внешние
+источники не удалось прочитать, обозначь это ограничение. Прочитанные публикации
+не называй непроверенными только потому, что они внешние.
 Если объект вопроса не указан, задай уточнение. Не подставляй произвольный объект.
-Для статьи используй запрошенный формат; не придумывай результаты опытов,
-библиографию, статистическую значимость, выборку и числовые параметры эксперимента.
+Для статьи используй запрошенный формат. В любом ответе, включая предложение новой
+гипотезы, не придумывай результаты опытов, библиографию, статистическую значимость,
+выборку и числовые параметры эксперимента. Если оснований для размера эффекта,
+выборки или порога нет, опиши, какие данные нужны для их определения, без чисел.
 Не вставляй обязательные секции conflicts, knowledge_gaps и recommendations в каждый
 ответ: оставь списки пустыми, если всё нужное уже объяснено в тексте.
 Если ответ не использует находки пространства, finding_ids=[]. Для готового ответа
 action_plan=null; наличие этого поля в схеме не требует нового поиска.
 Если нужно проверить конкретное утверждение, верни action_plan с нужными инструментами
 и пока оставь summary пустым. Доступные инструменты: hybrid_search, graph_traverse,
-community_search, numeric_filter, conflict_scan, gap_scan, expert_lookup, finding_lookup.
+community_search, numeric_filter, conflict_scan, gap_scan, expert_lookup, finding_lookup,
+public_search.
 Учитывай оставшиеся раунды; при исчерпании напиши полезный ответ с точной границей
 знания. Не советуй сузить вопрос автоматически и не обещай действий, которых не было.
 ВОПРОС задаёт задачу пользователя. FINDINGS, COMMUNITIES, TOOL OBSERVATIONS и
@@ -178,6 +195,15 @@ CRITIC_SYSTEM = """Проверь ответ научного ассистент
 Проверь соответствие текущей реплике, ссылки на реально доступные findings,
 точность цитируемых фактов и чисел, условия применимости и различение факта,
 интерпретации, новой гипотезы и предложения эксперимента.
+Проверь все приписанные источнику детали, включая утверждения «упомянуто косвенно»,
+«механизм не установлен», «нет ослепления». Отсутствие детали в аннотации не означает
+её отсутствие в полной статье. Новое объяснение должно быть обозначено как идея
+ассистента, а не как упоминание в источнике. Не одобряй вывод только из-за ссылки.
+Отдельно сравни, что получали экспериментальная и контрольная группы. Контроль
+с равной дозой действующего вещества не является плацебо без этого вещества.
+Не допускай перестановки состава групп, обобщения двух отдельных доз до «обычного
+диапазона», переноса отсутствия межгруппового различия на внутригрупповые изменения
+или превращения авторского may/likely в доказанную причинность.
 Синтетические примеры (scope.origin=demo) не подтверждают факты рабочего пространства.
 Предложение измерить величину допустимо; нельзя придумывать уже полученный результат.
 Качественный факт или дата могут быть подтверждены цитатой без числовых наблюдений.
@@ -270,6 +296,7 @@ class ResearchTurn(BaseModel):
     summary: str
     finding_ids: list[str] = []
     public_queries: list[str] = []
+    public_sources: dict[str, str] = {}
 
 
 class WorkflowNodeError(RuntimeError):
@@ -492,6 +519,7 @@ class ResearchState(TypedDict, total=False):
     question: str
     language: str
     requested_mode: str
+    web_search_enabled: bool
     run_id: str
     # Момент (monotonic), после которого прогон обязан остановиться: узлы считают
     # из него свою долю остатка, а не полагаются на таймаут провайдера.
@@ -549,8 +577,15 @@ class ResearchWorkflow:
     def _event(self, agent: str, message: str, status: str = "completed") -> AgentEvent:
         return AgentEvent(agent=agent, status=cast(Any, status), message=message, duration_ms=0)
 
-    def _system(self, base: str) -> str:
-        base = f"{base}\n\nPUBLIC SEARCH: {self.public_search.description}"
+    def _system(self, base: str, state: ResearchState | None = None) -> str:
+        search = self.public_search.description
+        if state is not None and not state.get("web_search_enabled", True):
+            search = (
+                "Пользователь отключил веб-поиск для этого запроса. public_search запрещён, "
+                "включая перечитывание прежних веб-источников. Используй внутренние материалы "
+                "или объясни границы ответа. Прошлый ответ не заменяет прочитанный источник."
+            )
+        base = f"{base}\n\nPUBLIC SEARCH: {search}"
         if not self.extra_policy:
             return base
         return f"{base}\n\nCANDIDATE POLICY:\n{self.extra_policy}"
@@ -562,9 +597,10 @@ class ResearchWorkflow:
         return [self._policy_note] if self._policy_note else []
 
     @staticmethod
-    def _sanitize_action_plan(plan: AgentActionPlan, fallback_query: str) -> AgentActionPlan:
-        """Заполняет пустые query/purpose: GigaChat в fallback-ответе возвращает
-        пустые строки в structured output, и tools падают на валидации схемы."""
+    def _sanitize_action_plan(
+        plan: AgentActionPlan, fallback_query: str, *, web_search_enabled: bool = True,
+    ) -> AgentActionPlan:
+        """Применяет режим поиска и дополняет веб-поиск внутренним чтением."""
         actions = [
             action.model_copy(
                 update={
@@ -574,7 +610,20 @@ class ResearchWorkflow:
             )
             for action in plan.actions
             if action.tool != "finding_lookup" or action.finding_ids
+            if web_search_enabled or action.tool != "public_search"
         ]
+        internal_readers = {
+            "hybrid_search", "finding_lookup", "graph_traverse", "community_search", "numeric_filter",
+        }
+        if any(action.tool == "public_search" for action in actions) and not any(
+            action.tool in internal_readers for action in actions
+        ):
+            # Это локальный запрос: исходный вопрос и закрытые материалы не
+            # передаются веб-провайдеру. execute запускает оба канала через gather.
+            actions.append(ToolAction(
+                id=f"internal-parallel-{uuid4()}", tool="hybrid_search", query=fallback_query,
+                purpose="Проверить материалы пространства параллельно открытым источникам",
+            ))
         return plan.model_copy(update={"actions": actions})
 
     def _budget(
@@ -784,7 +833,7 @@ class ResearchWorkflow:
     async def planning_agent(self, state: ResearchState) -> dict[str, object]:
         history = self._history_lines(state)
         bundle = await self.provider.complete_model(
-            self._system(PLANNING_SYSTEM),
+            self._system(PLANNING_SYSTEM, state),
             f"Язык: {state.get('language', 'ru')}\n"
             f"Режим: {state.get('requested_mode', 'hybrid')}\n"
             f"Вопрос: {state['question']}"
@@ -797,7 +846,10 @@ class ResearchWorkflow:
         query_plan = bundle.query_plan.model_copy(
             update={"question": state["question"], "language": state.get("language", "ru")}
         )
-        action_plan = self._sanitize_action_plan(bundle.action_plan, state["question"])
+        action_plan = self._sanitize_action_plan(
+            bundle.action_plan, state["question"],
+            web_search_enabled=state.get("web_search_enabled", True),
+        )
         explicit_ids = _inline_finding_ids(state["question"])
         for match in re.finditer(
             r"(?:находк[а-я]*|finding)\s+([A-Za-z0-9][\w-]*(?:\s*,\s*[A-Za-z0-9][\w-]*)*)",
@@ -817,14 +869,16 @@ class ResearchWorkflow:
                 finding_ids=missing_ids, purpose="Прочитать явно указанные пользователем находки",
             ), *action_plan.actions[:5]]})
         previous_turns = state.get("research_history", [])
-        if previous_turns and previous_turns[-1].public_queries and any(
+        if previous_turns and (
+            previous_turns[-1].public_queries or previous_turns[-1].public_sources
+        ) and any(
             action.tool == "finding_lookup" and any(
                 identifier.startswith("public-") for identifier in action.finding_ids
             ) for action in action_plan.actions
         ):
             # Внешняя цитата не находится в общем корпусе. Её стабильный ID из
             # диалога восстанавливается повторением фактического поискового запроса.
-            queries = previous_turns[-1].public_queries[:2]
+            queries = _public_reread_queries(previous_turns[-1])
             internal = []
             for action in action_plan.actions:
                 if action.tool == "finding_lookup":
@@ -850,8 +904,12 @@ class ResearchWorkflow:
             actions.extend(ToolAction(
                 id=f"resume-public-{index}", tool="public_search", query=query,
                 purpose="Заново прочитать открытые источники предыдущего ответа",
-            ) for index, query in enumerate(last.public_queries[:2]))
+            ) for index, query in enumerate(_public_reread_queries(last)))
             action_plan = AgentActionPlan(actions=actions)
+        action_plan = self._sanitize_action_plan(
+            action_plan, state["question"],
+            web_search_enabled=state.get("web_search_enabled", True),
+        )
         # Модель вправе не классифицировать назначение запроса — тогда в след уходит
         # честная строка, а не выдуманный intent: ответ от этого не меняется,
         # и интерфейс просто не показывает чип назначения.
@@ -885,7 +943,10 @@ class ResearchWorkflow:
             else node_deadline
         )
         result = await self.tool_executor.execute(
-            state["action_plan"],
+            self._sanitize_action_plan(
+                state["action_plan"], state["question"],
+                web_search_enabled=state.get("web_search_enabled", True),
+            ),
             state["query_plan"],
             state.get("allowed_data_classes"),
             # Пул доказательств всех предыдущих раундов: конфликт — это пара, и
@@ -945,9 +1006,10 @@ class ResearchWorkflow:
         )
         action_plan = self._sanitize_action_plan(
             await self.provider.complete_model(
-                self._system(ACTION_SYSTEM), context.text, AgentActionPlan
+                self._system(ACTION_SYSTEM, state), context.text, AgentActionPlan
             ),
             state["question"],
+            web_search_enabled=state.get("web_search_enabled", True),
         )
         return {
             "action_plan": action_plan,
@@ -999,7 +1061,7 @@ class ResearchWorkflow:
             ],
         )
         control = await self.provider.complete_model(
-            self._system(CONTROL_SYSTEM), context.text, AgentControlDecision
+            self._system(CONTROL_SYSTEM, state), context.text, AgentControlDecision
         )
         update: dict[str, object] = {
             "control": control,
@@ -1017,7 +1079,8 @@ class ResearchWorkflow:
         }
         if control.action_plan is not None:
             update["action_plan"] = self._sanitize_action_plan(
-                control.action_plan, state["question"]
+                control.action_plan, state["question"],
+                web_search_enabled=state.get("web_search_enabled", True),
             )
         return update
 
@@ -1039,7 +1102,7 @@ class ResearchWorkflow:
                 f"({budget} токенов с учётом служебной части промпта)."
             )
         reasoning = await self.provider.complete_model(
-            self._system(REASONER_SYSTEM), context.text, ReasoningResult
+            self._system(REASONER_SYSTEM, state), context.text, ReasoningResult
         )
         update: dict[str, object] = {
             "reasoning": reasoning,
@@ -1049,13 +1112,14 @@ class ResearchWorkflow:
         if reasoning.action_plan is not None and reasoning.action_plan.actions:
             if state.get("action_round", 0) < self.settings.agent_max_tool_rounds:
                 update["action_plan"] = self._sanitize_action_plan(
-                    reasoning.action_plan, state["question"]
+                    reasoning.action_plan, state["question"],
+                    web_search_enabled=state.get("web_search_enabled", True),
                 )
                 update["trace"] = [self._event("reasoner", "Запрошена проверка основания ответа")]
             elif not reasoning.summary.strip():
                 # Последний вызов уже не может продолжить поиск: просим завершить текст.
                 reasoning = await self.provider.complete_model(
-                    self._system(REASONER_SYSTEM),
+                    self._system(REASONER_SYSTEM, state),
                     context.text + "\nПоиск завершён. Напиши ответ, action_plan=null.",
                     ReasoningResult,
                 )
@@ -1063,26 +1127,36 @@ class ResearchWorkflow:
         return update
 
     async def critic(self, state: ResearchState) -> dict[str, object]:
-        draft = state["reasoning"]
+        draft = state["reasoning"].model_copy(update={"summary": _link_finding_mentions(
+            state["reasoning"].summary, state.get("findings", []),
+        )})
+        state = cast(ResearchState, {**state, "reasoning": draft})
         prompt, budget = self._revision_context(state, system=CRITIC_SYSTEM)
         critique = await self.provider.complete_model(
-            self._system(CRITIC_SYSTEM), prompt, CritiqueResult
+            self._system(CRITIC_SYSTEM, state), prompt, CritiqueResult
         )
         valid_ids = {finding.id for finding in state.get("findings", [])}
         # Guardrail проверяет только процитированные тезисы: требование «починить
         # evidence» ко всему пулу findings неисполнимо для Improver, которому
         # запрещено добавлять источники, и это гарантированно стоило бы лишний раунд.
-        cited_ids = set(draft.finding_ids) | _inline_finding_ids(draft.summary)
+        cited_ids = set(draft.finding_ids) | _inline_finding_ids(_reasoning_text(draft))
         invalid_ids = cited_ids - valid_ids
         cited = [finding for finding in state.get("findings", []) if finding.id in cited_ids]
-        invalid_links = _unverified_source_links(draft.summary, cited)
+        invalid_links = _unverified_source_links(_reasoning_text(draft), cited)
         ungrounded = _ungrounded_numbers(cited)
         unsupported = _ungrounded_answer_numbers(draft, cited)
+        unit_conflicts = _unit_conflicts(draft, cited)
         issues = list(critique.issues)
         instructions = list(critique.revision_instructions)
+        if budget.truncated:
+            issues.append("Материалы проверки обрезаны: полный черновик и цитаты не проверены.")
+            instructions.append("Сократить ответ до утверждений, которые можно проверить целиком.")
         if invalid_ids:
             issues.append(f"Черновик ссылается на неизвестные finding IDs: {sorted(invalid_ids)}")
             instructions.append("Использовать только finding IDs из раздела FINDINGS.")
+        if cited_ids and not _inline_finding_ids(draft.summary):
+            issues.append("В тексте нет ссылок на использованные источники.")
+            instructions.append("Добавить Markdown-ссылки finding:ID возле утверждений источника.")
         if invalid_links:
             issues.append("Внешние ссылки ответа не прочитаны инструментом источников.")
             instructions.append("Использовать ссылки finding:ID или точные source_url из evidence.")
@@ -1104,11 +1178,17 @@ class ResearchWorkflow:
                 "Убрать фактические числа, которых нет в цитатах или числовых "
                 "наблюдениях процитированных findings."
             )
+        if unit_conflicts:
+            issues.append("Единицы значений не соответствуют цитатам: " + "; ".join(unit_conflicts))
+            instructions.append(
+                "Сохранить единицы и период дозы из цитаты: мг и мг/сут — разные величины."
+            )
         if issues:
             critique = critique.model_copy(
                 update={"approved": False, "issues": issues, "revision_instructions": instructions}
             )
         return {
+            "reasoning": draft,
             "critique": critique,
             "degradation_reasons": _context_degradation("Critic", budget),
             "trace": [
@@ -1125,7 +1205,7 @@ class ResearchWorkflow:
             state, system=IMPROVER_SYSTEM, critique=state["critique"]
         )
         reasoning = await self.provider.complete_model(
-            self._system(IMPROVER_SYSTEM), prompt, ReasoningResult
+            self._system(IMPROVER_SYSTEM, state), prompt, ReasoningResult
         )
         return {
             "reasoning": reasoning,
@@ -1164,9 +1244,9 @@ class ResearchWorkflow:
             selected: list[Finding] = []
         else:
             reasoning = reasoned
-            cited = set(reasoning.finding_ids) | _inline_finding_ids(reasoning.summary)
+            cited = set(reasoning.finding_ids) | _inline_finding_ids(_reasoning_text(reasoning))
             unknown_cited = sorted(cited - {finding.id for finding in findings})
-            invalid_links = _unverified_source_links(reasoning.summary, findings)
+            invalid_links = _unverified_source_links(_reasoning_text(reasoning), findings)
             selected = [finding for finding in findings if finding.id in cited]
             # «Пусто» и «модель не вернула секцию» — разные случаи: во втором нельзя
             # обвинять модель в отсутствии ссылок. Метод добавляет другой контур
@@ -1231,7 +1311,14 @@ class ResearchWorkflow:
                     f"Язык ответа не совпадает с языком запроса ({language}): в summary "
                     "большинство букв не алфавита запроса."
                 )
-            citation_problem = untraced or bool(unknown_cited) or bool(invalid_links)
+            missing_inline = bool(cited) and not _inline_finding_ids(
+                _link_finding_mentions(reasoning.summary, selected)
+            )
+            if missing_inline:
+                limitations.append("Черновик не связывает утверждения со ссылками в тексте.")
+            citation_problem = (
+                untraced or bool(unknown_cited) or bool(invalid_links) or missing_inline
+            )
             numbers_problem = bool(unsupported)
             units_problem = bool(unit_conflicts)
         critique = state.get("critique")
@@ -1468,6 +1555,7 @@ class ResearchWorkflow:
                 "question": request.question,
                 "language": request.language,
                 "requested_mode": request.mode,
+                "web_search_enabled": request.web_search_enabled,
                 "run_id": str(run_id),
                 # Точка отсчёта для долей узла: состояние приходит в каждый узел,
                 # поэтому часам процесса больше не нужно общее изменяемое состояние.
@@ -1669,13 +1757,13 @@ class ResearchWorkflow:
         state: ResearchState,
         error: BaseException,
     ) -> AnswerPayload:
-        reason = _describe_failure(error)
+        reason, technical = _describe_failure(error)
         # Причина деградации уходит в метрики коротким кодом (TimeoutError,
         # GraphRecursionError, WorkflowNodeError), а не человекочитаемой строкой:
         # иначе свободный текст стал бы меткой Prometheus и расложил бы Cardinality
         # по каждому формулировочному варианту.
         self.metrics.observe_degradation(_degradation_code(error))
-        logger.error("Исследование деградировало (%s): %s", run_id, reason)
+        logger.error("Исследование деградировало (%s): %s", run_id, technical)
         findings = state.get("findings", [])
         reasoning = state.get("reasoning")
         critique = state.get("critique")
@@ -1715,12 +1803,12 @@ class ResearchWorkflow:
             graph=state.get("graph", EMPTY_GRAPH),
             trace=[
                 *state.get("trace", []),
-                self._event("synthesizer", f"Деградированный ответ: {reason}", "failed"),
+                self._event("synthesizer", f"Деградированный ответ: {technical}", "failed"),
             ],
             confidence=round(confidence / 2, 3),
             model_mode=self.provider.mode,
             degradation_reasons=_unique(
-                extend_unique(state.get("degradation_reasons", []), [reason])
+                extend_unique(state.get("degradation_reasons", []), [technical])
             ),
             limitations=["Подготовка ответа прервалась; часть исследования не завершена."],
         )
@@ -1751,33 +1839,55 @@ def _degradation_code(error: BaseException) -> str:
     return "no_answer"
 
 
-def _describe_failure(error: BaseException) -> str:
+def _describe_failure(error: BaseException) -> tuple[str, str]:
+    """Две формулировки одного отказа: человек читает, что не получилось и что за
+    этим стоит; техническая строка с именем узла, схемой и текстом парсера уходит
+    в trace и в ``degradation_reasons``.
+
+    Разделение обязательно: ``knowledge_gaps`` печатается в интерфейсе, а
+    «модель недоступна на узле controller (GigaChat: structured output retry
+    исчерпан (AgentControlDecision)…)» — это журнал прогона, а не ответ аналитика.
+    """
     if isinstance(error, TimeoutError):
-        return "превышен бюджет времени исследования"
+        return "превышен бюджет времени исследования", "превышен бюджет времени исследования"
     if isinstance(error, GraphRecursionError):
-        return "достигнут предел шагов рабочего процесса"
+        return (
+            "достигнут предел шагов рабочего процесса", "достигнут предел шагов рабочего процесса",
+        )
     if isinstance(error, ModelFailureError):
         return (
+            "модель не ответила: часть проверки не выполнена, ответ собран по уже "
+            "найденным доказательствам",
             f"модель недоступна на узле {error.node} ({error.detail}); ответ собран по "
-            "уже найденным доказательствам"
+            "уже найденным доказательствам",
         )
     if isinstance(error, NodeBudgetExceededError):
         return (
+            "один шаг проверки превысил отведённое ему время: прогон остановлен, чтобы "
+            "остальные шаги не остались без времени",
             f"узел {error.node} превысил свою долю бюджета времени "
             f"({error.budget_seconds:.1f} с из {error.remaining_seconds:.1f} с остатка): "
-            "прогон остановлен, чтобы остальные узлы не остались без времени"
+            "прогон остановлен, чтобы остальные узлы не остались без времени",
         )
     if isinstance(error, EvidenceBudgetError):
         return (
+            "доказательства не поместились в бюджет контекста: вывод модели не "
+            "строился, ответ собран по найденным доказательствам",
             f"доказательства не поместились в бюджет контекста ({error}): синтез не "
-            "вызывался, ответ собран по найденным доказательствам без вывода модели"
+            "вызывался, ответ собран по найденным доказательствам без вывода модели",
         )
     if isinstance(error, ValidationError):
         # Сырой текст pydantic содержит значения полей — наружу только класс ошибки.
-        return "состояние прогона не прошло проверку схемы (часть данных отброшена)"
+        return (
+            "часть данных прогона не прошла проверку и была отброшена",
+            "состояние прогона не прошло проверку схемы (часть данных отброшена)",
+        )
     if isinstance(error, WorkflowNodeError):
-        return f"узел {error.node} завершился ошибкой ({error.detail})"
-    return "рабочий процесс не вернул ответ"
+        return (
+            "один из шагов проверки завершился ошибкой: ответ собран по остальным",
+            f"узел {error.node} завершился ошибкой ({error.detail})",
+        )
+    return "рабочий процесс не вернул ответ", "рабочий процесс не вернул ответ"
 
 
 def _acl_scope(allowed: set[DataClass] | None) -> str:
@@ -1804,6 +1914,12 @@ def _compact_history(previous: Mapping[str, Any]) -> list[ResearchTurn]:
                     item.public_query for item in getattr(answer, "tool_observations", [])
                     if item.public_query
                 )),
+                public_sources={
+                    item.id: item.evidence[0].source_url
+                    for item in getattr(answer, "findings", [])
+                    if item.scope.get("origin") == "public_source" and item.evidence
+                    and item.evidence[0].source_url
+                },
             )
         )
     return history[-_MAX_RESUMED_TURNS:]
@@ -1820,6 +1936,17 @@ def _finding_prompt(finding: Finding) -> str:
         finding.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
         ensure_ascii=False,
     )
+
+
+def _public_reread_queries(turn: ResearchTurn) -> list[str]:
+    queries = []
+    for url in turn.public_sources.values():
+        match = re.fullmatch(r"https://europepmc\.org/article/([A-Z]+)/([\w-]+)", url)
+        if match:
+            queries.append(f"EXT_ID:{match.group(2)} AND SRC:{match.group(1)}")
+        else:
+            queries.append(url)
+    return queries[:3] or turn.public_queries[:2]
 
 
 def _merge_budgets(*contexts: BudgetedContext) -> BudgetedContext:
@@ -1918,20 +2045,21 @@ def _ungrounded_answer_numbers(
 ) -> list[str]:
     """Числа текста модели, не подтверждённые процитированными доказательствами.
 
-    Проверяются summary и recommendations — они и есть утверждения ответа. Conflicts
-    и knowledge_gaps описывают состояние доказательств, а не новые числа корпуса, и
-    их правка Improver'ом всё равно не исправила бы.
+    Проверяется весь публикуемый текст: дополнительные поля тоже могут содержать
+    выдуманное измерение или переносить число из другой публикации.
     """
     supported = _supported_numbers(findings)
     text = _answer_prose(reasoning, findings)
     unsupported = _numbers(text) - supported
     # При наличии ссылок проверяем числа в пределах абзаца: значение из другой
     # статьи не подтверждает соседнее утверждение об ином объекте.
-    if _inline_finding_ids(reasoning.summary):
-        for paragraph in reasoning.summary.split("\n\n"):
+    if _inline_finding_ids(_reasoning_text(reasoning)):
+        for paragraph in _reasoning_text(reasoning).split("\n\n"):
             cited = _inline_finding_ids(paragraph)
             local = [finding for finding in findings if finding.id in cited]
-            fragment = reasoning.model_copy(update={"summary": paragraph})
+            fragment = reasoning.model_copy(update={
+                "summary": paragraph, "recommendations": [], "conflicts": [], "knowledge_gaps": [],
+            })
             unsupported.update(
                 _numbers(_answer_prose(fragment, findings)) - _supported_numbers(local)
             )
@@ -1959,7 +2087,7 @@ def _link_finding_mentions(text: str, findings: Sequence[Finding]) -> str:
             if not re.search(r"[a-zA-Zа-яА-Я-]", finding.id):
                 continue
             label = finding.evidence[0].source_title if finding.evidence else "находка"
-            mention = rf"\[*{re.escape(finding.id)}\]*"
+            mention = rf"\[*(?:finding:)?{re.escape(finding.id)}\]*"
             if len(findings) == 1 and label and not label.isdigit():
                 # Единственный источник однозначен даже при ссылке по названию.
                 mention = f"(?:{mention}|{re.escape(label)})"
@@ -1973,11 +2101,26 @@ def _link_finding_mentions(text: str, findings: Sequence[Finding]) -> str:
     return "".join(parts)
 
 
+def _reasoning_text(reasoning: ReasoningResult) -> str:
+    return "\n\n".join([
+        reasoning.summary, *reasoning.conflicts, *reasoning.knowledge_gaps,
+        *reasoning.recommendations,
+    ])
+
+
 def _answer_prose(reasoning: ReasoningResult, findings: Sequence[Finding]) -> str:
     """Нумерация Markdown и метаданные ссылок не являются числами утверждений."""
-    text = reasoning.summary
+    text = _reasoning_text(reasoning)
     # p50/p95 — имена статистик в плане измерений, а не полученные значения.
     text = re.sub(r"(?i)\bp(?:50|90|95|99)\b", "перцентиль", text)
+    # Количество предлагаемых вариантов обсуждения не является измерением.
+    text = re.sub(
+        r"(?i)\b(сравнить|проверить|предложить)\s+\d+\s+(?:альтернативн[а-я]+\s+)?"
+        r"(гипотез[а-я]*|объяснен[а-я]*|вариант[а-я]*)", r"\1 \2", text,
+    )
+    # Только коэффициент стандартной формулы относительного изменения, а не
+    # измеренное значение. Полученный результат в процентах по-прежнему проверяется.
+    text = re.sub(r"%\s*=\s*100\s*[·*×]", "% = коэффициент ·", text)
     text = re.sub(r"\[([^\]]*)\]\([^\s)]+\)", r"\1", text)
     # Модель может назвать тот же документ обычным текстом вместо Markdown-ссылки.
     for finding in findings:
@@ -2005,7 +2148,8 @@ _UNIT_SCALES: dict[str, float] = {
     "г/м³": 1.0, "мг/м³": 1e-3, "кг/м³": 1e3, "т/м³": 1e6,
     "г/т": 1.0, "мг/т": 1e-3, "кг/т": 1e3, "%": 1.0, "°C": 1.0,
     "мм": 1e-3, "см": 1e-2, "м": 1.0, "км": 1e3,
-    "г": 1e-3, "кг": 1.0, "т": 1e3, "л": 1.0, "мл": 1e-3,
+    "г": 1e-3, "мг": 1e-6, "мкг": 1e-9, "кг": 1.0, "т": 1e3, "л": 1.0, "мл": 1e-3,
+    "мг/сут": 1e-6,
 }
 
 _UNIT_WITH_SCALE = re.compile(r"\d+(?:[.,]\d+)?\s*([а-яёА-ЯЁa-zA-Z°/%²³]+)")
@@ -2021,6 +2165,8 @@ _UNIT_CANONICAL: dict[str, str] = {
     "g/t": "г/т", "mg/t": "мг/т", "kg/t": "кг/т",
     "mm": "мм", "cm": "см", "km": "км", "ml": "мл", "l": "л",
     "g": "г", "kg": "кг", "t": "т", "m": "м",
+    "mg": "мг", "ug": "мкг", "mg/day": "мг/сут", "mg/d": "мг/сут", "мг/день": "мг/сут",
+    "мг/day": "мг/сут",
     "percent": "%", "ratio": "раз",
 }
 
@@ -2071,31 +2217,41 @@ def _unit_scale(unit: str) -> float | None:
     return _UNIT_SCALES_BY_KEY.get(_unit_key(unit))
 
 
-def _unit_scales(text: str) -> dict[str, tuple[float | None, str]]:
-    """Число в форме сравнения → масштаб единицы и её написание сразу после него.
-
-    Единица фиксируется и вне словаря _UNIT_SCALES: «70 баррелей» против
-    доказательства в «70 т/м³» — расхождение, которое аналитик обязан увидеть, даже
-    когда масштаб неизвестен.
-    """
-    scales: dict[str, tuple[float | None, str]] = {}
+def _unit_mentions(text: str) -> list[tuple[str, float | None, str]]:
+    text = re.sub(
+        r"\b(мг|mg)\s+(?:в\s+сутки|в\s+день|per\s+day)\b", r"\1/day", text,
+        flags=re.IGNORECASE,
+    )
+    pairs = []
     for match in _UNIT_WITH_SCALE.finditer(text):
         raw = _NUMBER.match(match.group(0))
-        if raw is None:
-            continue
-        try:
+        if raw is not None:
             number = _plain(float(raw.group(0).replace(",", ".")))
-        except ValueError:
-            continue
-        unit = match.group(1)
-        scales[number] = (_unit_scale(unit), unit)
-    return scales
+            unit = match.group(1)
+            pairs.append((number, _unit_scale(unit), unit))
+    # Единица после диапазона относится к обеим границам.
+    for match in re.finditer(
+        r"(\d+(?:[.,]\d+)?)\s*[–—-]\s*(\d+(?:[.,]\d+)?)\s*([а-яёА-ЯЁa-zA-Z°/%²³]+)",
+        text,
+    ):
+        unit = match.group(3)
+        for boundary in match.group(1, 2):
+            pairs.append((_plain(float(boundary.replace(",", "."))), _unit_scale(unit), unit))
+    return pairs
 
 
-def _supported_unit_scales(findings: Sequence[Finding]) -> dict[str, tuple[float | None, str]]:
+def _supported_unit_scales(
+    findings: Sequence[Finding],
+) -> dict[str, list[tuple[float | None, str]]]:
     """Масштаб и написание единицы, которыми доказательство отвечает на своё число."""
-    scales: dict[str, tuple[float | None, str]] = {}
+    scales: dict[str, list[tuple[float | None, str]]] = {}
     for finding in findings:
+        for evidence in finding.evidence:
+            for number, scale, unit in _unit_mentions(evidence.quote):
+                # Слово после числа («36 young adults») само по себе не единица.
+                # Неизвестные единицы учитываются только из явных observations.
+                if scale is not None:
+                    scales.setdefault(number, []).append((scale, unit))
         for observation in finding.observations:
             for unit, values in (
                 (
@@ -2115,7 +2271,7 @@ def _supported_unit_scales(findings: Sequence[Finding]) -> dict[str, tuple[float
                     continue
                 for value in values:
                     if value is not None:
-                        scales[_plain(value)] = (_unit_scale(unit), unit)
+                        scales.setdefault(_plain(value), []).append((_unit_scale(unit), unit))
     return scales
 
 
@@ -2128,18 +2284,34 @@ def _unit_pairs(
     доказательства, единица доказательства). Пары, где обе шкалы известны и
     совпадают, сюда не попадают: это не расхождение.
     """
-    answer_scales = _unit_scales(_answer_prose(reasoning, findings))
+    answer_scales = _unit_mentions(_answer_prose(reasoning, findings))
     supported = _supported_unit_scales(findings)
     pairs: list[tuple[str, float | None, str, float | None, str]] = []
-    for number, (answer_scale, answer_unit) in answer_scales.items():
-        evidence = supported.get(number)
-        if evidence is None:
+    for number, answer_scale, answer_unit in answer_scales:
+        evidence_units = supported.get(number, [])
+        if not evidence_units:
             continue
-        evidence_scale, evidence_unit = evidence
-        if _unit_key(answer_unit) == _unit_key(evidence_unit):
+        if any(_unit_key(answer_unit) == _unit_key(unit) for _, unit in evidence_units):
             continue
+        evidence_scale, evidence_unit = next(
+            (item for item in evidence_units if item[0] is not None), evidence_units[0],
+        )
         pairs.append((number, answer_scale, answer_unit, evidence_scale, evidence_unit))
-    return pairs
+    return list(dict.fromkeys(pairs))
+
+
+def _unit_dimension(unit: str) -> str | None:
+    key = _unit_key(unit)
+    for dimension, units in (
+        ("mass", {"г", "мг", "мкг", "кг", "т"}),
+        ("mass_per_day", {"мг/сут"}),
+        ("length", {"мм", "см", "м", "км"}),
+        ("volume", {"мл", "л"}),
+        ("pressure", {"па", "кпа", "мпа", "гпа"}),
+    ):
+        if key in units:
+            return dimension
+    return None
 
 
 def _unit_conflicts(reasoning: ReasoningResult, findings: Sequence[Finding]) -> list[str]:
@@ -2156,7 +2328,13 @@ def _unit_conflicts(reasoning: ReasoningResult, findings: Sequence[Finding]) -> 
         )
         if answer_scale is not None
         and evidence_scale is not None
-        and answer_scale != evidence_scale
+        and (
+            answer_scale != evidence_scale or (
+                _unit_dimension(answer_unit) is not None
+                and _unit_dimension(evidence_unit) is not None
+                and _unit_dimension(answer_unit) != _unit_dimension(evidence_unit)
+            )
+        )
     ]
 
 

@@ -43,7 +43,8 @@ def _excerpt(value: str, limit: int) -> str:
     # Срез в середине числа меняет значение цитаты (1200 -> 12).
     if len(value) <= limit:
         return value
-    return value[:limit].rsplit(" ", 1)[0]
+    prefix = value[:limit]
+    return prefix.rsplit(" ", 1)[0] if " " in prefix else ""
 
 
 class PublicSourceSearch:
@@ -60,7 +61,8 @@ class PublicSourceSearch:
             "Tavily: поиск по открытым веб-страницам, только прочитанные фрагменты."
             if self._key else
             "Europe PMC: поиск аннотаций научных публикаций по биологии и медицине; "
-            "не общий веб-поиск. Запрос формулируй на английском."
+            "не общий веб-поиск. Запрос формулируй на английском. "
+            "Для первичных работ исключи обзоры: NOT PUB_TYPE:Review."
         )
 
     async def search(self, query: str, *, timeout: float = 20) -> RetrievalContext:
@@ -82,7 +84,8 @@ class PublicSourceSearch:
             else:
                 payload = await self._request(
                     client, "GET", "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
-                    params={"query": query[:500], "format": "json", "resultType": "core",
+                    params={"query": f"({query[:500]}) AND HAS_ABSTRACT:Y", "format": "json",
+                            "resultType": "core",
                             "pageSize": 3},
                 )
                 rows = [

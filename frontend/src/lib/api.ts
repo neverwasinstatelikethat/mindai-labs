@@ -206,10 +206,11 @@ export const api = {
     if (!response.ok) throw await failure(response);
     return response.json() as Promise<DocumentReceipt>;
   },
-  query: (question: string) =>
+  query: (question: string, webSearchEnabled = true) =>
     request<QueryResponse>('/api/v1/query', {
       method: 'POST',
-      body: JSON.stringify({ question, language: 'ru', mode: 'hybrid' }),
+      body: JSON.stringify({ question, language: 'ru', mode: 'hybrid',
+                             web_search_enabled: webSearchEnabled }),
     }),
   answerHistory: (limit = 30, offset = 0) =>
     request<AnswerHistoryPage>(`/api/v1/answers?limit=${limit}&offset=${offset}`),

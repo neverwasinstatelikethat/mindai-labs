@@ -176,8 +176,7 @@
      один раз. */
   .auth__gate {
     max-width: var(--maxw-measure);
-    padding-top: var(--s1);
-    border-top: 1px solid var(--line);
+    margin-top: var(--s5);
   }
 
   /* Ссылка-действие рядом с кнопкой входа: цель нажатия 32 px берётся

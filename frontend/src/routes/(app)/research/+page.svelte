@@ -53,6 +53,7 @@
   let historySaveError = $state('');
   let historyRequest = 0;
   let running = $state(false);
+  let webSearchEnabled = $state(true);
   // Прежний ответ остаётся доступен в серверной истории после нового вопроса.
   let delivered = false;
   let failure = $state<RunFailure | null>(null);
@@ -313,7 +314,8 @@
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thread_id: threadId, question: asked, language: 'ru', mode: 'hybrid' }),
+        body: JSON.stringify({ thread_id: threadId, question: asked, language: 'ru', mode: 'hybrid',
+                               web_search_enabled: webSearchEnabled }),
         signal,
       });
 
@@ -589,6 +591,8 @@
       {answer}
       {question}
       {running}
+      {webSearchEnabled}
+      onwebsearchchange={(enabled) => (webSearchEnabled = enabled)}
       {turns}
       {progressStages}
       error={failure}

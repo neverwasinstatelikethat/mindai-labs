@@ -129,13 +129,15 @@
     outline: none;
   }
 
+  /* Шапка отделена расстоянием: заголовок шторки и так самый крупный блок на
+     слое, а линия под ним рисовала вторую границу внутри и без того обведённого
+     модального окна. */
   .sheet__head {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     gap: var(--s4);
     padding: clamp(var(--s5), 3vw, var(--s7)) clamp(var(--s5), 3vw, var(--s7)) var(--s3);
-    border-bottom: 1px solid var(--line-soft);
   }
 
   /* Заголовок шторки — часто полная формулировка находки: перенос по любому
@@ -161,6 +163,9 @@
     overscroll-behavior: contain;
   }
 
+  /* Полоса действий отделена тоном, а не линией: тело прокручивается под ней, и
+     без собственной поверхности последние строки доказательства ложились бы
+     вплотную к кнопкам. */
   .sheet__foot {
     display: flex;
     align-items: center;
@@ -168,6 +173,6 @@
     gap: var(--s3);
     padding: var(--s4) clamp(var(--s5), 3vw, var(--s7))
       calc(var(--s4) + env(safe-area-inset-bottom));
-    border-top: 1px solid var(--line-soft);
+    background: var(--surface-sunk);
   }
 </style>

@@ -167,12 +167,11 @@
     content: "";
     position: absolute;
     inset: 6px;
-    border: 1px solid var(--line);
     border-radius: var(--r-pill);
-    background: var(--surface);
+    background: var(--surface-sunk);
     transition:
-      border-color var(--dur-fast) var(--ease-soft),
-      background-color var(--dur-fast) var(--ease-soft);
+      background-color var(--dur-fast) var(--ease-soft),
+      box-shadow var(--dur-fast) var(--ease-soft);
   }
 
   .infodot__btn > :global(svg) {
@@ -183,9 +182,11 @@
     color: var(--ink);
   }
 
+  /* Круглая кнопка «i» живёт тем же тоном и тенью, что и весь иконочный ряд
+     шапки: рамка вокруг неё рисовала второй язык для одного и того же жеста. */
   .infodot__btn:hover::before {
-    border-color: var(--line-strong);
     background: var(--surface-raised);
+    box-shadow: var(--shadow-soft);
   }
 
   .infodot__btn:active {
@@ -199,7 +200,6 @@
   .infodot__btn:focus-visible::before {
     outline: 2px solid var(--action);
     outline-offset: 2px;
-    border-color: var(--line-strong);
   }
 
   .infodot--open .infodot__btn {
@@ -207,10 +207,11 @@
   }
 
   .infodot--open .infodot__btn::before {
-    border-color: var(--line-strong);
-    background: var(--surface-sunk);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-soft);
   }
 
+  /* Пояснение — плывущий слой: держится собственной тенью, а не линией. */
   .infodot__pop {
     position: absolute;
     top: calc(100% + var(--s2));
@@ -220,7 +221,6 @@
     max-block-size: min(70dvh, 34rem);
     overflow: auto;
     padding: var(--s4);
-    border: 1px solid var(--line);
     border-radius: var(--r-sm);
     background: var(--surface-raised);
     box-shadow: var(--shadow-lift);

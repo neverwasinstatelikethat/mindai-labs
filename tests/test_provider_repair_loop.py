@@ -6,6 +6,7 @@ repair-промпт → потолок попыток → явный отказ�
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +21,7 @@ from scientific_tangle.domain.contracts import (
     ReasoningResult,
 )
 from scientific_tangle.services import provider as provider_module
+from scientific_tangle.services.agent_metrics import AgentMetricsRegistry
 from scientific_tangle.services.provider import GigaChatProvider, ModelUnavailableError
 
 
@@ -122,8 +124,10 @@ def _provider(
     pending = list(responses)
 
     async def fake_request(
-        messages: Any, *, max_tokens: int | None = None, model: str | None = None
+        messages: Any, *, max_tokens: int | None = None, model: str | None = None,
+        response_schema: type[BaseModel] | None = None,
     ) -> Any:
+        assert response_schema is not None
         prompt_log.append(list(messages))
         limits.append(max_tokens)
         models.append(model)
@@ -138,6 +142,28 @@ def _provider(
 
 def _broken_runs(count: int) -> list[SimpleNamespace]:
     return [_completion("это не json") for _ in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_native_json_schema_reaches_sdk_http_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gigachat.api.chat import _get_chat_kwargs
+
+    subject, _ = _provider([], metrics=AgentMetricsRegistry())
+    payloads: list[dict[str, Any]] = []
+
+    async def achat(request: Any) -> Any:
+        payloads.append(json.loads(_get_chat_kwargs(chat=request)["content"]))
+        return _completion('{"summary": "готово", "finding_ids": []}')
+
+    async def get_client() -> Any:
+        return SimpleNamespace(achat=achat)
+
+    monkeypatch.setattr(subject, "_get_client", get_client)
+    await GigaChatProvider._request(subject, [], response_schema=Answer)
+    assert payloads[0]["response_format"] == {
+        "type": "json_schema", "schema": Answer.model_json_schema(), "strict": True,
+    }
+    assert "additional_fields" not in payloads[0]
 
 
 @pytest.mark.asyncio
@@ -278,7 +304,7 @@ async def test_cancellation_after_repair_attempt_still_accounts_spent_tokens() -
     subject, _ = _provider([_completion("не json", tokens=(70, 7))])
     seen: list[int] = []
 
-    async def cancel_after_first(messages, *, model=None):
+    async def cancel_after_first(messages, *, model=None, response_schema=None):
         seen.append(1)
         if len(seen) == 1:
             return _completion("не json", tokens=(70, 7))
@@ -308,7 +334,7 @@ async def test_cancellation_is_accounted_without_the_new_registry_parameter() ->
     registry = StrictRegistry()
     subject, _ = _provider([_completion("не json", tokens=(70, 7))], metrics=registry)
 
-    async def cancel_at_once(messages, *, model=None):
+    async def cancel_at_once(messages, *, model=None, response_schema=None):
         raise asyncio.CancelledError
 
     subject._request = cancel_at_once  # type: ignore[method-assign]

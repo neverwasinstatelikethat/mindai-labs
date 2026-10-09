@@ -380,6 +380,7 @@ class QueryRequest(BaseModel):
     question: str = Field(min_length=3)
     language: Literal["ru", "en"] = "ru"
     mode: Literal["local", "global", "hybrid"] = "hybrid"
+    web_search_enabled: bool = True
 
 
 class IntentClassification(LlmForm):

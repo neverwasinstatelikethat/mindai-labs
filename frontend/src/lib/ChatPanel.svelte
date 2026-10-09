@@ -12,6 +12,7 @@
   import { session } from '$lib/sessionStore.svelte';
   import {
     ANSWER_HEAD,
+    ANSWER_SOURCES,
     ANSWER_TAIL,
     ASK_ACTIONS,
     ASK_EMPTY,
@@ -21,16 +22,21 @@
     OPERATOR_WORD,
     PREDICATE_LABELS,
     PROPERTY_LABELS,
+    REASONING,
     SHEET_LABELS,
-    STATUS_PHRASE,
+    STATUS_SHORT,
     SUBJECT_LABELS,
     TERM_FALLBACKS,
+    degradationOf,
     describeScope,
     describeValue,
     knownTerm,
     moreThesesText,
+    stageByLabel,
+    stageHint,
   } from '$lib/terms';
   import Button from '$lib/ui/Button.svelte';
+  import Disclosure from '$lib/ui/Disclosure.svelte';
   import Empty from '$lib/ui/Empty.svelte';
   import Mascot from '$lib/ui/Mascot.svelte';
   import Icon from '$lib/ui/Icon.svelte';
@@ -38,7 +44,6 @@
   import PromptInput from '$lib/ui/PromptInput.svelte';
 
   import Sheet from '$lib/ui/Sheet.svelte';
-  import StatusPill from '$lib/ui/StatusPill.svelte';
   import VerdictSheet from '$lib/ui/VerdictSheet.svelte';
   import ResearchMarkdown from '$lib/ui/ResearchMarkdown.svelte';
   import { stageOfNode } from '$lib/terms/research';
@@ -97,6 +102,8 @@
     question: string;
     answer: AnswerPayload | null;
     running: boolean;
+    webSearchEnabled: boolean;
+    onwebsearchchange: (enabled: boolean) => void;
     turns?: AnswerPayload[];
     progressStages?: string[];
     error: RunFailure | null;
@@ -125,6 +132,8 @@
     question,
     answer,
     running,
+    webSearchEnabled,
+    onwebsearchchange,
     turns = [],
     progressStages = [],
     error,
@@ -204,11 +213,54 @@
   const verdictTurn = $derived(
     [answer, ...turns].find((turn) => turn?.findings.some((finding) => finding.id === thesisVerdict?.id)) ?? null,
   );
-  const answerStages = $derived(
-    (answer?.trace ?? []).map((event) => stageOfNode(event.agent)?.label).filter(
-      (label, index, stages): label is string => !!label && label !== stages[index - 1],
-    ),
-  );
+  // Цепочка подготовки ответа: стадии идут порядком событий, состояние стадии —
+  // её последний исход. Узел, которого нет в перечне стадий, шагом не считается.
+  type ReasonStep = { key: string; label: string; hint: string; state: 'done' | 'current' | 'failed' };
+
+  function pushStep(steps: ReasonStep[], key: string, label: string, hint: string, state: ReasonStep['state']): void {
+    const found = steps.find((step) => step.key === key);
+    if (!found) {
+      steps.push({ key, label, hint, state });
+      return;
+    }
+    // Повторный проход по стадии не откатывает её к «выполняется», отказ же
+    // остаётся отказом: человек должен видеть, что шаг не прошёл.
+    if (state === 'failed') found.state = 'failed';
+    else if (found.state === 'current' && state === 'done') found.state = 'done';
+  }
+
+  const answerChain = $derived.by(() => {
+    const steps: ReasonStep[] = [];
+    for (const event of answer?.trace ?? []) {
+      const stage = stageOfNode(event.agent);
+      if (!stage) continue;
+      pushStep(
+        steps,
+        stage.key,
+        stage.label,
+        stageHint(stage.key),
+        event.status === 'failed' ? 'failed' : event.status === 'started' ? 'current' : 'done',
+      );
+    }
+    return steps;
+  });
+
+  const liveChain = $derived.by(() => {
+    const steps: ReasonStep[] = [];
+    progressStages.forEach((label, index) => {
+      const stage = stageByLabel(label);
+      pushStep(steps, stage?.key ?? label, label, stage?.hint ?? '', index === progressStages.length - 1 ? 'current' : 'done');
+    });
+    return steps;
+  });
+
+  // Развёрнутая цепочка — рабочее состояние во время сборки: человеку важно, что
+  // происходит. Готовый ответ сворачивается, чтобы вывод остался единственным
+  // крупным объектом на экране.
+  let reasoningOpen = $state(false);
+  $effect(() => {
+    reasoningOpen = running;
+  });
 
   // Вопрос со входа в раздел подставляется в поле один раз и сразу запускается:
   // человек уже отправил его с входной страницы, повторять нажатие не нужно.
@@ -734,6 +786,16 @@
 />
 
 {#snippet composerTools()}
+  <button
+    type="button"
+    class="btn btn--quiet btn--sm"
+    aria-pressed={webSearchEnabled}
+    disabled={running || !canAsk}
+    onclick={() => onwebsearchchange(!webSearchEnabled)}
+    title="Открытые источники дополняют поиск по материалам пространства"
+  >
+    Поиск в интернете: {webSearchEnabled ? 'включён' : 'выключен'}
+  </button>
   <label class="btn btn--quiet btn--sm upload">
     <Icon name="doc" size={16} />
     Добавить файл
@@ -795,114 +857,131 @@
       </div>
     {/if}
 
+    {#snippet chain(steps: ReasonStep[])}
+      <ol class="reasoning__chain">
+        {#each steps as step (step.key)}
+          <li class="reasoning__step" data-state={step.state}>
+            <span class="reasoning__dot" aria-hidden="true"></span>
+            <span class="reasoning__label">{step.label}</span>
+            {#if step.hint}<span class="reasoning__hint">{step.hint}</span>{/if}
+          </li>
+        {/each}
+      </ol>
+    {/snippet}
+
     {#each turns.filter((turn) => turn.query_id !== answer?.query_id) as turn (turn.query_id)}
-      <article class="paper" aria-label="Предыдущий ход диалога">
-        <p class="chat__question">{turn.question}</p>
-        <ResearchMarkdown text={turn.summary} findings={turn.findings} onfinding={openClaim} />
+      <div class="turn flex flex-col gap-3" aria-label="Предыдущий ход диалога">
+        <p class="chat__question self-end max-w-measure rounded-lg bg-coral-mist px-4 py-3 text-body">{turn.question}</p>
+        <article class="answer w-full rounded-lg bg-raised p-6 shadow-object">
+          <ResearchMarkdown text={turn.summary} findings={turn.findings} onfinding={openClaim} />
+        </article>
         {#if turn.limitations?.length}
           <Notice tone="warn" title="Границы этого ответа">
-            {#each turn.limitations as limitation}<p>{limitation}</p>{/each}
+            {#each turn.limitations as limitation, index (index)}<p>{degradationOf(limitation)}</p>{/each}
           </Notice>
         {/if}
-      </article>
+      </div>
     {/each}
 
-    <!-- ── 3. ОТВЕТ = БУМАГА ─────────────────────────────────────────────── -->
+    <!-- ── 3. ХОД ДИАЛОГА: реплика человека → цепочка подготовки → ответ →
+         доказательства → техника. Подъём держит только ответ: он единственный
+         объект, ради которого здесь находятся. Всё остальное различается тоном,
+         сдвигом и кеглем, а не рамкой. ─────────────────────────────────── -->
     {#if showPaper && answer}
       {@const payload = answer}
-      <article class="paper">
-        <header class="paper__head">
-          {#if staleAnswer}
-            <!-- Новый вопрос ещё без ответа: прежний не стирается молча, он
-                 назван прежним и остаётся до явного действия человека. -->
-            <div class="paper__stale">
-              <Notice tone="info" title={ANSWER_HEAD.staleTitle}>
-                <p>{ANSWER_HEAD.stale.replace('{question}', `«${answer.question}»`)}</p>
-              </Notice>
-              <Button variant="quiet" size="sm" onclick={() => (staleDismissed = true)}>
-                {ANSWER_HEAD.discard}
-              </Button>
-            </div>
-          {/if}
-          <p class="chat__question">{payload.question || question}</p>
+      <div class="turn flex flex-col gap-3">
+        <p class="chat__question self-end max-w-measure rounded-lg bg-coral-mist px-4 py-3 text-body">{payload.question || question}</p>
+
+        {#if staleAnswer}
+          <!-- Новый вопрос ещё без ответа: прежний не стирается молча, он
+               назван прежним и остаётся до явного действия человека. -->
+          <div class="turn__stale flex flex-wrap items-center gap-2">
+            <Notice tone="info" title={ANSWER_HEAD.staleTitle}>
+              <p>{ANSWER_HEAD.stale.replace('{question}', `«${answer.question}»`)}</p>
+            </Notice>
+            <Button variant="quiet" size="sm" onclick={() => (staleDismissed = true)}>
+              {ANSWER_HEAD.discard}
+            </Button>
+          </div>
+        {/if}
+
+        {#if answerChain.length}
+          <Disclosure
+            id={`reasoning-${payload.query_id}`}
+            class="reasoning"
+            title={REASONING.title}
+            summary={countOf(answerChain.length, 'шаг', 'шага', 'шагов')}
+            bind:open={reasoningOpen}
+          >
+            {@render chain(answerChain)}
+          </Disclosure>
+        {/if}
+
+        <article class="answer w-full rounded-lg bg-raised p-6 shadow-object">
           <div class="prose">
             <ResearchMarkdown text={payload.summary || ANSWER_HEAD.summaryMissing} findings={payload.findings} onfinding={openClaim} />
           </div>
-        </header>
-
-        {#if answerStages.length}
-          <details class="chat__sources">
-            <summary>Как подготовлен ответ</summary>
-            <ol>{#each answerStages as stage, index (index)}<li>{stage}</li>{/each}</ol>
-          </details>
-        {/if}
+        </article>
 
         {#if payload.limitations?.length}
-          <div class="paper__degraded">
-            <Notice tone="warn" title="Границы этого ответа">
-              {#each payload.limitations as limitation}<p>{limitation}</p>{/each}
-            </Notice>
-          </div>
+          <Notice tone="warn" title="Границы этого ответа">
+            {#each payload.limitations as limitation, index (index)}<p>{degradationOf(limitation)}</p>{/each}
+          </Notice>
         {/if}
 
         {#if payload.findings.length}
-          <details class="chat__sources">
-            <summary>Источники и находки ({payload.findings.length})</summary>
-          <div class="paper__body">
-            <!-- Шкала интервалов: клавиатурный путь к тому же содержимому,
-                 что и список тезисов, и общий масштаб по единице. -->
-            <div class="theses">
+          <Disclosure
+            id={`evidence-${payload.query_id}`}
+            title={ANSWER_SOURCES.title}
+            summary={countOf(payload.findings.length, 'находка', 'находки', 'находок')}
+          >
+            <ul class="theses m-0 flex list-none flex-col gap-1 p-0">
               {#each visibleFindings as finding (finding.id)}
                 {@const selected = finding.id === openClaimId}
-                <article class="thesis" class:thesis--selected={selected} data-claim={finding.id}>
-                  <div class="thesis__head">
-                    <div class="thesis__marks">
-                      <StatusPill status={finding.status} label={STATUS_PHRASE[finding.status]} />
-                    </div>
+                <li
+                  class="thesis grid items-center gap-x-4 gap-y-1 rounded-md p-3 transition-colors md:grid-cols-[minmax(0,1fr)_auto]"
+                  data-selected={selected || undefined}
+                  data-claim={finding.id}
+                >
+                  <div class="min-w-0">
                     <h3 class="thesis__statement">{finding.statement}</h3>
-                    <!-- Только русские имена: ключи онтологии живут в разборе
-                         тезиса под «Служебными данными». -->
-
-                    <Button
-                      variant="quiet"
-                      size="sm"
-                      class="thesis__toggle"
-                      onclick={() => openClaim(finding.id)}
-                    >
-                      {SHEET_LABELS.open}
-                    </Button>
+                    <p class="thesis__value">{valueSummary(finding)}</p>
                   </div>
-
-                  <p class="small thesis__closed">{valueSummary(finding)}</p>
-                </article>
+                  <Button
+                    variant="link"
+                    size="sm"
+                    class="thesis__open justify-self-start md:justify-self-end"
+                    onclick={() => openClaim(finding.id)}
+                  >
+                    {SHEET_LABELS.open}
+                  </Button>
+                </li>
               {/each}
-              {#if findingsHidden > 0}
-                <Button variant="quiet" size="sm" icon="chevronDown" onclick={showMoreTheses}>
-                  {moreThesesText(findingsHidden)}
-                </Button>
-              {/if}
-            </div>
-          </div>
-          </details>
+            </ul>
+            {#if findingsHidden > 0}
+              <Button variant="quiet" size="sm" icon="chevronDown" onclick={showMoreTheses}>
+                {moreThesesText(findingsHidden)}
+              </Button>
+            {/if}
+          </Disclosure>
         {/if}
 
         {#if payload.conflicts.length || payload.knowledge_gaps.length || payload.recommendations.length}
           <!-- Каждая группа названа: совет модели и расхождение двух документов
                иначе прочитались бы как одинаковые строки одного списка. -->
           {#snippet tailGroup(name: string, items: string[])}
-            <div class="stack" style="--gap: var(--s2)">
-              <p class="field__label">{name}</p>
+            <div class="tail__group mt-5 flex flex-col gap-1 first:mt-0">
+              <h4 class="tail__name m-0 text-small font-medium text-ink-2">{name}</h4>
               {#each items as item, index (index)}
                 {@const line = humanTail(item, payload.findings)}
-                <p class="small">{line.body}</p>
+                <p class="tail__line m-0 text-small">{degradationOf(line.body)}</p>
                 {#if line.refs.length}
-                  <p class="micro muted">{ANSWER_TAIL.refsLead}{line.refs.join(', ')}</p>
+                  <p class="tail__refs m-0 text-micro text-ink-4">{ANSWER_TAIL.refsLead}{line.refs.join(', ')}</p>
                 {/if}
               {/each}
             </div>
           {/snippet}
-          <details class="chat__more">
-            <summary>{ANSWER_TAIL.summary}</summary>
+          <Disclosure id={`tail-${payload.query_id}`} class="tail" title={ANSWER_TAIL.summary}>
             {#if payload.conflicts.length}
               {@render tailGroup(ANSWER_TAIL.conflicts, payload.conflicts)}
             {/if}
@@ -912,31 +991,31 @@
             {#if payload.recommendations.length}
               {@render tailGroup(ANSWER_TAIL.next, payload.recommendations)}
             {/if}
-          </details>
+          </Disclosure>
         {/if}
-      </article>
+      </div>
     {/if}
 
     {#if question.trim() && (running || staleAnswer || error)}
-      <div class="chat__pending" aria-live="polite">
-        <p class="chat__question">{question}</p>
+      <div class="turn flex flex-col gap-3">
+        <p class="chat__question self-end max-w-measure rounded-lg bg-coral-mist px-4 py-3 text-body">{question}</p>
         {#if running}
-          <div class="chat__waiting" role="status">
+          <div class="waiting flex items-start gap-3">
             <Mascot size={32} label="StormIdea собирает ответ" />
-            <div>
-              <p>{progressStages.at(-1) ?? 'Разбираю вопрос в контексте диалога'}</p>
-              <!-- В перечне остаются пройденные стадии: текущая названа строкой
-                   выше, а остановка уже есть в композере, где человек её жмёт. -->
-              {#if progressStages.length > 1}
-                <details class="chat__stages">
-                  <summary>Ход исследования</summary>
-                  <ol>
-                    {#each progressStages.slice(0, -1) as stage, index (index)}
-                      <li>{stage}</li>
-                    {/each}
-                  </ol>
-                </details>
-              {/if}
+            <div class="waiting__body min-w-0 flex-1" role="status">
+              <!-- Текущая стадия стоит в заголовке раскрытия: она и есть то, что
+                   человек ждёт. В перечне остаются пройденные шаги, а остановка
+                   уже есть в композере, где человек её и жмёт. -->
+              <Disclosure
+                id="reasoning-live"
+                class="reasoning"
+                title={liveChain.at(-1)?.label ?? 'Разбираю вопрос в контексте диалога'}
+                open={liveChain.length > 1}
+              >
+                {#if liveChain.length > 1}
+                  {@render chain(liveChain.slice(0, -1))}
+                {/if}
+              </Disclosure>
             </div>
           </div>
         {/if}
@@ -1007,11 +1086,12 @@
 
 {#snippet thesisTrace(finding: Finding)}
   <div class="sheet__thesis">
-    <div class="thesis__marks">
-      <StatusPill status={finding.status} label={STATUS_PHRASE[finding.status]} />
-    </div>
     <h3 class="h4">{finding.statement}</h3>
+    <!-- Состояние проверки — слово в строке фактов, а не плашка: цвет держит
+         смысл, а рамка вокруг одного слова только добавляла бы объект там, где
+         его нет. -->
     <p class="micro muted sheet__facts">
+      <span class="status-word" data-status={finding.status}>{STATUS_SHORT[finding.status]}</span>
       <span>{sourceOf(finding)}</span>
       <span>{scopeText(finding.scope)}</span>
       <span>{countOf(finding.evidence.length, 'цитата', 'цитаты', 'цитат')}</span>
@@ -1206,10 +1286,7 @@
             <p class="small">{version.statement}</p>
             <p class="micro version__meta">
               <span>{SHEET_LABELS.versionLabel} <b class="num">{version.version}</b></span>
-              <StatusPill
-                status={version.status}
-                label={STATUS_PHRASE[version.status]}
-              />
+              <span class="status-word" data-status={version.status}>{STATUS_SHORT[version.status]}</span>
               {#if version.review_date}
                 <time datetime={version.review_date}>{reviewDate(version.review_date)}</time>
               {:else}
@@ -1352,122 +1429,99 @@
     flex: 1 1 auto;
   }
 
-  /* ── Бумага ответа ───────────────────────────────────────────────────── */
+  /* ── Ход диалога ────────────────────────────────────────────────────────
+     Композиция ряда собрана утилитами в разметке; здесь остаётся то, что
+     утилитами не выражается: стержень цепочки, состояния шага и тон выбора. */
 
-  /* Лист лежит на всю ширину (wrap--bleed): плотность даёт таблица и шкала,
-     а читается текст в своей мере, поэтому она ограничена внутри колонок. */
-  .paper {
+  /* Стержень цепочки подготовки: вертикальная линия и точки состояний. Бокса у
+     рассуждения нет намеренно — обведённый список шагов читался бы вторым
+     ответом, а не пояснением к первому. */
+  .reasoning__chain {
     position: relative;
     display: flex;
     flex-direction: column;
-    gap: var(--s4);
-    max-width: var(--maxw-narrow);
-    align-self: center;
-    width: 100%;
-  }
-
-  .paper__head {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s3);
-  }
-
-
-  .chat__question {
-    align-self: flex-end;
-    max-width: min(80%, 62ch);
-    margin: 0;
-    padding: var(--s3) var(--s4);
-    border-radius: var(--r-lg);
-    background: var(--coral-mist);
-    color: var(--ink);
-    font-size: var(--t-body);
-    font-weight: 400;
-    line-height: var(--lh-body);
-    text-wrap: pretty;
-  }
-
-  .chat__pending {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: var(--s3);
-  }
-
-  .chat__waiting {
-    display: flex;
-    align-items: center;
-    align-self: flex-start;
-    gap: var(--s3);
-    width: 100%;
-    padding-block: var(--s2);
-    color: var(--ink-2);
-  }
-
-  .chat__waiting p {
-    margin: 0;
-  }
-
-  .chat__sources { border-top: 1px solid var(--line); padding-top: var(--s3); }
-  .chat__sources > summary { cursor: pointer; color: var(--ink-3); font-size: var(--t-small); }
-  .chat__sources > summary:focus-visible { outline: 2px solid var(--action-ink); outline-offset: 3px; border-radius: var(--r-sm); }
-  .chat__sources .paper__body { margin-top: var(--s4); }
-
-  .chat__more {
-    max-width: var(--maxw-measure);
-    border-top: 1px solid var(--line);
-    padding-top: var(--s3);
-  }
-
-  .chat__more summary {
-    width: fit-content;
-    color: var(--ink-2);
-    cursor: pointer;
-  }
-
-  /* Внутри группы держит расстояние `.stack`, между группами — шаг больше:
-     двойной margin у каждой строки раздвигал список так, что метка группы
-     отрывалась от своих пунктов. */
-  .chat__more p {
-    margin-block: 0;
-  }
-
-  .chat__more .stack + .stack {
-    margin-top: var(--s5);
-  }
-
-  .paper__degraded {
-    display: flex;
-    flex-direction: column;
     gap: var(--s2);
+    margin: var(--s3) 0 0;
+    padding: 0 0 0 var(--s5);
+    list-style: none;
   }
 
-  .paper__body {
-    display: block;
+  .reasoning__chain::before {
+    content: '';
+    position: absolute;
+    inset-block: 6px;
+    inset-inline-start: 4px;
+    width: 2px;
+    border-radius: var(--r-pill);
+    background: var(--line);
+  }
+
+  .reasoning__step {
+    position: relative;
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    flex-wrap: wrap;
+    color: var(--ink-3);
+  }
+
+  .reasoning__dot {
+    position: absolute;
+    inset-inline-start: calc(-1 * var(--s5) + 1px);
+    inset-block-start: 0.45em;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--surface);
+    box-shadow: inset 0 0 0 2px var(--line-strong);
+  }
+
+  .reasoning__step[data-state='current'] .reasoning__dot {
+    background: var(--action);
+    box-shadow: inset 0 0 0 2px var(--action);
+  }
+
+  .reasoning__step[data-state='failed'] .reasoning__dot {
+    background: var(--disputed);
+    box-shadow: inset 0 0 0 2px var(--disputed);
+  }
+
+  .reasoning__step[data-state='current'] .reasoning__label {
+    color: var(--ink);
+    font-weight: 500;
+  }
+
+  .reasoning__step[data-state='failed'] .reasoning__label {
+    color: var(--disputed);
+  }
+
+  .reasoning__hint {
+    color: var(--ink-4);
+    font-size: var(--t-micro);
+  }
+
+  /* Выбор тезиса держится тоном поля, а не усилением рамки: рамки у строки нет. */
+  .thesis[data-selected] {
+    background: var(--sage);
+  }
+
+  @media (hover: hover) {
+    .thesis:hover {
+      background: var(--surface-sunk);
+    }
+
+    .thesis[data-selected]:hover {
+      background: var(--sage-deep);
+    }
   }
 
   /* ── Тезисы ──────────────────────────────────────────────────────────── */
 
-  .theses {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s4);
-    min-width: 0;
-  }
-
-  .thesis {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s3);
-    padding: var(--s4) var(--s5);
-    border: 1px solid var(--line-soft);
-    border-radius: var(--r-lg);
-    background: var(--surface);
-  }
-
-  .thesis--selected {
-    border-color: var(--line-strong);
-    box-shadow: var(--shadow-soft);
+  .thesis__value {
+    margin: 0;
+    color: var(--ink-3);
+    font-size: var(--t-micro);
+    line-height: var(--lh-dense);
   }
 
   /* Шапка разбора в шторке: тот же тезис, что и на листе, но в роли заголовка
@@ -1476,19 +1530,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--s3);
-  }
-
-  .thesis__head {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s2);
-  }
-
-  .thesis__marks {
-    display: flex;
-    align-items: center;
-    gap: var(--s2);
-    flex-wrap: wrap;
   }
 
   /* Источник, условия и число цитат — три разных факта. Словами в одну строку
@@ -1507,12 +1548,6 @@
     line-height: var(--lh-head);
     letter-spacing: var(--tr-body);
     text-wrap: pretty;
-    overflow-wrap: anywhere;
-  }
-
-  .thesis__closed {
-    margin-top: var(--s2);
-    max-width: var(--maxw-measure);
     overflow-wrap: anywhere;
   }
 
@@ -1607,7 +1642,6 @@
     gap: var(--s2);
     margin-top: var(--s4);
     padding-left: var(--s4);
-    border-left: 1px solid var(--coral-mist);
   }
 
   .trace__label {
@@ -1615,16 +1649,15 @@
     color: var(--ink-2);
   }
 
+  /* Доказательство — строка списка внутри листа вердикта: своей рамки нет,
+     раскрытие держится тном, иначе вокруг цитаты выросла бы вторая карточка. */
   .evidence {
-    border: 1px solid var(--line-soft);
     border-radius: var(--r-md);
-    background: var(--surface-raised);
-    overflow: hidden;
+    transition: background var(--dur-fast) var(--ease-soft);
   }
 
   .evidence--open {
-    border-color: var(--action);
-    box-shadow: var(--shadow-soft);
+    background: var(--surface-sunk);
   }
 
   .evidence__head {
@@ -1694,9 +1727,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--s2);
-    margin-top: var(--s4);
-    padding-top: var(--s3);
-    border-top: 1px solid var(--line-soft);
+    margin-top: var(--s6);
   }
 
   .history__label {
@@ -1709,17 +1740,12 @@
     flex-direction: column;
     gap: var(--s1);
     padding: var(--s3);
-    border: 1px solid var(--line-soft);
     border-radius: var(--r-sm);
     background: var(--surface-sunk);
   }
 
   .version p {
     overflow-wrap: anywhere;
-  }
-
-  .version :global(.status) {
-    vertical-align: middle;
   }
 
 </style>

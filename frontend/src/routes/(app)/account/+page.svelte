@@ -403,14 +403,15 @@
     max-width: 34rem;
   }
 
+  /* «Текущий сеанс» — заголовок блока, а не подпись под чертой: разделяет
+     расстояние до предыдущей группы, линия внутри панели рисовала второй
+     контур на уже обведённом листе. */
   .ac__session-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: var(--s4);
-    margin-top: var(--s2);
-    padding-top: var(--s4);
-    border-top: 1px solid var(--line-strong);
+    margin-top: var(--s6);
   }
 
   .ac__session-row h3,

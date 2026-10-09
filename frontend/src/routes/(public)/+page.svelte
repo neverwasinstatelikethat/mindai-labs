@@ -298,8 +298,6 @@
     display: grid;
     align-content: start;
     gap: var(--s3);
-    padding-top: var(--s3);
-    border-top: 1px solid var(--line-strong);
   }
 
   .steps__number {
@@ -316,11 +314,12 @@
     margin: 0;
     padding: 0;
     list-style: none;
-    border-top: 1px solid var(--line);
   }
 
-  .rooms li {
-    border-bottom: 1px solid var(--line);
+  /* Строки раздела разделены одной линией: рамки вокруг списка и под
+     последним пунктом не было бы видно, где список кончается. */
+  .rooms li + li {
+    border-top: 1px solid var(--line);
   }
 
   .rooms a {

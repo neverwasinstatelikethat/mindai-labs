@@ -27,7 +27,7 @@ _GIGACHAT_CONTEXT_WINDOWS: dict[str, int] = {
 _PROMPT_OVERHEAD_TOKENS = 3072
 # Это бюджет доказательств, которые приложение включает в запрос, а не размер
 # окна модели: контекстное окно 128k не означает, что нужно отправлять все 128k.
-_DEFAULT_CONTEXT_TOKEN_BUDGET = 5120
+_DEFAULT_CONTEXT_TOKEN_BUDGET = 12288
 
 # Доверенные источники cookie-запросов (CSRF). Порты контура взяты из диапазона
 # 20000–49000 и выбраны нестандартно: 3000/8000/9090 на рабочих машинах обычно
@@ -98,7 +98,7 @@ class Settings(BaseSettings):
     # Потолок времени ОДНОГО узла. Провайдер считает транспортный таймаут делением
     # всего дедлайна на попытки одного обращения, и без этого потолка один медленный
     # узел выжигал бюджет, оставляя остальные не запущенными (см. agents/workflow.py).
-    agent_node_budget_seconds: float = Field(default=60.0, gt=0, le=600)
+    agent_node_budget_seconds: float = Field(default=120.0, gt=0, le=600)
     # Сколько токенов доказательства помещается в промпт reasoner/critic/improver.
     context_token_budget: int = Field(default=_DEFAULT_CONTEXT_TOKEN_BUDGET, ge=500)
     # Потолок candidate policy в системном промпте: активные правки EvolutionService

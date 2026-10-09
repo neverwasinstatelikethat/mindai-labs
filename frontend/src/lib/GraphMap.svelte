@@ -1,22 +1,18 @@
 <script module lang="ts">
   // Разбор класса данных узла — один на компонент и на страницу-инспектор:
-  // русское имя приходит из контракта (DATA_CLASS_LABELS), пилюля статуса — из
-  // словаря карты в $lib/terms. Сами словари (типы узлов, отношения, слои)
-  // живут там же: локальных карт имён у карты нет.
-  import { MAP_DATA_CLASS_PILL } from './terms';
+  // русское имя приходит из контракта (DATA_CLASS_LABELS). Сами словари (типы
+  // узлов, отношения, слои) живут в $lib/terms: локальных карт имён у карты нет.
   import { DATA_CLASS_LABELS, type DataClass, type GraphNode } from './types';
 
   export interface NodeClass {
     code: DataClass;
     ru: string;
-    pill: 'consensus' | 'hypothesis' | 'disputed';
   }
 
   export function classOf(node: GraphNode): NodeClass {
     return {
       code: node.data_class,
       ru: DATA_CLASS_LABELS[node.data_class],
-      pill: MAP_DATA_CLASS_PILL[node.data_class] ?? 'consensus',
     };
   }
 </script>
@@ -24,31 +20,44 @@
 <script lang="ts">
   // Карта связей читается за два хода.
   //
-  // 1. Обзор областей: названные множества связанных записей (их считает
-  //    сервер, числа берутся из этого же среза). Уровня «весь корпус» у экрана
-  //    нет ни по клику, ни с клавиатуры, ни по ссылке: на поле всегда лежит
-  //    одна названная область. Поиск по названиям записей стоит прямо на
-  //    обзоре и ведёт в область найденной записи.
-  // 2. Цепочки выбранной области: три колонки по роли записи — Источники,
+  // 1. Цепочки выбранной области: три колонки по роли записи — Источники,
   //    Утверждения, Сущности (единственный словарь колонок, см. terms/map.ts).
   //    Из порядка колонок следует главное: почти каждое отношение связывает
   //    соседние колонки, то есть пересекает ровно один промежуток. Длинных
   //    диагоналей через всё поле при такой раскладке не бывает.
+  // 2. Обзор областей: названные множества связанных записей (их считает
+  //    сервер, числа берутся из этого же среза). Уровня «весь корпус» у экрана
+  //    нет ни по клику, ни с клавиатуры, ни по ссылке: на поле всегда лежит
+  //    одна названная область.
+  //
+  // Экран открывается первым ходом: поле связей видно сразу, обзор областей
+  // остаётся вторым нажатием в той же полосе переключения.
+  //
+  // Поиск стоит строкой над полем на обоих уровнях и не является режимом:
+  // совпадение фильтрует поле и печатается списком, а клик по нему ведёт в
+  // область найденной записи. Отдельного фильтра колонок над полем больше нет:
+  // один запрос живёт в одном месте.
   //
   // Запись — строка с полным названием, связь — линия с остриём у цели и
-  // русским именем на линии. Якоря линий измеряются в живом DOM, а не
-  // вычисляются из сетки: прежнее поле привязывало конец штриха к центру
-  // кнопки, тогда как видимый диск лежал на 13–23 px выше, и связи уходили в
-  // пустоту.
+  // русским именем на линии. Чем является знак, подписано в легенде у поля, а
+  // не только за «i». Якоря линий измеряются в живом DOM, а не вычисляются из
+  // сетки: прежнее поле привязывало конец штриха к центру кнопки, тогда как
+  // видимый диск лежал на 13–23 px выше, и связи уходили в пустоту.
+  //
+  // Выбранный объект подсвечивается на поле, повторный клик по той же строке
+  // снимает выбор. Детали открывает не карта: колонка сведений стоит рядом с
+  // полем, и поля карты её не перекрывают.
   //
   // Масштаба, перетаскивания и внутреннего скролла нет: поле растёт с
   // содержимым, прокрутку ведёт документ. Плотность регулируется областью,
   // отбором и «Показать ещё».
   //
   // Методика (способ чтения поля, клавиатура, причина списка связей без линии)
-  // живёт за «i» (InfoDot), а не инлайн. Текстовое чтение обязательно и не
-  // зависит от поля: связи строки печатаются списком под ней на узком экране,
-  // а на широком связи без линии читаются списком под полем.
+  // живёт за «i» (InfoDot). Легенда знаков при этом остаётся у поля: способ
+  // чтения не имеет права быть единственной подсказкой. Текстовое чтение
+  // обязательно и не зависит от поля: на узком экране всё поле читается одной
+  // колонкой, где под записью идут её связи по строке, без карточек и без
+  // решётки кнопок.
   // Клавиатура: Tab по строкам, меткам связей и списку под полем, ← → между
   // колонками, ↑ ↓ по колонке, Home/End край колонки, Enter выбрать, Esc снять.
   // У каждой нарисованной линии есть метка-кнопка (слово или точка), поэтому
@@ -58,18 +67,21 @@
   import type { GraphEdge, GraphSnapshot } from './types';
   import { countOf, num, plural } from './format';
   import {
+    MAP_FIELD_SIGNS,
+    MAP_FIND,
     MAP_INFO_AREAS,
     MAP_INFO_FIELD,
     MAP_INFO_KEYS,
     MAP_INFO_STARTERS,
+    MAP_INSPECTOR,
     MAP_LAYER_GLOSS,
     MAP_LAYER_LABELS,
     MAP_LAYER_ORDER,
+    MAP_LEVELS,
     MAP_LARGEST_AREA,
     MAP_NODE_TYPE_ORDER,
     MAP_NOUN,
     MAP_OVERVIEW_TITLE,
-    MAP_SEARCH,
     MAP_UNNAMED_AREA,
     mapAreaName,
     mapLayerOf,
@@ -80,10 +92,11 @@
     type MapLayer,
   } from './terms';
   import Button from './ui/Button.svelte';
+  import Disclosure from './ui/Disclosure.svelte';
   import Empty from './ui/Empty.svelte';
   import Icon from './ui/Icon.svelte';
   import InfoDot from './ui/InfoDot.svelte';
-  import StatusPill from './ui/StatusPill.svelte';
+  import Segmented from './ui/Segmented.svelte';
 
   interface Props {
     graph: GraphSnapshot;
@@ -148,7 +161,12 @@
   const LAYER_INDEX: Record<MapLayer, number> = { source: 0, claim: 1, entity: 2 };
 
   // ── Состояние ───────────────────────────────────────────────────────────
-  let level = $state<'overview' | 'chain'>('overview');
+  /**
+   * Экран открывается цепочками: поле связей видно сразу, а обзор областей
+   * остаётся вторым нажатием в той же полосе. Прежний вход обзором заставлял
+   * сначала выбрать область, чтобы увидеть хоть какие-то связи.
+   */
+  let level = $state<'overview' | 'chain'>('chain');
   let levelChosen = false;
   /**
    * Область поля, выбранная человеком. Пустая строка означает «ещё не выбрана»,
@@ -156,10 +174,11 @@
    * экрана нет ни по клику, ни с клавиатуры, ни по ссылке.
    */
   let chosenArea = $state('');
-  /** Набросок фильтра цепочек: в отбор уходит после паузы ввода, а не на каждый символ. */
-  let queryDraft = $state('');
-  let query = $state('');
-  /** Набросок поиска на обзоре: та же пауза, свой запрос. */
+  /**
+   * Один поисковый запрос на весь экран: строка над полем. Набросок уходит в
+   * отбор после паузы ввода, а не на каждый символ, и тот же запрос фильтрует
+   * колонки поля.
+   */
   let findDraft = $state('');
   let findQuery = $state('');
   let hiddenTypes = $state<Set<string>>(new Set());
@@ -283,12 +302,16 @@
   const largestArea = $derived(areas[0]?.name ?? MAP_UNNAMED_AREA);
   const activeArea = $derived(chosenArea || largestArea);
 
-  $effect(() => {
-    // Пока человек сам не выбрал уровень, маленький корпус открывается сразу
-    // цепочками: показывать одну карточку «вот ваша единственная область»
-    // значит заставлять кликать ради ничего.
-    if (!levelChosen) level = hasChoice ? 'overview' : 'chain';
-  });
+  /**
+   * Уровень переключает одна полоса: обзор областей остаётся одним нажатием,
+   * но экран открывается полем, а не списком карточек. Одна область — обзора
+   * нет: показывать единственную карточку и заставлять кликать через неё
+   * значит прятать связи за ничего не значащим шагом.
+   */
+  function setLevel(next: string): void {
+    level = next === 'overview' ? 'overview' : 'chain';
+    levelChosen = true;
+  }
 
   const cards = $derived<Area[]>(areas);
   const shownCards = $derived(cards.slice(0, cardsCap));
@@ -304,7 +327,7 @@
       .map((node) => ({ node, links: degree.get(node.id) ?? 0 })),
   );
 
-  // ── Поиск на обзоре ─────────────────────────────────────────────────────
+  // ── Поиск над полем ──────────────────────────────────────────────────────
   /** Результат поиска: записи всей загруженной карты по совпадению названия. */
   const findMatches = $derived.by<GraphNode[]>(() => {
     const q = findQuery.trim().toLowerCase();
@@ -312,10 +335,19 @@
     return graph.nodes.filter((node) => searchHit(node, q));
   });
   const findShown = $derived(findMatches.slice(0, FIND_WINDOW));
+  /** Записи той же области, что на поле: переход в них не меняет поле. */
+  const findInArea = $derived(
+    findMatches.filter((node) => areaOf(node) === activeArea).length,
+  );
 
   function clearFind(): void {
     findDraft = '';
     findQuery = '';
+  }
+
+  /** Совпадение: в него входят и переход в его область, и выбор самой записи. */
+  function openFound(node: GraphNode): void {
+    openNode(node);
   }
 
   // ── Отбор поля ──────────────────────────────────────────────────────────
@@ -340,7 +372,7 @@
   );
 
   const scopedNodes = $derived.by<GraphNode[]>(() => {
-    const q = query.trim().toLowerCase();
+    const q = findQuery.trim().toLowerCase();
     return areaNodes.filter((node) => matches(node, q));
   });
 
@@ -408,7 +440,7 @@
    * Детерминировано: одна и та же область всегда рисуется одинаково.
    */
   const columns = $derived.by<Column[]>(() => {
-    const q = query.trim().toLowerCase();
+    const q = findQuery.trim().toLowerCase();
     const buckets: Record<MapLayer, GraphNode[]> = { source: [], claim: [], entity: [] };
     for (const node of scopedNodes) buckets[mapLayerOf(node.type)].push(node);
 
@@ -489,6 +521,21 @@
   );
 
   const restTotal = $derived(columns.reduce((sum, column) => sum + column.rest, 0));
+
+  /**
+   * Узкий экран читает поле одной колонкой: порядок тот же, что и на широком,
+   * но утверждения идут первыми, потому что вопрос экрана звучит «что заявлено
+   * и откуда», а не «как разложены полосы».
+   */
+  const flatRows = $derived.by<GraphNode[]>(() => {
+    const order: MapLayer[] = ['claim', 'source', 'entity'];
+    const rows: GraphNode[] = [];
+    for (const layer of order) {
+      const column = columns.find((item) => item.layer === layer);
+      if (column) rows.push(...column.rows);
+    }
+    return rows;
+  });
 
   /**
    * Связи области, а не всего корпуса: вне этого множества связи считать
@@ -668,17 +715,9 @@
   });
 
   /**
-   * Поиск и фильтр пересобирают списки не на каждый символ: без паузы каждое
+   * Поиск пересобирает список и поле не на каждый символ: без паузы каждое
    * нажатие перекладывало набор строк под курсором.
    */
-  $effect(() => {
-    const draft = queryDraft;
-    const timer = setTimeout(() => {
-      query = draft;
-    }, 250);
-    return () => clearTimeout(timer);
-  });
-
   $effect(() => {
     const draft = findDraft;
     const timer = setTimeout(() => {
@@ -706,11 +745,23 @@
   });
 
   // ── Действия ────────────────────────────────────────────────────────────
+  /**
+   * Выбор записи повторным кликом по той же строке снимается: человек
+   * возвращается к полю тем же жестом, которым в него входил, и отдельная
+   * кнопка на каждый случай не нужна.
+   */
   function select(node: GraphNode | null): void {
+    if (node && selectedId === node.id) {
+      onselect?.(null);
+      if (edgeId) onpickEdge?.(null);
+      chainOnly = false;
+      announcement = 'Выбор записи снят.';
+      return;
+    }
     onselect?.(node);
     if (node) {
       const count = degree.get(node.id) ?? 0;
-      announcement = `Выбрана запись «${node.label}», ${mapNodeType(node.type)}. Связей: ${countOf(count, MAP_NOUN.link.one, MAP_NOUN.link.few, MAP_NOUN.link.many)}. Доказательства читаются под картой.`;
+      announcement = `Выбрана запись «${node.label}», ${mapNodeType(node.type)}. Связей: ${countOf(count, MAP_NOUN.link.one, MAP_NOUN.link.few, MAP_NOUN.link.many)}. Сведения открыты в колонке рядом с полем.`;
       return;
     }
     // Выбор снят: чип цепочки гаснет вместе с ним, иначе следующее нажатие
@@ -719,7 +770,7 @@
     announcement = 'Выбор записи снят.';
   }
 
-  /** Чип «только цепочка»: на поле остаётся выбранная запись и её соседи. */
+  /** Только цепочка выбранной записи: на поле остаётся она и её соседи. */
   function toggleChain(): void {
     chainOnly = !chainOnly;
     const left = neighbours.get(selectedNode?.id ?? '')?.size ?? 0;
@@ -737,7 +788,7 @@
     onpickEdge?.(edge);
     const from = nodeById.get(edge.source)?.label ?? 'запись вне поля';
     const to = nodeById.get(edge.target)?.label ?? 'запись вне поля';
-    announcement = `Связь «${mapRelationLabel(edge.relation)}»: «${from}» ведёт к «${to}». Описание связи читается под картой.`;
+    announcement = `Связь «${mapRelationLabel(edge.relation)}»: «${from}» ведёт к «${to}». Описание связи открыто в колонке сведений.`;
   }
 
   /** Вход в область: из карточки обзора или из списка крупнейших записей. */
@@ -767,8 +818,7 @@
   }
 
   function resetFilters(): void {
-    queryDraft = '';
-    query = '';
+    clearFind();
     hiddenTypes = new Set();
     announcement = 'Отбор снят: на поле снова вся область.';
   }
@@ -777,7 +827,7 @@
    * Отбор это поиск и виды записей. Потолок «Показать ещё» в счётчик не входит:
    * иначе «Сбросить отбор» всплывал сразу после добавления строк на поле.
    */
-  const hasFilters = $derived(queryDraft.trim() !== '' || hiddenTypes.size > 0);
+  const hasFilters = $derived(findDraft.trim() !== '' || hiddenTypes.size > 0);
 
   /**
    * Текстовое чтение поля: все связи области списком, а не только те, что легли
@@ -797,8 +847,18 @@
     return nodeById.get(id) ?? null;
   }
 
-  /** ← → переводят между колонками, ↑ ↓ — по колонке. */
+  /** ← → переводят между колонками, ↑ ↓ — по колонке; Home/End — её край. */
   function move(current: GraphNode, dx: number, dy: number): boolean {
+    // На узком экране колонок не видно: поле читается одним списком, и по нему
+    // ходят вверх и вниз, а влево-вправо делать нечего.
+    if (narrow) {
+      const at = flatRows.findIndex((node) => node.id === current.id);
+      if (at < 0) return false;
+      const target = flatRows[at + (dy !== 0 ? dy : dx)];
+      if (!target) return false;
+      focusRow(target.id);
+      return true;
+    }
     const at = columns.findIndex((column) => column.rows.some((node) => node.id === current.id));
     if (at < 0) return false;
     if (dx !== 0) {
@@ -833,6 +893,14 @@
       return;
     }
     if (event.key === 'Home' || event.key === 'End') {
+      if (narrow) {
+        const target = event.key === 'Home' ? flatRows[0] : flatRows[flatRows.length - 1];
+        if (target) {
+          event.preventDefault();
+          focusRow(target.id);
+        }
+        return;
+      }
       const column = columns.find((item) => item.rows.some((row) => row.id === node.id));
       const target = column
         ? event.key === 'Home'
@@ -917,14 +985,86 @@
 
 <svelte:window
   onkeydown={(event) => {
-    if (event.key === 'Escape' && (selectedNode || edgeId)) {
-      event.preventDefault();
-      select(null);
+    if (event.key !== 'Escape' || (!selectedNode && !edgeId)) return;
+    // Esc снимает выбор целиком: сначала связь, открытую поверх записи, потом
+    // и запись. Двух разных «закрыть» на экране нет.
+    event.preventDefault();
+    if (edgeId) {
+      onpickEdge?.(null);
+      announcement = 'Выбор связи снят.';
+      return;
     }
+    select(null);
   }}
 />
 
 <section class="map" aria-label="Карта связей корпуса">
+  <!-- Поиск стоит строкой над полем на обоих уровнях: поле связей открыто
+       всегда, а совпадение ведёт в область найденной записи. Режимом экрана
+       поиск больше не называется. -->
+  <div class="map__findrow">
+    <div class="map__find map__find--top">
+      <Icon name="search" size={17} />
+      <input
+        type="search"
+        class="input"
+        bind:value={findDraft}
+        placeholder={MAP_FIND.placeholder}
+        aria-label={MAP_FIND.label}
+      />
+      {#if findDraft !== ''}
+        <button type="button" class="map__find-clear" onclick={clearFind}>
+          {MAP_FIND.clear}
+        </button>
+      {/if}
+    </div>
+
+    {#if findQuery.trim() !== ''}
+      <!-- Слой совпадений над полем: число называет только то, что не влезло,
+           а строка ведёт в область найденной записи. -->
+      <div class="map__findlayer">
+        {#if findMatches.length === 0}
+          <p class="small map__find-empty">{mapSearchEmptyBody(findQuery.trim())}</p>
+        {:else}
+          <p class="micro muted">{mapSearchShownOf(findShown.length, findMatches.length, findQuery.trim())}</p>
+          <ul class="map__found" aria-label={MAP_FIND.list}>
+            {#each findShown as node (node.id)}
+              <li>
+                <button
+                  type="button"
+                  class="map__found-row"
+                  aria-pressed={selectedId === node.id}
+                  onclick={() => openFound(node)}
+                >
+                  <span class="map__found-type">{mapNodeType(node.type)}</span>
+                  <span class="map__found-name">{node.label}</span>
+                  {#if level === 'chain' && areaOf(node) !== activeArea}
+                    <span class="micro muted map__found-elsewhere">{MAP_FIND.elsewhere}</span>
+                  {/if}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    {/if}
+  </div>
+
+  <!-- Уровень поля переключается той же полосой, что и фасеты находок: обзор
+       областей и цепочки — два вида одного поля, а не два действия. -->
+  {#if hasChoice}
+    <Segmented
+      class="map__levels"
+      label={MAP_LEVELS.group}
+      items={[
+        { value: 'overview', label: MAP_LEVELS.overview },
+        { value: 'chain', label: MAP_LEVELS.chain },
+      ]}
+      value={level}
+      onchange={setLevel}
+    />
+  {/if}
+
   {#if level === 'overview'}
     <!-- Уровень 1: где искать. Экран остаётся одного размера и на 6 записях,
          и на 6 тысячах: дальше идут области, а не весь граф. -->
@@ -1005,12 +1145,6 @@
          человек настраивает список до того, как начинает его читать. -->
     <div class="map__bar" role="group" aria-label="Отбор записей на поле">
       <nav class="map__path" aria-label="Уровень карты">
-        {#if hasChoice}
-          <button type="button" class="map__path-back" onclick={backToOverview}>
-            <Icon name="chevronLeft" size={15} />
-            {MAP_OVERVIEW_TITLE}
-          </button>
-        {/if}
         <h2 class="h4 map__path-name" title={activeArea}>{activeArea}</h2>
         <p class="micro muted map__path-count">
           в отборе <span class="num">
@@ -1022,35 +1156,27 @@
         </p>
       </nav>
 
-      <div class="map__find">
-        <Icon name="search" size={17} />
-        <input
-          type="search"
-          class="input"
-          bind:value={queryDraft}
-          placeholder={MAP_SEARCH.filterPlaceholder}
-          aria-label={MAP_SEARCH.filterLabel}
-        />
-      </div>
-
       {#if legend.length > 1}
-        <!-- Все виды включены по умолчанию, поэтому чипы спокойные: тёмным
-             становится только то, что человек выключил, и выключенное названо
-             словом, а не одним цветом. -->
-        <div class="map__types" role="group" aria-label="Виды записей на поле">
+        <!-- Отбор по видам: строки с тоном-фоном, а не обведённые плашки. Все
+             виды включены по умолчанию, поэтому гаснет только выключенное, и он
+             назван словом, а не одним цветом. -->
+        <ul class="map__types" role="group" aria-label="Виды записей на поле">
           {#each legend as item (item.type)}
-            <Button
-              class={`map__type-button${item.on ? '' : ' map__type-button--off'}`}
-              size="sm"
-              variant="quiet"
-              onclick={() => toggleType(item.type)}
-            >
-              {item.label}
-              <span class="num">{item.count}</span>
-              {#if !item.on}<span class="map__type-off">скрыт</span>{/if}
-            </Button>
+            <li>
+              <button
+                type="button"
+                class="map__type"
+                class:map__type--off={!item.on}
+                aria-pressed={item.on}
+                onclick={() => toggleType(item.type)}
+              >
+                <span class="map__type-name">{item.label}</span>
+                <span class="num">{item.count}</span>
+                {#if !item.on}<span class="map__type-off">скрыт</span>{/if}
+              </button>
+            </li>
           {/each}
-        </div>
+        </ul>
       {/if}
     </div>
 
@@ -1083,8 +1209,12 @@
             <Button variant={chainOnly ? 'ink' : 'quiet'} current={chainOnly} onclick={toggleChain}>
               {chainOnly ? 'Показать всю область' : 'Показать только цепочку'}
             </Button>
-            <Button href="#evidence" variant="quiet" size="sm">К доказательствам</Button>
-            <Button variant="ghost" size="sm" onclick={() => select(null)}>Снять выбор</Button>
+            <!-- Повторный клик по выбранной строке снимает выбор, а «Снять
+                 выбор» на экране один: он живёт в колонке сведений. Сюда до
+                 колонки надо дотянуться, когда она не справа, а под полем. -->
+            <span class="map__to-insp">
+              <Button href="#inspector" variant="quiet" size="sm">{MAP_INSPECTOR.details}</Button>
+            </span>
           </div>
         </div>
       {:else}
@@ -1093,8 +1223,103 @@
         </p>
       {/if}
 
+      <!-- Легенда знаков стоит у поля и всегда: чем является знак, человек
+           видит до того, как начал искать ответ за «i». -->
+      <ul class="map__signs" aria-label="Знаки поля">
+        {#each MAP_FIELD_SIGNS as item (item.sign)}
+          <li class="map__sign">
+            <span class="map__sign-mark map__sign-mark--{item.sign}" aria-hidden="true"></span>
+            {item.label}
+          </li>
+        {/each}
+      </ul>
+
       <div class="chain-field" bind:this={fieldEl}>
-        {#if !narrow}
+        {#if narrow}
+          <!-- Узкий экран: одна колонка. Запись, под ней её связи по строке,
+               без карточек вокруг каждой строки и без решётки кнопок. Отношений
+               на линиях здесь нет, поэтому связи печатаются словами. -->
+          <ul class="chain-list">
+            {#each flatRows as node (node.id)}
+              {@const rels = rowRels(node)}
+              {@const layer = MAP_LAYER_LABELS[mapLayerOf(node.type)]}
+              <li
+                class="chain-item"
+                class:chain-item--on={selectedId === node.id}
+                class:chain-item--near={selectedNode != null && neighbourIds.has(node.id)}
+              >
+                <button
+                  type="button"
+                  class="chain-row"
+                  data-chain-id={node.id}
+                  aria-pressed={selectedId === node.id}
+                  aria-label="{layer}, {mapNodeType(node.type)}: {node.label}. Связей: {degree.get(node.id) ?? 0}."
+                  onclick={() => select(node)}
+                  onkeydown={(event) => onRowKeydown(event, node)}
+                >
+                  <span class="chain-row__kind">{mapNodeType(node.type)}</span>
+                  <span class="chain-row__label">{node.label}</span>
+                  <span class="micro muted">
+                    {countOf(
+                      degree.get(node.id) ?? 0,
+                      MAP_NOUN.link.one,
+                      MAP_NOUN.link.few,
+                      MAP_NOUN.link.many,
+                    )}
+                  </span>
+                </button>
+
+                {#if rels.out.length > 0 || rels.back.length > 0}
+                  <ul class="chain-rels">
+                    {#each rels.out as edge (edge.id)}
+                      <li>
+                        <button
+                          type="button"
+                          class="chain-rel"
+                          aria-pressed={edgeId === edge.id}
+                          onclick={() => pick(edge)}
+                        >
+                          <span class="chain-rel__word">{labelFor(edge)}</span>
+                          <span class="chain-rel__to">
+                            ведёт к: {rowOf(edge.target)?.label ?? 'запись вне поля'}
+                          </span>
+                        </button>
+                      </li>
+                    {/each}
+                    {#each rels.back as edge (edge.id)}
+                      <li>
+                        <button
+                          type="button"
+                          class="chain-rel"
+                          aria-pressed={edgeId === edge.id}
+                          onclick={() => pick(edge)}
+                        >
+                          <span class="chain-rel__word">{labelFor(edge)}</span>
+                          <span class="chain-rel__to">
+                            исходит от: {rowOf(edge.source)?.label ?? 'запись вне поля'}
+                          </span>
+                        </button>
+                      </li>
+                    {/each}
+                  </ul>
+                  {#if rels.hidden > 0}
+                    <Button variant="ghost" size="sm" onclick={() => openRowRels(node.id)}>
+                      Показать остальные связи
+                      <span class="num">
+                        {countOf(
+                          rels.hidden,
+                          MAP_NOUN.link.one,
+                          MAP_NOUN.link.few,
+                          MAP_NOUN.link.many,
+                        )}
+                      </span>
+                    </Button>
+                  {/if}
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {:else}
           <svg
             class="chain-links"
             width={box.w}
@@ -1142,122 +1367,70 @@
               <path class="chain-hit" d={row.d} onclick={() => pick(row.edge)} aria-hidden="true" />
             {/each}
           </svg>
-        {/if}
 
-        <div class="chain-grid">
-          {#each columns as column (column.layer)}
-            <section class="chain-col" aria-label={column.label}>
-              <header class="chain-col__head">
-                <h3 class="h4">{column.label}</h3>
-                <p class="chain-col__count micro muted">
-                  показано <span class="num">{column.rows.length}</span>
-                  {#if column.rest > 0}
-                    из <span class="num">{column.rows.length + column.rest}</span>
-                  {/if}
-                </p>
-                <p class="micro muted">{column.gloss}</p>
-              </header>
+          <div class="chain-grid">
+            {#each columns as column (column.layer)}
+              <section class="chain-col" aria-label={column.label}>
+                <header class="chain-col__head">
+                  <h3 class="h4">{column.label}</h3>
+                  <p class="chain-col__count micro muted">
+                    показано <span class="num">{column.rows.length}</span>
+                    {#if column.rest > 0}
+                      из <span class="num">{column.rows.length + column.rest}</span>
+                    {/if}
+                  </p>
+                  <p class="micro muted">{column.gloss}</p>
+                </header>
 
-              {#if column.rows.length === 0}
-                <p class="micro muted chain-col__none">В отборе записей этого слоя нет.</p>
-              {:else}
-                {#each column.rows as node (node.id)}
-                  {@const rels = rowRels(node)}
-                  <div
-                    class="chain-item"
-                    class:chain-item--on={selectedId === node.id}
-                    class:chain-item--near={selectedNode != null && neighbourIds.has(node.id)}
-                    class:chain-item--dim={selectedNode != null &&
-                      selectedId !== node.id &&
-                      !neighbourIds.has(node.id)}
-                  >
-                    <button
-                      type="button"
-                      class="chain-row"
-                      data-chain-id={node.id}
-                      aria-pressed={selectedId === node.id}
-                      aria-label="{column.label}, {mapNodeType(node.type)}: {node.label}. Связей: {degree.get(node.id) ?? 0}."
-                      onclick={() => select(node)}
-                      onkeydown={(event) => onRowKeydown(event, node)}
+                {#if column.rows.length === 0}
+                  <p class="micro muted chain-col__none">В отборе записей этого слоя нет.</p>
+                {:else}
+                  {#each column.rows as node (node.id)}
+                    <div
+                      class="chain-item"
+                      class:chain-item--on={selectedId === node.id}
+                      class:chain-item--near={selectedNode != null && neighbourIds.has(node.id)}
+                      class:chain-item--dim={selectedNode != null &&
+                        selectedId !== node.id &&
+                        !neighbourIds.has(node.id)}
                     >
-                      <span class="chain-row__kind">{mapNodeType(node.type)}</span>
-                      <span class="chain-row__label">{node.label}</span>
-                      <span class="chain-row__meta">
-                        <span class="micro muted">
-                          {countOf(
-                            degree.get(node.id) ?? 0,
-                            MAP_NOUN.link.one,
-                            MAP_NOUN.link.few,
-                            MAP_NOUN.link.many,
-                          )}
-                        </span>
-                        <!-- Дробную уверенность модели на строке поля не печатают:
-                             у неё нет калиброванного смысла, она читается за «i»
-                             в инспекторе вместе с оговоркой о её происхождении. -->
-                        {#if node.data_class !== 'public'}
-                          <StatusPill status={classOf(node).pill} label={classOf(node).ru} />
-                        {/if}
-                      </span>
-                    </button>
-
-                    {#if narrow && (rels.out.length > 0 || rels.back.length > 0)}
-                      <!-- Текстовое чтение строки: на узком экрана линии нет,
-                           поэтому отношения печатаются словами под каждой
-                           строкой, а не вместо неё. -->
-                      <ul class="chain-rels">
-                        {#each rels.out as edge (edge.id)}
-                          <li>
-                            <button
-                              type="button"
-                              class="chain-rel"
-                              aria-pressed={edgeId === edge.id}
-                              onclick={() => pick(edge)}
-                            >
-                              <span class="chain-rel__word">{labelFor(edge)}</span>
-                              <span class="chain-rel__to">
-                                ведёт к: {rowOf(edge.target)?.label ?? 'запись вне поля'}
-                              </span>
-                            </button>
-                          </li>
-                        {/each}
-                        {#each rels.back as edge (edge.id)}
-                          <li>
-                            <button
-                              type="button"
-                              class="chain-rel"
-                              aria-pressed={edgeId === edge.id}
-                              onclick={() => pick(edge)}
-                            >
-                              <span class="chain-rel__word">{labelFor(edge)}</span>
-                              <span class="chain-rel__to">
-                                исходит от: {rowOf(edge.source)?.label ?? 'запись вне поля'}
-                              </span>
-                            </button>
-                          </li>
-                        {/each}
-                      </ul>
-                      {#if rels.hidden > 0}
-                        <Button variant="ghost" size="sm" onclick={() => openRowRels(node.id)}>
-                          Показать остальные связи
-                          <span class="num">
+                      <button
+                        type="button"
+                        class="chain-row"
+                        data-chain-id={node.id}
+                        aria-pressed={selectedId === node.id}
+                        aria-label="{column.label}, {mapNodeType(node.type)}: {node.label}. Связей: {degree.get(node.id) ?? 0}."
+                        onclick={() => select(node)}
+                        onkeydown={(event) => onRowKeydown(event, node)}
+                      >
+                        <span class="chain-row__kind">{mapNodeType(node.type)}</span>
+                        <span class="chain-row__label">{node.label}</span>
+                        <span class="chain-row__meta">
+                          <span class="micro muted">
                             {countOf(
-                              rels.hidden,
+                              degree.get(node.id) ?? 0,
                               MAP_NOUN.link.one,
                               MAP_NOUN.link.few,
                               MAP_NOUN.link.many,
                             )}
                           </span>
-                        </Button>
-                      {/if}
-                    {/if}
-                  </div>
-                {/each}
-              {/if}
-            </section>
-          {/each}
-        </div>
+                          <!-- Дробную уверенность модели на строке поля не печатают:
+                               у неё нет калиброванного смысла, она читается за «i»
+                               в колонке сведений вместе с оговоркой о происхождении. -->
+                          {#if node.data_class !== 'public'}
+                            <!-- Класс данных — доступ, а не состояние проверки:
+                                 тон статуса врал бы, что материал оспорен. -->
+                            <span class="chain-row__class">{classOf(node).ru}</span>
+                          {/if}
+                        </span>
+                      </button>
+                    </div>
+                  {/each}
+                {/if}
+              </section>
+            {/each}
+          </div>
 
-        {#if !narrow}
           <div class="chain-marks">
             {#each marks as mark (mark.edge.id)}
               <button
@@ -1298,54 +1471,59 @@
         </div>
       {/if}
 
-      {#if readEdges.length > 0}
-        <details class="acc map__other">
-          <summary class="acc__head">
-            <span>Связи области без линии на поле</span>
-            <span class="num">
-              {countOf(readEdges.length, MAP_NOUN.link.one, MAP_NOUN.link.few, MAP_NOUN.link.many)}
-            </span>
-          </summary>
-          <div class="acc__body">
-            <p class="micro muted">
-              На линию встаёт только отношение между соседними колонками: здесь
-              остальные связи области.
-            </p>
-            <ul class="map__other-list">
-              {#each shownLinks as edge (edge.id)}
-                <li>
-                  <button type="button" class="map__jump" onclick={() => select(rowOf(edge.source))}>
-                    {rowOf(edge.source)?.label ?? 'запись вне поля'}
-                  </button>
-                  <button
-                    type="button"
-                    class="map__word"
-                    aria-pressed={edgeId === edge.id}
-                    onclick={() => pick(edge)}
-                  >
-                    <span>{labelFor(edge)}, ведёт к</span>
-                  </button>
-                  <button type="button" class="map__jump" onclick={() => select(rowOf(edge.target))}>
-                    {rowOf(edge.target)?.label ?? 'запись вне поля'}
-                  </button>
-                </li>
-              {/each}
-            </ul>
-            {#if !linksAll && readEdges.length > shownLinks.length}
-              <Button variant="quiet" size="sm" onclick={() => (linksAll = true)}>
-                Показать все
-                <span class="num">
-                  {countOf(
-                    readEdges.length,
-                    MAP_NOUN.link.one,
-                    MAP_NOUN.link.few,
-                    MAP_NOUN.link.many,
-                  )}
-                </span>
-              </Button>
-            {/if}
-          </div>
-        </details>
+      {#if readEdges.length > 0 && !narrow}
+        <!-- Раскрытие ведёт примитив: нативный маркер рисует браузер, и он не
+             наследует ни кегль, ни ритм системы. На узком экране список не
+             нужен: там связи каждой строки уже напечатаны под ней. -->
+        <Disclosure
+          id="map-other-links"
+          title="Связи области без линии на поле"
+          summary={countOf(
+            readEdges.length,
+            MAP_NOUN.link.one,
+            MAP_NOUN.link.few,
+            MAP_NOUN.link.many,
+          )}
+          bodyClass="map__other"
+        >
+          <p class="micro muted">
+            На линию встаёт только отношение между соседними колонками: здесь
+            остальные связи области.
+          </p>
+          <ul class="map__other-list">
+            {#each shownLinks as edge (edge.id)}
+              <li>
+                <button type="button" class="map__jump" onclick={() => select(rowOf(edge.source))}>
+                  {rowOf(edge.source)?.label ?? 'запись вне поля'}
+                </button>
+                <button
+                  type="button"
+                  class="map__word"
+                  aria-pressed={edgeId === edge.id}
+                  onclick={() => pick(edge)}
+                >
+                  <span>{labelFor(edge)}, ведёт к</span>
+                </button>
+                <button type="button" class="map__jump" onclick={() => select(rowOf(edge.target))}>
+                  {rowOf(edge.target)?.label ?? 'запись вне поля'}
+                </button>
+              </li>
+            {/each}
+          </ul>
+          {#if !linksAll && readEdges.length > shownLinks.length}
+            <Button variant="quiet" size="sm" onclick={() => (linksAll = true)}>
+              Показать все
+              <span class="num">
+                {countOf(
+                  readEdges.length,
+                  MAP_NOUN.link.one,
+                  MAP_NOUN.link.few,
+                  MAP_NOUN.link.many,
+                )}
+              </span>
+            </Button>
+          {/if}
+        </Disclosure>
       {/if}
 
       <div class="map__legend">
@@ -1403,26 +1581,28 @@
     display: flex;
   }
 
+  /* Карточка области — объект: её держат тон, подъём и радиус, а не обводка.
+     Обведённая плашка на поле из шести плашек не читалась как выбор. */
   .card {
     display: flex;
     flex-direction: column;
     gap: var(--s2);
     width: 100%;
     padding: var(--s5);
-    border: 1px solid var(--line);
+    border: 0;
     border-radius: var(--r-lg);
-    background: var(--surface);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-soft);
     color: var(--ink);
     text-align: start;
     cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease-soft),
-      box-shadow var(--dur-fast) var(--ease-soft), transform var(--dur-fast) var(--ease-soft);
+    transition: box-shadow var(--dur-fast) var(--ease-soft),
+      transform var(--dur-fast) var(--ease-soft);
   }
 
   .card:hover {
-    border-color: var(--line-strong);
     transform: translateY(-2px);
-    box-shadow: var(--shadow-soft);
+    box-shadow: var(--shadow-lift);
   }
 
   .card:focus-visible {
@@ -1438,13 +1618,10 @@
   }
 
   /* Метка крупнейшей области: она объясняет, почему вход по умолчанию ведёт
-     именно сюда, и не просит считать числа глазами. */
+     именно сюда. Плашки не нужно: одно слово подписью под названием. */
   .card__tag {
     align-self: flex-start;
-    padding: 2px var(--s3);
-    border-radius: var(--r-pill);
-    background: var(--sage);
-    color: var(--ink-2);
+    color: var(--ink-3);
     font-size: var(--t-micro);
   }
 
@@ -1470,12 +1647,15 @@
     font-size: var(--t-small);
   }
 
+  /* Список крупнейших записей: строки держит расстояние, а не линия между
+     ними. Разделитель живёт в плотной таблице, здесь таблицы нет. */
   .starters {
     list-style: none;
     margin: 0;
     padding: 0;
     display: flex;
     flex-direction: column;
+    gap: var(--s1);
   }
 
   .starter {
@@ -1484,9 +1664,9 @@
     gap: var(--s3);
     width: 100%;
     min-height: 44px;
-    padding: var(--s2) 0;
+    padding: var(--s2) var(--s3);
     border: 0;
-    border-top: 1px solid var(--line);
+    border-radius: var(--r-sm);
     background: none;
     color: var(--ink);
     font: inherit;
@@ -1494,13 +1674,11 @@
     text-align: start;
     cursor: pointer;
     overflow-wrap: anywhere;
-  }
-
-  .starters li:first-child .starter {
-    border-top: 0;
+    transition: background var(--dur-fast) var(--ease-soft);
   }
 
   .starter:hover {
+    background: var(--surface-sunk);
     color: var(--action-ink);
   }
 
@@ -1549,25 +1727,37 @@
     overflow-wrap: anywhere;
   }
 
+  /* Возврат к обзору — действие внутри полосы поля: его держит тон-фон, а не
+     обводка. Двойная обводка вокруг кнопки и вокруг поля не читалась бы. */
   .map__path-back {
     display: inline-flex;
     align-items: center;
     gap: var(--s1);
     min-height: 44px;
-    padding: 0 var(--s3);
-    border: 1px solid var(--line);
+    padding: 0 var(--s4);
+    border: 0;
     border-radius: var(--r-pill);
-    background: var(--surface);
+    background: var(--surface-sunk);
     color: var(--ink-2);
     font: inherit;
     font-size: var(--t-small);
     cursor: pointer;
     align-self: center;
+    transition: background var(--dur-fast) var(--ease-soft),
+      color var(--dur-fast) var(--ease-soft);
   }
 
   .map__path-back:hover {
     color: var(--ink);
-    border-color: var(--line-strong);
+    background: var(--surface);
+  }
+
+  /* Строка поиска над полем: шире всего поля, потому что поиск относится ко
+     всему экрану, а не к одной его колонке. */
+  .map__findrow {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
   }
 
   .map__find {
@@ -1575,11 +1765,17 @@
     align-items: center;
     gap: var(--s3);
     flex: 1 1 240px;
-    min-width: 200px;
+    min-width: 0;
     padding-inline: var(--s4);
     border-radius: var(--r-pill);
     background: var(--surface-sunk);
     color: var(--ink-3);
+  }
+
+  .map__find--top {
+    flex: none;
+    width: 100%;
+    padding-block: var(--s1);
   }
 
   .map__find .input {
@@ -1590,25 +1786,143 @@
     padding-inline-start: 0;
   }
 
+  /* Сброс поиска — текстовое действие, а не вторая кнопка рядом с полем ввода. */
+  .map__find-clear {
+    flex: none;
+    border: 0;
+    background: none;
+    padding: var(--s2) 0;
+    color: var(--action-ink);
+    font: inherit;
+    font-size: var(--t-small);
+    cursor: pointer;
+  }
+
+  .map__find-clear:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  /* Слой совпадений: поднятый объект поверх поля, а не ещё одна секция. */
+  .map__findlayer {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    padding: var(--s4);
+    border-radius: var(--r-lg);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-soft);
+  }
+
+  .map__findlayer p {
+    margin: 0;
+  }
+
+  .map__find-empty {
+    color: var(--ink-2);
+  }
+
+  .map__found {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .map__found-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    width: 100%;
+    min-height: 44px;
+    padding: var(--s2) var(--s3);
+    border: 0;
+    border-radius: var(--r-sm);
+    background: none;
+    color: var(--ink);
+    font: inherit;
+    font-size: var(--t-small);
+    text-align: start;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-soft);
+  }
+
+  .map__found-row:hover {
+    background: var(--surface-sunk);
+  }
+
+  .map__found-row[aria-pressed='true'] {
+    background: var(--sage);
+  }
+
+  .map__found-type {
+    flex: none;
+    color: var(--ink-3);
+    font-size: var(--t-micro);
+  }
+
+  .map__found-name {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .map__found-elsewhere {
+    flex: none;
+    margin-inline-start: auto;
+    color: var(--ink-3);
+  }
+
+  /* Отбор по видам записей: строки с тоном-фоном. Обведённые плашки фильтров
+     запрещены: они удваивали границу там, где нужно одно слово с числом. */
   .map__types {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--s2);
-  }
-
-  .map__types :global(.map__type-button .num) {
+    gap: var(--s1);
+    list-style: none;
+    margin: 0;
     padding: 0;
-    border-radius: 0;
-    background: transparent;
-    color: inherit;
-    font-weight: 600;
   }
 
-  /* Выключенный вид: светлее и названо словом. Включённый чип остаётся
-     обычным — тёмная плашка на каждом чипе превращает отбор в три кнопки. */
-  .map__types :global(.map__type-button--off) {
+  .map__types li {
+    display: flex;
+  }
+
+  /* Ряд фильтров читается списком слов, а не рядом плашек: закрашено только
+     исключение, поэтому глаз сразу цепляет то, что спрятано. */
+  .map__type {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s2);
+    min-height: 36px;
+    padding: 0 var(--s3);
+    border: 0;
+    border-radius: var(--r-sm);
+    background: none;
+    color: var(--ink-2);
+    font: inherit;
+    font-size: var(--t-small);
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-soft),
+      color var(--dur-fast) var(--ease-soft);
+  }
+
+  .map__type:hover {
+    background: var(--surface-sunk);
+    color: var(--ink);
+  }
+
+  .map__type .num {
+    font-family: var(--font-data);
+    font-weight: 600;
+    color: inherit;
+  }
+
+  /* Выключенный вид гаснет и называется словом: один только цвет не решение,
+     а обводка вокруг плашки вернула бы двойную границу на поле. */
+  .map__type--off {
+    background: var(--surface-sunk);
     color: var(--ink-4);
-    border-color: var(--line);
   }
 
   .map__type-off {
@@ -1617,6 +1931,8 @@
     color: var(--ink-4);
   }
 
+  /* Полоса выбранной записи держится тоном и подъёмом: тень-обводка
+     `--shadow-inset` рисовала рамку вокруг строки действий. */
   .map__focus {
     display: flex;
     align-items: center;
@@ -1625,8 +1941,8 @@
     flex-wrap: wrap;
     padding: var(--s3) var(--s4);
     border-radius: var(--r-md);
-    background: var(--surface);
-    box-shadow: var(--shadow-inset);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-soft);
   }
 
   .map__focus p {
@@ -1640,14 +1956,84 @@
     color: var(--ink-3);
   }
 
+  /* Прыжок к колонке сведений нужен только там, где колонка стоит под полем:
+     на широком экране она справа и всегда перед глазами. */
+  .map__to-insp {
+    display: none;
+  }
+
+  @media (min-width: 900px) and (max-width: 1119px) {
+    .map__to-insp {
+      display: inline-flex;
+    }
+  }
+
+  /* Легенда знаков у поля: каждый знак нарисован тем же, чем он стоит на поле,
+     поэтому подпись не просит верить ей на слово. */
+  .map__signs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s2) var(--s5);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: var(--t-micro);
+    color: var(--ink-3);
+  }
+
+  .map__sign {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s2);
+  }
+
+  .map__sign-mark {
+    flex: none;
+    display: inline-block;
+  }
+
+  /* Строка означает запись: короткий отрезок поверхности с тенью. */
+  .map__sign-mark--row {
+    width: 22px;
+    height: 8px;
+    border-radius: var(--r-xs);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-soft);
+  }
+
+  /* Линия означает связь. */
+  .map__sign-mark--line {
+    width: 24px;
+    height: 2px;
+    border-radius: var(--r-pill);
+    background: var(--edge);
+  }
+
+  /* Остриё показывает направление к цели. Знак вырезан формой, а не собран из
+     рамок: рамка здесь была бы декором, а не границей взаимодействия. */
+  .map__sign-mark--arrow {
+    width: 10px;
+    height: 10px;
+    background: var(--edge-active);
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
+  }
+
+  /* Точка означает связь без подписи. */
+  .map__sign-mark--dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--edge);
+  }
+
   /* ── Поле: колонки и линии ────────────────────────────────────────────── */
   /* Поле растёт вместе с содержимым: внутреннего скролла нет, прокрутку ведёт
-     документ. */
+     документ. Границу поля держит тон, а не обводка. */
   .chain-field {
     position: relative;
     padding: var(--s5);
     border-radius: var(--r-xl);
-    border: 1px solid var(--line-soft);
     background: var(--surface-sunk);
   }
 
@@ -1723,6 +2109,8 @@
     min-width: 0;
   }
 
+  /* Строка поля — объект, который можно выбрать: её держат тон и подъём.
+     Обводка вокруг каждой из двадцати строк превращала поле в решётку рамок. */
   .chain-row {
     display: flex;
     flex-direction: column;
@@ -1731,20 +2119,19 @@
     width: 100%;
     min-width: 0;
     padding: var(--s3) var(--s4);
-    border: 1px solid var(--line);
+    border: 0;
     border-radius: var(--r-md);
-    background: var(--surface);
+    background: var(--surface-raised);
     color: var(--ink);
     text-align: start;
     cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease-soft),
+    transition: background var(--dur-fast) var(--ease-soft),
       box-shadow var(--dur-fast) var(--ease-soft), transform var(--dur-fast) var(--ease-soft);
   }
 
   .chain-row:hover {
-    border-color: var(--line-strong);
     transform: translateY(-1px);
-    box-shadow: var(--shadow-soft);
+    box-shadow: var(--shadow-lift);
   }
 
   .chain-row:focus-visible {
@@ -1755,6 +2142,12 @@
   .chain-row__kind {
     font-size: var(--t-micro);
     color: var(--ink-3);
+  }
+
+  /* Класс данных — слабее типа записи: он меняет доступ, а не смысл строки. */
+  .chain-row__class {
+    font-size: var(--t-micro);
+    color: var(--ink-4);
   }
 
   .chain-row__label {
@@ -1771,21 +2164,23 @@
     flex-wrap: wrap;
   }
 
+  /* Выбор читается сценой, а не вторым контуром вокруг рамки: строка залита
+     цветом поля и поднята. */
   .chain-item--on .chain-row {
-    border-color: var(--action-ink);
-    box-shadow: 0 0 0 1px var(--action-ink), var(--shadow-lift);
+    background: var(--sage-deep);
+    box-shadow: var(--shadow-lift);
   }
 
   .chain-item--near .chain-row {
-    border-color: var(--edge-active);
+    background: var(--surface);
+    box-shadow: var(--shadow-soft);
   }
 
   /* Второй план не гасят прозрачностью: вместе с ней текст строки падал до
      2.7:1, а подпись связи до 1.5:1. Гаснет токеном цвета, и текст остаётся
      не ниже нормы. */
   .chain-item--dim .chain-row {
-    border-color: var(--line-soft);
-    background: var(--surface-raised);
+    background: var(--surface-sunk);
   }
 
   .chain-item--dim .chain-row__label {
@@ -1843,14 +2238,21 @@
     pointer-events: none;
   }
 
+  /* Подпись связи на линии держится тоном и подъёмом: обводка вокруг слова
+     стояла поверх линии и удваивала границу там, где знак один. Высота —
+     32 px: метка стоит на линии и в неё надо попасть, не целясь в текст. */
   .chain-mark {
     position: absolute;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     transform: translate(-50%, -50%);
     max-width: clamp(76px, 9vw, 150px);
-    padding: 2px var(--s3);
-    border: 1px solid var(--line);
+    min-height: 32px;
+    padding: 0 var(--s3);
+    border: 0;
     border-radius: var(--r-pill);
-    background: var(--surface);
+    background: var(--surface-raised);
     color: var(--ink-2);
     font-family: var(--font-ui);
     font-size: var(--t-micro);
@@ -1864,21 +2266,22 @@
 
   .chain-mark:hover {
     color: var(--ink);
-    border-color: var(--line-strong);
+    box-shadow: var(--shadow-lift);
   }
 
   /* Метка без слова: точка на линии. Доступ к связи не прячется у зрения.
-     Цель остаётся 20x20, видимый кружок рисует псевдоэлемент. */
+     Цель — 32x32, видимый кружок 8 px рисует псевдоэлемент: на линии в
+     точку меньше попасть труднее, чем в слово. */
   .chain-mark--dot {
     display: grid;
     place-items: center;
-    width: 20px;
-    height: 20px;
-    max-width: 20px;
+    width: 32px;
+    height: 32px;
+    max-width: 32px;
     padding: 0;
-    border-color: transparent;
     background: transparent;
     box-shadow: none;
+    border-radius: 50%;
   }
 
   .chain-mark--dot::after {
@@ -1891,18 +2294,13 @@
 
   .chain-mark--dot:hover,
   .chain-mark--dot:focus-visible {
-    border-color: var(--line-strong);
-    background: var(--surface);
-  }
-
-  .chain-mark--dot.chain-mark--on {
-    border-color: var(--line-strong);
-    background: var(--surface);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-soft);
   }
 
   .chain-mark--on {
     color: var(--ink);
-    border-color: var(--action-ink);
+    background: var(--lavender);
     box-shadow: var(--shadow-lift);
   }
 
@@ -1910,7 +2308,6 @@
      исчезала целиком. */
   .chain-mark--dim {
     color: var(--ink-2);
-    border-color: var(--line-soft);
     background: var(--surface-raised);
     box-shadow: none;
   }
@@ -1965,7 +2362,7 @@
 
   .map__word[aria-pressed='true'] {
     color: var(--ink);
-    box-shadow: inset 0 0 0 1px var(--action-ink);
+    background: var(--sage);
   }
 
   .map__jump {
@@ -2009,7 +2406,19 @@
     color: var(--ink-3);
   }
 
-  /* Отношения под строкой — вертикальное чтение на узком экране. */
+  /* Отношения под строкой — вертикальное чтение на узком экране. Отступ
+     говорит о вложенности, линия-стержень здесь не нужна: связей у строки и
+     так по одной строке. */
+  .chain-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    position: relative;
+  }
+
   .chain-rels {
     list-style: none;
     margin: 0;
@@ -2017,11 +2426,14 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    border-inline-start: 1px solid var(--line);
   }
 
+  /* Одна связь — одна строка текста: отношение и вторая запись читаются в
+     той же строке, а не двумя плашками под кнопкой. */
   .chain-rel {
-    display: block;
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
     width: 100%;
     min-height: 44px;
     padding: var(--s2);
@@ -2040,28 +2452,22 @@
   }
 
   .chain-rel[aria-pressed='true'] {
-    box-shadow: inset 0 0 0 1px var(--action-ink);
+    background: var(--sage);
   }
 
-  /* Отношение и вторая запись читаются двумя строками: на ширине телефона имя
-     отношения вместе с названием не помещается, и название разваливалось по
-     буквам. */
   .chain-rel__word {
+    flex: none;
     color: var(--ink-3);
   }
 
   .chain-rel__to {
-    display: block;
     min-width: 0;
-    overflow-wrap: break-word;
+    overflow-wrap: anywhere;
   }
 
+  /* Узкий экран: поле теряет внутренние отступы широкой раскладки, потому что
+     колонок на нём нет. */
   @media (max-width: 900px) {
-    .chain-grid {
-      grid-template-columns: minmax(0, 1fr);
-      row-gap: var(--s5);
-    }
-
     .chain-field {
       padding: var(--s4);
     }

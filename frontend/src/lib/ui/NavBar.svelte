@@ -9,6 +9,7 @@
   import type { IconName } from './icons';
   import Sheet from './Sheet.svelte';
   import Button from './Button.svelte';
+  import { placeSegIndicator, segActive } from './seg-indicator';
 
   export interface NavLink {
     href: string;
@@ -40,18 +41,10 @@
   // перекрашивает пункты по одному.
   function placeIndicator() {
     if (!seg) return;
-    const active = seg.querySelector<HTMLElement>('[aria-current="page"]');
-    if (!active) {
-      seg.style.setProperty('--ind-o', '0');
-      return;
-    }
+    const active = segActive(seg);
+    placeSegIndicator(seg, active);
+    if (!active) return;
     const a = active.getBoundingClientRect();
-    const s = seg.getBoundingClientRect();
-    seg.style.setProperty('--ind-x', `${a.left - s.left + seg.scrollLeft}px`);
-    seg.style.setProperty('--ind-y', `${a.top - s.top}px`);
-    seg.style.setProperty('--ind-w', `${a.width}px`);
-    seg.style.setProperty('--ind-h', `${a.height}px`);
-    seg.style.setProperty('--ind-o', '1');
 
     const railEl = rail;
     if (railEl && railEl.scrollWidth > railEl.clientWidth + 2) {

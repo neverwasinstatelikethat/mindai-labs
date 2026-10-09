@@ -3,10 +3,22 @@
 @import './tokens.css';
 @import './fonts.css';
 @import 'tailwindcss';
+@import './theme.css';
 
 @layer base {
   * {
     box-sizing: border-box;
+  }
+
+  /* Раскрытие ведёт компонент Disclosure с настоящим <button>: нативный маркер
+     <summary> — деталь галереи браузера, он не наследует ни кегль, ни ритм, ни
+     движение системы. Сброс здесь, чтобы ни одна разметка не вернула треугольник. */
+  details > summary {
+    list-style: none;
+  }
+
+  details > summary::-webkit-details-marker {
+    display: none;
   }
 
   html {
@@ -245,17 +257,13 @@
   font-weight: 500;
 }
 
-.num,
-/* Техническая строка отделена от прозы полем: это журнал, а не аргумент.
-   Моно-шрифт сам по себе не останавливает взгляд, а тонкая подложка говорит
-   «сюда за числом id, а не за смыслом». */
-.code {
+/* Число — цифрой, а не плашкой: подложка вокруг каждого значения превращала
+   счётчики в чипы и спорила с прозой. Моноширинная линия и табличные цифры
+   держат выравнивание колонок без всякой рамки. */
+.num {
   font-family: var(--font-data);
   font-size: 0.94em;
   font-variant-numeric: tabular-nums;
-  padding: 0 var(--s1);
-  border-radius: var(--r-xs);
-  background: var(--field-code);
 }
 
 /* Служебное имя — id, ключ, имя схемы — подписью при человекочитаемом названии,
@@ -484,7 +492,6 @@
   width: min(100% - var(--s8), var(--maxw-page));
   padding: var(--s2) var(--s2) var(--s2) var(--s5);
   border-radius: var(--r-pill);
-  border: 1px solid var(--line-soft);
   background: color-mix(in oklab, var(--surface) 72%, transparent);
   backdrop-filter: blur(20px) saturate(1.1);
   box-shadow: var(--shadow-soft);
@@ -598,17 +605,16 @@
   align-items: center;
   gap: var(--s3);
   padding: var(--s1) var(--s4) var(--s1) var(--s1);
-  border: 1px solid var(--line);
   border-radius: var(--r-pill);
-  background: var(--surface);
+  background: var(--surface-sunk);
   cursor: pointer;
-  transition: box-shadow var(--dur) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft),
+  transition: box-shadow var(--dur) var(--ease-soft), background var(--dur-fast) var(--ease-soft),
     transform var(--dur-fast) var(--ease-enter);
 }
 
 .account:hover {
+  background: var(--surface-raised);
   box-shadow: var(--shadow-soft);
-  border-color: var(--line-strong);
 }
 
 .account:active {
@@ -638,7 +644,6 @@
   right: 0;
   min-width: 246px;
   padding: var(--s2);
-  border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--surface);
   box-shadow: var(--shadow-lift);
@@ -678,10 +683,11 @@
   transform: translateX(3px);
 }
 
+/* Идентичность в шапке меню отделена от пунктов расстоянием: пункт «Выйти»
+   читается последним действием списка, а не подписью под чертой. */
 .menu__head {
-  padding: var(--s3) var(--s4) var(--s2);
-  border-bottom: 1px solid var(--line-soft);
-  margin-bottom: var(--s2);
+  padding: var(--s3) var(--s4) var(--s3);
+  margin-bottom: var(--s3);
 }
 
 /* Сегментированная полоса разделов: под текущим едет общий индикатор,
@@ -695,8 +701,12 @@
   border-radius: var(--r-pill);
   background: var(--surface-sunk);
   /* Полоса фасетов не имеет права растягивать документ на узком экране:
-     она крутится сама, а элементы в ней не сжимаются в нечитаемые. */
+     она крутится сама, а элементы в ней не сжимаются в нечитаемые.
+     min-width: 0 нужно отдельно: внутри flex- или grid-контейнера полоса с
+     min-width: auto не ужималась бы до своей области, а растягивала её —
+     ряд отбора на 390px становился шире вьюпорта. */
   max-width: 100%;
+  min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -788,10 +798,75 @@
   box-shadow: var(--shadow-soft);
 }
 
-/* В полосе разделов подсветку ведёт общий индикатор, а не фон элемента. */
-.pill-nav .seg__item[aria-current='page'] {
+/* Подсветку полосы ведёт общий индикатор, а не фон элемента: переход между
+   видами читается одним движением. Правило привязано к наличию индикатора, а не
+   к конкретному экрану, — иначе каждая полоса получала бы свой язык выбора. */
+.seg:has(.seg__ind) .seg__item[aria-current='page'],
+.seg:has(.seg__ind) .seg__item[aria-pressed='true'] {
   background: none;
   box-shadow: none;
+}
+
+/* ── Раскрытие (Disclosure) ───────────────────────────────────────────── */
+
+/* Правила живут здесь, а не в компоненте: класс на теге <Icon> не получает
+   scoped-хеш родителя, и поворот знака молча переставал бы применяться. */
+.disclosure__mark {
+  flex: none;
+  align-self: center;
+  color: var(--ink-4);
+  transition: transform var(--dur-fast) var(--ease-enter);
+}
+
+[aria-expanded='true'] .disclosure__mark {
+  transform: rotate(180deg);
+}
+
+/* Геометрия строки раскрытия. Перенос разрешён всей строке: на 390px заголовок
+   темы и её числа не должны делить ширину пополам и превращаться в узкую
+   колонку, которая к тому же растягивает документ. */
+.disclosure__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s1) var(--s3);
+  width: 100%;
+  min-height: 32px;
+  cursor: pointer;
+}
+
+.disclosure__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 500;
+}
+
+.disclosure__summary {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--ink-4);
+}
+
+.disclosure__aside {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s1) var(--s3);
+  min-width: 0;
+}
+
+/* Появление содержимого — короткий вход сверху, без анимации высоты: строки под
+   раскрытием не должны прыгать. Движение живёт только при разрешённом motion. */
+html.motion-ok .disclosure__body {
+  animation: disclosure-in var(--dur) var(--ease-enter);
+}
+
+@keyframes disclosure-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
 }
 
 /* Порог 1119px общий с узким режимом рабочего листа (ChatPanel): ниже полоса
@@ -879,6 +954,14 @@
   color: var(--ink);
 }
 
+/* Включённый тумблер: состояние называют слово и тон, а не вес кнопки.
+   Залитая кнопка в ряду инструментов спорила с отправкой запроса. */
+.btn--quiet[aria-pressed='true'] {
+  background: var(--sage);
+  border-color: var(--sage-deep);
+  color: var(--ink);
+}
+
 .btn--ghost {
   background: none;
   color: var(--ink-2);
@@ -923,9 +1006,10 @@
   place-items: center;
   width: 40px;
   height: 40px;
-  border: 1px solid var(--line);
   border-radius: var(--r-pill);
-  background: var(--surface);
+  /* Контрол живёт на белой полосе навигации: утопленный тон отличает его от
+     поверхности без рамки, а наведение поднимает его обратно. */
+  background: var(--surface-sunk);
   color: var(--ink-2);
   cursor: pointer;
   transition: background var(--dur-fast) var(--ease-soft), color var(--dur-fast) var(--ease-soft);
@@ -1062,25 +1146,16 @@
   transform: translateY(-1px) rotate(-45deg);
 }
 
-.tag {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s2);
-  padding: 2px var(--s3);
-  border-radius: var(--r-pill);
-  background: var(--surface-sunk);
-  color: var(--ink-3);
-  font-size: var(--t-micro);
-}
-
 /* ── Панели ───────────────────────────────────────────────────────────── */
 
+/* Объект держится тоном поверхности и подъёмом, а не обводкой: рамка остаётся
+   только у полей ввода, фокуса, плотной таблицы и модального слоя. Тональные
+   сцены (sage/lav/coral/ink) не получают «свою» рамку — поле уже названо цветом. */
 .panel {
   position: relative;
   padding: clamp(var(--s5), 3.2vw, var(--s7));
-  border: 1px solid var(--line-soft);
   border-radius: var(--r-xl);
-  background: var(--surface);
+  background: var(--surface-raised);
   box-shadow: var(--shadow-soft);
 }
 
@@ -1096,25 +1171,21 @@
 
 .panel--sage {
   background: var(--sage);
-  border-color: var(--sage-deep);
   box-shadow: none;
 }
 
 .panel--lav {
   background: var(--lavender);
-  border-color: var(--lavender-deep);
   box-shadow: none;
 }
 
 .panel--coral {
   background: var(--peach-wash);
-  border-color: var(--coral-mist);
   box-shadow: none;
 }
 
 .panel--ink {
   background: var(--stone-deep);
-  border-color: var(--line-inverse);
   color: var(--ink-inverse);
 }
 
@@ -1128,12 +1199,16 @@
   box-shadow: var(--shadow-lift);
 }
 
+/* Строка находки — строка, а не карточка: ни рамки, ни тени, ни своего фона.
+   Разделяет её с соседями расстояние, а отклик держит тон под курсором. */
 .card-note {
-  padding: var(--s6);
-  border: 1px solid var(--line-soft);
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow-soft);
+  padding: var(--s5) var(--s4);
+  border-radius: var(--r-md);
+  transition: background var(--dur-fast) var(--ease-soft);
+}
+
+.card-note:hover {
+  background: var(--surface-sunk);
 }
 
 .panel__head {
@@ -1150,9 +1225,9 @@
 /* Таблица шире блока — это видно по полосе прокрутки: жёлоб утоплен в бумагу,
    поэтому подсказка остаётся и когда низ таблицы ушёл за вьюпорт. */
 .table-wrap {
-  border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background: var(--surface);
+  box-shadow: var(--shadow-soft);
   overflow: hidden;
   overflow-x: auto;
   scrollbar-color: var(--ink-4) var(--surface-sunk);
@@ -1210,49 +1285,62 @@
   text-align: right;
 }
 
-.status {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s2);
-  padding: 3px var(--s3) 3px var(--s2);
-  border-radius: var(--r-pill);
+/* Пары «что — значение» для карточек и шторок: подпись держит микро-кегль и
+   слабый тон, значение читается рабочим текстом. Колонки считает содержимое, а не
+   ширина экрана, поэтому пять фактов не распадаются на простыню и не липнут в
+   одну строку. */
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--s3) var(--s5);
+  margin: 0;
+}
+
+.facts > div {
+  display: grid;
+  gap: var(--s1);
+  min-width: 0;
+}
+
+.facts dt {
+  color: var(--ink-4);
   font-size: var(--t-micro);
-  font-weight: 500;
-  white-space: nowrap;
 }
 
-.status::before {
-  content: '';
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: currentColor;
-  flex: none;
+.facts dd {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: var(--t-small);
+  line-height: var(--lh-dense);
+  overflow-wrap: anywhere;
 }
 
-.status--consensus {
-  background: var(--consensus-wash);
+/* Состояние проверки словом, а не плашкой: цвет несёт смысл, рамка вокруг одного
+   слова только добавляла бы объект там, где его нет. */
+.status-word[data-status='consensus'] {
   color: var(--consensus);
 }
 
-.status--hypothesis {
-  background: var(--hypothesis-wash);
-  color: var(--hypothesis);
-}
-
-.status--disputed {
-  background: var(--disputed-wash);
+.status-word[data-status='disputed'] {
   color: var(--disputed);
 }
 
-.status--superseded {
-  background: var(--superseded-wash);
+.status-word[data-status='hypothesis'],
+.status-word[data-status='proposed'] {
+  color: var(--hypothesis);
+}
+
+.status-word[data-status='superseded'],
+.status-word[data-status='off'] {
   color: var(--superseded);
 }
 
-.status--off {
-  background: var(--surface-sunk);
-  color: var(--ink-3);
+.status-word[data-status='accepted'] {
+  color: var(--consensus);
+}
+
+.status-word[data-status='rejected'] {
+  color: var(--disputed);
 }
 
 .bar {
@@ -1306,6 +1394,8 @@
   text-align: center;
 }
 
+/* Notice уже назван цветом поля: обводка поверх тонированного плашки-фона
+   добавляла вторую границу там, где достаточно одной ступени тона. */
 .notice {
   display: flex;
   align-items: flex-start;
@@ -1313,32 +1403,27 @@
   padding: var(--s4) var(--s5);
   border-radius: var(--r-md);
   background: var(--surface-sunk);
-  border: 1px solid var(--line);
   font-size: var(--t-small);
   line-height: var(--lh-dense);
 }
 
 .notice--error {
   background: var(--disputed-wash);
-  border-color: color-mix(in oklab, var(--disputed) 26%, var(--line));
   color: var(--disputed);
 }
 
 .notice--warn {
   background: var(--hypothesis-wash);
-  border-color: color-mix(in oklab, var(--hypothesis) 24%, var(--line));
   color: var(--hypothesis);
 }
 
 .notice--ok {
   background: var(--consensus-wash);
-  border-color: color-mix(in oklab, var(--consensus) 22%, var(--line));
   color: var(--consensus);
 }
 
 .notice--info {
   background: var(--lavender);
-  border-color: var(--lavender-deep);
   color: var(--ink-2);
 }
 
@@ -1398,7 +1483,6 @@
   width: min(100%, 720px);
   max-height: min(88dvh, 900px);
   overflow: hidden;
-  border: 1px solid var(--line);
   border-radius: var(--r-xl);
   background: var(--surface);
   box-shadow: var(--shadow-lift);
@@ -1429,8 +1513,6 @@
 
   .sheet {
     max-height: 92dvh;
-    border-inline: 0;
-    border-bottom: 0;
     border-radius: var(--r-xl) var(--r-xl) 0 0;
     animation: sheet-up var(--dur) var(--ease-enter);
   }
@@ -1451,64 +1533,14 @@
   }
 }
 
-/* ── Аккордеон ────────────────────────────────────────────────────────── */
-
-.acc {
-  border: 1px solid var(--line-soft);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  overflow: hidden;
-}
-
-.acc + .acc {
-  margin-top: var(--s3);
-}
-
-.acc__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--s4);
-  width: 100%;
-  padding: var(--s5) var(--s6);
-  border: 0;
-  background: none;
-  font-size: var(--t-h4);
-  font-weight: 500;
-  text-align: left;
-  cursor: pointer;
-}
-
-.acc__head:hover {
-  background: var(--surface-sunk);
-}
-
-.acc__icon {
-  flex: none;
-  transition: transform var(--dur) var(--ease-enter);
-  color: var(--ink-3);
-}
-
-.acc__head[aria-expanded='true'] .acc__icon {
-  transform: rotate(45deg);
-  color: var(--action-ink);
-}
-
-.acc__body {
-  padding: 0 var(--s6) var(--s6);
-  color: var(--ink-2);
-  font-size: var(--t-small);
-  line-height: var(--lh-body);
-  max-width: 68ch;
-}
-
 /* ── Подвал ───────────────────────────────────────────────────────────── */
 
+/* Подвал отделён от последнего блока расстоянием, а не чертой: 64 px над ним и
+   более светлый текст уже читаются как конец документа. */
 .site-foot {
   display: grid;
   gap: var(--s6);
   padding: var(--s8) 0 var(--s6);
-  border-top: 1px solid var(--line);
   font-size: var(--t-small);
   color: var(--ink-3);
 }
@@ -1673,8 +1705,7 @@ html.motion-ok .prompt {
   display: flex;
   align-items: center;
   gap: var(--s3);
-  padding-top: var(--s3);
-  border-top: 1px solid var(--line-soft);
+  padding-top: var(--s4);
 }
 
 /* Ряд инструментов композера: обязательное действие не может ждать за краем.
@@ -1770,25 +1801,22 @@ html.motion-ok .prompt {
   align-items: center;
   gap: var(--s4);
   padding: var(--s4) var(--s5);
-  border: 1px solid var(--line-soft);
   border-radius: var(--r-md);
-  background: var(--surface);
+  background: var(--surface-sunk);
   color: var(--ink);
   text-decoration: none;
-  transition: background var(--dur) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft),
+  transition: background var(--dur) var(--ease-soft),
     transform var(--dur) var(--ease-enter);
 }
 
 .flow__item:hover,
 .flow__item:focus-visible {
   background: var(--lavender);
-  border-color: var(--lavender-deep);
   color: var(--ink);
 }
 
 .flow__item[aria-current='page'] {
   background: var(--sage);
-  border-color: var(--sage-deep);
 }
 
 .flow__icon {
@@ -1871,6 +1899,7 @@ html.motion-ok .btn:hover::after {
 
 .icon-btn:hover {
   transform: translateY(-1px);
+  background: var(--surface-raised);
   box-shadow: var(--shadow-soft);
 }
 
@@ -1895,18 +1924,14 @@ html.motion-ok .btn:hover::after {
   }
 }
 
-html.motion-ok .panel--raised,
-html.motion-ok .card-note {
-  transition: transform var(--dur) var(--ease-enter), box-shadow var(--dur) var(--ease-soft),
-    border-color var(--dur) var(--ease-soft);
+html.motion-ok .panel--raised {
+  transition: transform var(--dur) var(--ease-enter), box-shadow var(--dur) var(--ease-soft);
 }
 
 @media (hover: hover) {
-  html.motion-ok .panel--raised:hover,
-  html.motion-ok .card-note:hover {
+  html.motion-ok .panel--raised:hover {
     transform: translateY(-4px);
     box-shadow: var(--shadow-lift);
-    border-color: var(--line);
   }
 
 }
@@ -1949,34 +1974,6 @@ html.motion-ok .table tbody tr {
 .quote:hover {
   background: var(--peach-wash);
   border-left-color: var(--action-deep);
-}
-
-.acc {
-  transition: border-color var(--dur) var(--ease-soft), box-shadow var(--dur) var(--ease-soft);
-}
-
-.acc:has(.acc__head[aria-expanded='true']) {
-  border-color: var(--line);
-  box-shadow: var(--shadow-soft);
-}
-
-html.motion-ok .acc__head:hover .acc__icon {
-  transform: scale(1.12) rotate(90deg);
-}
-
-html.motion-ok .acc__head[aria-expanded='true']:hover .acc__icon {
-  transform: scale(1.12) rotate(135deg);
-}
-
-.acc__body {
-  animation: acc-open var(--dur) var(--ease-enter);
-}
-
-@keyframes acc-open {
-  from {
-    opacity: 0;
-    transform: translateY(-6px);
-  }
 }
 
 html.motion-ok .site-foot a {
@@ -2099,8 +2096,6 @@ html.motion-ok .site-foot a {
   .sheet,
   .empty,
   .notice,
-  .acc__body,
-  .status--hypothesis::before,
   .table tbody tr {
     animation: none;
   }

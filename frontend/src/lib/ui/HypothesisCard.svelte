@@ -2,6 +2,7 @@
   import { countOf } from '$lib/format';
   import { hypothesisKindLabel } from '$lib/terms';
   import type { HypothesisSignal } from '$lib/types';
+  import Disclosure from './Disclosure.svelte';
   import SourceRef from './SourceRef.svelte';
 
   let { signal }: { signal: HypothesisSignal } = $props();
@@ -38,9 +39,13 @@
       {signal.proposal}
     </p>
   {/if}
-  <details class="hypo__evidence">
-    <summary class="small">{evidenceSummary}</summary>
-    <ul>
+  <Disclosure
+    id={`hypothesis-evidence-${signal.id}`}
+    size="small"
+    title="Основание"
+    summary={evidenceSummary}
+  >
+    <ul class="hypo__evidence">
       {#each signal.evidence as item, index (`${signal.id}-evidence-${index}`)}
         <li>
           <a class="hypo__source" href={sourceHref(index)}>
@@ -49,7 +54,7 @@
         </li>
       {/each}
     </ul>
-  </details>
+  </Disclosure>
 </article>
 
 <style>
@@ -61,10 +66,12 @@
     padding: var(--s4) 0;
   }
 
+  /* Тип гипотезы — тихая подпись над выводом: коралловый чернильный цвет спорил
+     со ссылкой и делал из категории действие. */
   .hypo__kind {
-    color: var(--action-ink);
+    color: var(--ink-4);
     font-size: var(--t-micro);
-    font-weight: 650;
+    font-weight: 500;
   }
 
   .hypo__statement {
@@ -82,19 +89,9 @@
     color: var(--ink-3);
   }
 
-  .hypo__evidence summary {
-    width: fit-content;
-    color: var(--ink-2);
-    cursor: pointer;
-    border-radius: var(--r-pill);
-  }
-
-  .hypo__evidence summary:focus-visible {
-    outline: 2px solid var(--action-ink);
-    outline-offset: 3px;
-  }
-
-  .hypo__evidence ul {
+  /* Класс стоит на самом списке: на теге компонента он не получил бы scoped-хеш
+     родителя, и правило молча переставало применяться. */
+  .hypo__evidence {
     display: grid;
     gap: var(--s3);
     margin: var(--s3) 0 0;

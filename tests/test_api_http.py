@@ -105,7 +105,8 @@ def _provider() -> ScriptedProvider:
         planning_bundle(),
         AgentControlDecision(decision="reason", rationale="Доказательств достаточно."),
         ReasoningResult(
-            summary="Комбинированная схема использует обратный осмос после pretreatment.",
+            summary="Комбинированная схема использует обратный осмос после pretreatment "
+                    "[находка](finding:finding-ro).",
             finding_ids=["finding-ro", "finding-ro-pilot"],
             conflicts=[],
             knowledge_gaps=[],

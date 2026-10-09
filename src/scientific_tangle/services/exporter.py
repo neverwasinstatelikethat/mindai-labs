@@ -75,7 +75,14 @@ class ExportService:
                 lines.append(f"- **Уверенность:** {finding.confidence}")
                 lines.append(f"- **Статус:** {finding.status}")
                 for ev in finding.evidence:
-                    lines.append(f"- **Источник:** {ev.source_title}, стр. {ev.page}")
+                    locator = f", стр. {ev.page}" if ev.page is not None else ""
+                    if ev.sheet:
+                        locator += f", лист {ev.sheet}"
+                    lines.append(f"- **Источник:** {ev.source_title}{locator}")
+                    if ev.source_url:
+                        lines.append(f"  URL: {ev.source_url}")
+                    if ev.retrieved_at:
+                        lines.append(f"  Получено: {ev.retrieved_at}")
                     lines.append(f"  > {ev.quote}")
                 if finding.observations:
                     obs_text = "; ".join(
@@ -135,6 +142,8 @@ class ExportService:
                         "evidence:source_title": ev.source_title,
                         "evidence:page": ev.page,
                         "evidence:quote": ev.quote,
+                        "evidence:source_url": ev.source_url,
+                        "evidence:retrieved_at": ev.retrieved_at,
                     }
                     for ev in f.evidence
                 ],
@@ -219,7 +228,14 @@ def _pdf_blocks(answer: AnswerPayload) -> list[str]:
             parts.append(f"   Уверенность: {finding.confidence}")
             parts.append(f"   Статус: {finding.status}")
             for ev in finding.evidence:
-                parts.append(f"   Источник: {ev.source_title}, стр. {ev.page}")
+                locator = f", стр. {ev.page}" if ev.page is not None else ""
+                if ev.sheet:
+                    locator += f", лист {ev.sheet}"
+                parts.append(f"   Источник: {ev.source_title}{locator}")
+                if ev.source_url:
+                    parts.append(f"   URL: {ev.source_url}")
+                if ev.retrieved_at:
+                    parts.append(f"   Получено: {ev.retrieved_at}")
                 parts.append(f"   > {ev.quote}")
             if finding.observations:
                 obs_text = "; ".join(

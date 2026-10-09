@@ -6,7 +6,6 @@
   import Button from './Button.svelte';
   import Field from './Field.svelte';
   import Notice from './Notice.svelte';
-  import StatusPill from './StatusPill.svelte';
 
   /**
    * Вердикт открывается там, где возникло сомнение: из ответа, из темы
@@ -175,7 +174,9 @@
     {#if verdict === 'correct'}
       {#if chosenFinding}
         <div class="verdict__picked">
-          <StatusPill status={chosenFinding.status} label={STATUS_SHORT[chosenFinding.status]} />
+          <span class="micro status-word" data-status={chosenFinding.status}>
+            {STATUS_SHORT[chosenFinding.status]}
+          </span>
           <span class="verdict__statement">{chosenFinding.statement}</span>
         </div>
       {:else if candidates.length > 0}
@@ -190,7 +191,7 @@
           {#each filtered as item (item.id)}
             <li>
               <button class="verdict__pick" type="button" onclick={() => (chosen = item.id)}>
-                <StatusPill status={item.status} label={STATUS_SHORT[item.status]} />
+                <span class="micro status-word" data-status={item.status}>{STATUS_SHORT[item.status]}</span>
                 <span class="verdict__statement">{item.statement}</span>
                 <span class="micro muted">версия {item.version}</span>
               </button>
@@ -300,8 +301,8 @@
   }
 
   .verdict__option--on {
-    border-color: var(--ink);
-    background: var(--surface-raised);
+    border-color: var(--line-strong);
+    background: var(--sage);
     font-weight: 600;
   }
 
@@ -346,18 +347,19 @@
     gap: var(--s3);
     inline-size: 100%;
     padding: var(--s3);
-    border: 1px solid var(--line-soft);
+    border: 0;
     border-radius: var(--r-sm);
-    background: var(--surface);
+    background: var(--surface-sunk);
+    color: inherit;
     text-align: start;
     cursor: pointer;
     transition:
-      border-color var(--dur-fast) var(--ease-soft),
+      background-color var(--dur-fast) var(--ease-soft),
       transform var(--dur-fast) var(--ease-enter);
   }
 
   .verdict__pick:hover {
-    border-color: var(--line-strong);
+    background: var(--peach-wash);
   }
 
   .verdict__pick:active {

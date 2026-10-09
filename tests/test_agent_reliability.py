@@ -25,6 +25,7 @@ from scientific_tangle.agents.workflow import (
     _CONFIDENCE_PENALTY,
     _DEGRADABLE,
     _UNTRACED_CONFIDENCE_CAP,
+    ModelFailureError,
     ResearchWorkflow,
     _degradation_code,
     _describe_failure,
@@ -1118,8 +1119,41 @@ def test_state_validation_error_is_a_degradation_not_a_crash() -> None:
     error = caught.value
     assert isinstance(error, _DEGRADABLE)
     assert _degradation_code(error) == "state_schema"
-    assert "проверку схемы" in _describe_failure(error)
-    assert str(error)[:40] not in _describe_failure(error), "сырое сообщение не уходит наружу"
+    human, technical = _describe_failure(error)
+    assert "проверку схемы" in technical
+    assert str(error)[:40] not in human, "сырое сообщение не уходит человеку"
+    assert str(error)[:40] not in technical, "сырое сообщение не уходит наружу"
+
+
+def test_model_failure_reaches_the_analyst_without_internals() -> None:
+    """Человек читает, что проверка не полна, а не имя узла и текст парсера.
+
+    ``knowledge_gaps`` печатается в интерфейсе, а строка собиралась из
+    ``ModelFailureError(node, detail)`` целиком: «модель недоступна на узле
+    controller (GigaChat: structured output retry исчерпан
+    (AgentControlDecision): ответ не является JSON…)». Тест краснеет, если в
+    человекую половину вернётся имя узла, имя схемы или сообщение json, и если
+    техническая половина потеряет узел — по нему ищут прогон в журнале.
+    """
+    error = ModelFailureError(
+        "controller",
+        "GigaChat: structured output retry исчерпан (AgentControlDecision): "
+        "ответ не является JSON (Expecting property name enclosed in double quotes)",
+    )
+
+    human, technical = _describe_failure(error)
+
+    for leak in (
+        "controller",
+        "GigaChat",
+        "structured",
+        "AgentControlDecision",
+        "JSON",
+        "Expecting",
+    ):
+        assert leak not in human, f"внутреннее имя ушло человеку: {leak}"
+    assert "модель не ответила" in human
+    assert "controller" in technical, "техническая половина обязана сохранить узел"
 
 
 # ── D7: чекпоинтер вне дедлайна ──────────────────────────────────────────────
