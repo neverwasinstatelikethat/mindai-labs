@@ -47,6 +47,34 @@ def test_live_demo_answer_with_string_sections_validates() -> None:
     assert result.finding_ids == []
 
 
+@pytest.mark.parametrize("invalid_unit", [None, ""])
+def test_planning_preserves_valid_filters_and_reports_invalid_ones(
+    invalid_unit: str | None,
+) -> None:
+    from scientific_tangle.domain.models import QueryPlan
+
+    invalid = {"property_name": "год", "operator": "gte", "value": 2006}
+    if invalid_unit is not None:
+        invalid["unit"] = invalid_unit
+    valid = {"property_name": "влажность", "operator": "lt", "value": 5, "unit": "%"}
+    payload = {
+        "query_plan": {
+            "question": "Сравнить влажность продукта",
+            "mode": "hybrid",
+            "numeric_filters": [invalid, valid],
+        },
+        "action_plan": {"rationale": "Найти источники", "actions": []},
+    }
+
+    bundle = PlanningBundle.model_validate(payload)
+
+    assert [item.property_name for item in bundle.query_plan.numeric_filters] == ["влажность"]
+    assert bundle.dropped_llm_items() == {"numeric_filters": 1}
+    assert len(payload["query_plan"]["numeric_filters"]) == 2
+    with pytest.raises(ValidationError):
+        QueryPlan.model_validate(payload["query_plan"])
+
+
 def test_json_string_section_becomes_the_parsed_list() -> None:
     """`"[]"` и `"[\"a\"]"` — список, завернутый моделью в строку: разбираем его."""
     parsed = ReasoningResult.model_validate({"summary": "s", "conflicts": '["a", "b"]'})

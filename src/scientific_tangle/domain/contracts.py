@@ -19,7 +19,12 @@ from pydantic import (
 )
 
 from scientific_tangle.domain.intelligence import DataClass
-from scientific_tangle.domain.models import EvidenceLocator, NumericObservation, QueryPlan
+from scientific_tangle.domain.models import (
+    EvidenceLocator,
+    NumericFilter,
+    NumericObservation,
+    QueryPlan,
+)
 
 # Валидатор email без новой зависимости (pydantic[email] тянет email-validator):
 # грубой проверки формата достаточно — настоящий контроль даёт подтверждение
@@ -508,6 +513,27 @@ class PlanningBundle(LlmForm):
     intent: IntentClassification | None = None
     query_plan: QueryPlan
     action_plan: AgentActionPlan
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _discard_invalid_filters(
+        cls, data: object, handler: Callable[[object], PlanningBundle]
+    ) -> PlanningBundle:
+        """Непригодный фильтр модели не должен терять весь план исследования."""
+        coerced = _coerce_payload(cls, data)
+        dropped = 0
+        if isinstance(coerced, dict) and isinstance((plan := coerced.get("query_plan")), dict):
+            if isinstance((filters := plan.get("numeric_filters")), list):
+                kept: list[NumericFilter] = []
+                for item in filters:
+                    try:
+                        kept.append(NumericFilter.model_validate(item))
+                    except ValidationError:
+                        dropped += 1
+                coerced = {**coerced, "query_plan": {**plan, "numeric_filters": kept}}
+        instance = handler(coerced)
+        instance._llm_dropped = {"numeric_filters": dropped} if dropped else {}
+        return instance
 
 
 class ToolObservation(BaseModel):

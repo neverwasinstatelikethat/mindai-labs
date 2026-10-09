@@ -81,6 +81,24 @@ def planning_bundle() -> PlanningBundle:
 
 
 @pytest.mark.asyncio
+async def test_planning_discloses_discarded_numeric_filter() -> None:
+    payload = planning_bundle().model_dump()
+    payload["query_plan"]["numeric_filters"] = [
+        {"property_name": "год", "operator": "gte", "value": 2006}
+    ]
+    provider = ScriptedProvider(PlanningBundle.model_validate(payload))
+    workflow = ResearchWorkflow(provider=provider)
+
+    result = await workflow.planning_agent({"question": "Как сократить время обработки?"})
+
+    assert result["query_plan"].numeric_filters == []
+    assert result["degradation_reasons"] == [
+        "Часть числовых условий не применена: модель вернула непригодные фильтры."
+    ]
+    assert result["action_plan"].actions
+
+
+@pytest.mark.asyncio
 async def test_llm_driven_workflow_reaches_grounded_answer() -> None:
     provider = ScriptedProvider(
         planning_bundle(),
